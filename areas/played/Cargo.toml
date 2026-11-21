@@ -1,0 +1,16 @@
+# The areas of `areas/`, built for the machine from their sources against the SDK: what their
+# modules stand for in the engine's tests (POC_PLAN.md, "Tests"). Each area's `played(seed)` (from
+# `area!`) is the area to play. Not an area itself: `areas/build.sh` builds only the folders with an
+# `area.rs`.
+[package]
+name = "areas-played"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "areas_played"
+path = "lib.rs"
+
+[dependencies]
+plateau-sdk = { path = "../../sdk" }

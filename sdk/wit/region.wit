@@ -1,0 +1,57 @@
+/// The interface between Plateau's engine and an area's program (POC_PLAN.md, step 1). An area
+/// answers what is where, for a viewer of a size, and describes itself once; the engine decides
+/// everything else (CONCEPT.md, "The engine and the programs"). The package's version is the
+/// interface's version: a change is a new version, never an edit of one an area was built for.
+///
+/// An area is 64 m square: x and z from 0 to 64, y up, in metres, the ground about y = 0. North is
+/// the edge at z = 0, east at x = 64, south at z = 64, west at x = 0.
+package plateau:region@0.1.0;
+
+interface types {
+    /// A point in the area, in metres.
+    record point { x: f32, y: f32, z: f32 }
+
+    /// The engine's materials. Each has its physics at every size, owned by the engine: water holds
+    /// up the tiny, mud gives under a giant.
+    enum material { soil, grass, sand, mud, stone, wood, leaf, moss, water }
+
+    /// What is at a point: how far it is to the nearest surface (negative inside it), in metres, and
+    /// that surface's material. The distance may be less than the true one, never more.
+    record answer { distance: f32, material: material }
+
+    /// The three sizes: tiny about 1.7 cm tall, a person 1.7 m, a giant 17 m.
+    enum size { tiny, person, giant }
+
+    /// A place the area means for one size: a point it can stand at. The engine works out what each
+    /// size can reach, and holds the area to it: this size, and no other, reaches it.
+    record place { name: string, size: size, at: point }
+
+    /// One edge: the ground's height every metre along it, 65 heights from its first corner to the
+    /// next (north and south from west to east, east and west from north to south), and the level
+    /// of any water that crosses it.
+    record edge { ground: list<f32>, water: option<f32> }
+
+    record borders { north: edge, east: edge, south: edge, west: edge }
+
+    record description { name: string, places: list<place>, borders: borders }
+}
+
+/// What an area may ask of the engine. Each import is a capability given on purpose.
+interface host {
+    /// The area's seed: the same module with the same seed is the same world on every machine.
+    seed: func() -> u64;
+}
+
+world region {
+    use types.{point, answer, description};
+
+    import host;
+
+    /// What is at each point, in order, for a viewer `size` metres tall: one answer a point. The
+    /// detail a viewer sees grows as they shrink; what a smaller viewer sees is the larger one's
+    /// world with more in it.
+    export sample: func(points: list<point>, size: f32) -> list<answer>;
+
+    /// What the area is: its name, its places, its borders. Asked once.
+    export describe: func() -> description;
+}

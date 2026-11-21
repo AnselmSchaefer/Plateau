@@ -1,0 +1,10 @@
+# The garden shown in Bevy (POC_PLAN.md, step 0), to set against spike/view-wgpu.
+[package]
+name = "view-bevy"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["3d"] }
+spike-host = { path = "../host" }

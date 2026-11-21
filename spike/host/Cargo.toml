@@ -1,0 +1,15 @@
+# The spike's host (POC_PLAN.md, step 0): the hand-written area run as a module in wasmtime and
+# natively, surface nets over a chunk, hashes of the answers, and the measurements.
+[package]
+name = "spike-host"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wasmtime = { version = "51.0.0", default-features = false, features = ["cranelift", "runtime", "std"] }
+# Without its "threads" feature wasmtime refuses modules that use threads, as the engine must.
+
+[dev-dependencies]
+# Modules written by hand for the laws' tests: areas made wrong on purpose.
+wat = "1.263.0"

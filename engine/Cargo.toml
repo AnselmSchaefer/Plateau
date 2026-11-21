@@ -1,0 +1,24 @@
+# Plateau's engine (POC_PLAN.md): for now an area's module checked on load and run in wasmtime with
+# the limits the engine keeps, its answers read out of the canonical ABI, and the first law.
+[package]
+name = "plateau-engine"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Without its "threads" feature wasmtime refuses modules that use threads, as the engine must.
+wasmtime = { version = "51.0.0", default-features = false, features = ["cranelift", "runtime", "std"] }
+# The check on load: wasmtime's own parser, with the features named.
+wasmparser = { version = "0.263.0", default-features = false, features = ["std", "validate", "features"] }
+
+[dev-dependencies]
+# Only for `examples/look.rs`, which writes pictures.
+png = "0.18.1"
+# The areas of `areas/` played natively: what their modules must answer as.
+areas-played = { path = "../areas/played" }
+plateau-sdk = { path = "../sdk" }
+# Modules written by hand for the tests: areas made wrong on purpose.
+wat = "1.263.0"
+# Only for the test that every area can still be made a component of the world.
+wit-component = "0.263.0"

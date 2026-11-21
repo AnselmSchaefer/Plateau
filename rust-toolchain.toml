@@ -1,0 +1,5 @@
+# The compiler Plateau is built with and areas are compiled with (POC_PLAN.md, "Compiling"): one
+# version, so a module built again from its source gives the same bytes.
+[toolchain]
+channel = "1.99.1"
+targets = ["wasm32-unknown-unknown"]

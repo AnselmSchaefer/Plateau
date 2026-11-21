@@ -1,0 +1,17 @@
+# What an area's program is written against (POC_PLAN.md, step 1): the bindings of the WIT world
+# `plateau:region@0.1.0` made ahead of time (no proc macro in an area's build), a little runtime in
+# place of wit-bindgen's, distances and their sums, noise, the engine's materials, `Seeds`. No
+# dependencies, as Caprice's theme SDK.
+[package]
+name = "plateau-sdk"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "plateau_sdk"
+
+[dev-dependencies]
+# Only for the test that making the bindings again from wit/region.wit changes nothing.
+wit-bindgen-rust = "=0.63.0"
+wit-bindgen-core = "=0.63.0"

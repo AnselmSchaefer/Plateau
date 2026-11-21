@@ -1,0 +1,15 @@
+# Build output. The modules in areas/modules/ and spike/modules/ are kept: the tests read them, and
+# a test checks they are what their sources build to.
+/target
+
+# Secrets and local settings
+.env
+.env.*
+.claude/settings.local.json
+
+# Editors and systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
