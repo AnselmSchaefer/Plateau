@@ -117,6 +117,76 @@ Found:
 **Done when** one can walk the garden at each size at 60 frames a second on this machine, find
 the cave as a tiny person, and sit on the bench as a giant.
 
+Built 2026-11-21; checked by the tests and a scripted tour, not yet played by hand. The engine
+(`engine/`, no window) gains `chunk` (surface nets over 32 cells a side, voxels a power of two
+metres, each chunk asked for the viewer twenty voxels tall, one cell asked beyond its edges so
+neighbours meet exactly, skirts two voxels deep against the seams between levels, a coarse pass
+that never asks a block its middle's distance proves empty or full, and shading for hollows),
+`rings` (the chunks a viewer sees: four a side on each level, from the power of two at or below a
+twentieth of their height up to a metre, every point about them in one chunk) and `body` (a
+capsule as tall as the size, proportions, pace and gravity scaled with it; feet held up by rays
+down, spheres above the step pushed out of what rays find; the tiny stand on water, a giant sinks
+up to 6% of its height into mud; growing stops where there is no room; sitting on a surface at knee
+height). The window is `play/` (Bevy): the chunks made by ten threads, each with its own instance,
+finest and nearest first; the world drawn about the eye and scaled so the player is always 1.7 m
+tall to the renderer. `cargo run --release -p plateau-play`; `-- --tour <folder>` visits nine
+places, measures and takes screenshots (`play/tour/`, with its numbers in `tour.txt`).
+
+Shown by `engine/tests/walking.rs` (the garden played natively): a person comes in at the gate and
+is stopped by the wall; a giant steps over it; the tiny walk in at the crack to the cave, where a
+person cannot go; the tiny cannot grow in the cave beyond its roof, nor a person under the bench
+into a giant; a giant sits on the bench and a person finds no seat; the tiny stand on the pond and a
+person wades to its floor and out; a giant stands a metre deeper in the mud than a person; every
+size jumps its proportion and lands. And by `engine/tests/chunks.rs`: the coarse pass makes the
+same surface asking under half as much, neighbours meet edge for edge, the levels fill the space
+about any viewer once.
+
+The tour (1600 × 900, the GTX 1650), uncapped (under Hyprland, vsync is sometimes kept anyway,
+and the same run gives 60):
+
+| Where | Frames a second | Worst frame | Triangles | Chunks made, and how long until all are |
+|---|---|---|---|---|
+| A person at the start | 190 | 6.6 ms | 103k | 156 in 0.24 s |
+| A person under the bench | 175 | 6.7 ms | 210k | 174 in 0.20 s |
+| A person shrinking to tiny at the crack | 114 | 20.8 ms | 473k | 552 in 1.0 s (during the second of shrinking) |
+| The tiny at the crack | 113 | 10.0 ms | 515k | 208 in 0.30 s |
+| The tiny in the cave | 112 | 9.6 ms | 535k | 312 in 0.43 s |
+| The tiny on the pond | 153 | 15.9 ms | 351k | 538 in 0.30 s |
+| A giant on the bench | 256 | 4.6 ms | 58k | |
+
+A chunk takes 3 ms for a person and 13 for the tiny on average, but the slowest at the crack take
+up to 180 ms: under the 20 ms target on average, not at worst, and hidden by making them off the
+frame and keeping the old chunks shown until the new are all made. A step of the body costs 0.06
+ms at most.
+
+Found:
+
+- **A distance is not a contact.** Wherever an area cuts one shape out of another, its distances
+  are only lower bounds, even in open air: in the gate, the wall said its nearest surface was the
+  gate's own outline, 15 cm away, and a person could not pass. The body never takes a short
+  distance for a touch; rays stepped by the distances find the surface itself (26 from each
+  sphere, out to its radius).
+- **The garden's distances were too long**, against the SDK's first rule: by up to 1.9 times at
+  the moss's tufts, 1.24 in the bench's grain, 1.13 on the wall's rough stone. The coarse pass
+  showed it (with a margin of a cell's diagonal it changed the surface by the crack), and the
+  physics would have walked into it. Scaled down; scaling a distance never moves a surface. The
+  coarse pass keeps a margin of two cells for areas that slip. **Step 3 needs the law "distances
+  never too long"**: near every surface, the distance grows no faster than the way to it.
+- **Thin things break up, and touching pieces are hollow.** A giant's view is drawn in voxels of
+  half a metre near it and a metre further off, so the bench's 35 cm planks fell apart; and planks
+  that only touch have distance nought inside, where they meet: a grid on whole metres asked only
+  there and saw no seat at all. The planks are now 90 cm thick, their 4 cm gaps closed (overlapping)
+  for whoever is too large to see them. The guide (step 5) must say: a thing a size should see is
+  at least a tenth of its height thick, detail it should not see is closed up, and pieces that are
+  one thing overlap.
+- **Shadows and the near plane are made for a person.** Bevy's cascades round their width up to
+  whole metres and its shadow bias is in metres, which would make the tiny's shadows coarse and
+  loose. Drawing the world scaled to the player keeps them right at every size. Haze is the
+  air's, in metres, so it is set against the scale (the tiny saw haze 70 cm away before).
+- **One answer a point hides the floor under water** (step 1) cost little: rays through water a
+  body does not float on step a twentieth of its height at a time and stop where the answers turn
+  solid. A person wades the pond, a giant sinks in its mud.
+
 ### 3. The laws, first set (three days)
 
 In `cargo test`, over the walled garden and every area in `areas/`:
@@ -131,6 +201,8 @@ In `cargo test`, over the walled garden and every area in `areas/`:
   change unasked.
 - **NaNs unseen**: the same answers with NaN canonicalization on and off (step 0's
   `nans_unseen`), since areas run without it.
+- **Distances never too long** (found in step 2): near every surface, at every size, an area's
+  distance grows no faster than the way to that surface, so the engine can step as far as it says.
 
 Seeded, with the smallest failing case printed (as `LAWS_PLAN.md`).
 

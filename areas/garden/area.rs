@@ -115,7 +115,9 @@ impl Garden {
         if coarse > 0.1 {
             return Answer::new(coarse - 0.05, Material::Stone);
         }
-        let mut d = coarse + detail(p, view, 0.3, 0.025, self.seed ^ 0x7f4a);
+        // The roughness is steeper than a distance grows: the distance made shorter to stay never
+        // too long.
+        let mut d = (coarse + detail(p, view, 0.3, 0.025, self.seed ^ 0x7f4a)) * 0.85;
         let depth = 0.025 * view.sees(0.03);
         if depth > 0.0 && p.y < TOP {
             // The courses are horizontal; the joints between blocks run across each wall, half a
@@ -138,8 +140,10 @@ impl Garden {
         if moss > 0.0 {
             wall.material = Material::Moss;
             // A forest of tufts to the tiny.
-            let tufts = view.sees(0.006) * moss * 0.004 * (0.6 + 0.4 * noise(p / 0.005, self.seed ^ 0x2b));
-            wall = wall.grown(tufts);
+            // They rise and fall as steeply as a distance grows: the distance halved where they are.
+            let seen = view.sees(0.006) * moss;
+            let tufts = seen * 0.004 * (0.6 + 0.4 * noise(p / 0.005, self.seed ^ 0x2b));
+            wall = Answer::new((wall.distance - tufts) * (1.0 - 0.5 * seen), wall.material);
         }
         wall
     }
@@ -154,11 +158,11 @@ impl Garden {
         }
         let f = self.floor;
         let rough = detail(p, view, 0.05, 0.08, self.seed ^ 0x4c);
-        let room = rounded_cuboid(p - point(CAVE.x, f + 0.12, CAVE.z), point(0.17, 0.12, 0.3), 0.09) + rough;
+        let room = (rounded_cuboid(p - point(CAVE.x, f + 0.12, CAVE.z), point(0.17, 0.12, 0.3), 0.09) + rough) * 0.6;
         // The crack: a jagged slot 1.4 cm wide, narrowing upwards, from the face to the room.
         let wiggle = 0.012 * noise(point(p.x / 0.04, p.y / 0.04, 0.0), self.seed ^ 0x19);
         let up = clamp((p.y - f) / 0.2, 0.0, 1.0);
-        let slot = (abs(p.z - CRACK_Z - wiggle) - 0.007 * (1.0 - 0.6 * up)) / 1.2;
+        let slot = (abs(p.z - CRACK_Z - wiggle) - 0.007 * (1.0 - 0.6 * up)) / 1.5;
         let crack = intersect(intersect(slot, abs(p.y - (f + 0.1)) - 0.1), abs(p.x - 53.845) - 0.175);
         let hollow = union(room, crack);
         let mut cut_out = solid.cut(hollow);
@@ -210,17 +214,26 @@ impl Garden {
         if bound > 0.5 {
             return Answer::new(bound, Material::Wood);
         }
-        // Four planks along x, 4 cm apart.
-        let plank = |k: f32| rounded_cuboid(q - point(0.0, SEAT - 0.175, -1.5 + k), point(6.0, 0.175, 0.48), 0.05);
+        // Four planks along x, 4 cm apart, 90 cm thick: thinner, and a giant's view (drawn in voxels
+        // of half a metre near it, a metre further off) breaks them up.
+        // The gaps between them, and their rounded edges, are detail: closed for whoever is too
+        // large to see them, or a coarse view would fall in the gaps and miss the seat. Closed, they
+        // overlap: planks that only touched would be a surface inside the seat, where the distance
+        // is nought, and a coarse view that asks there (a giant's asks on whole metres) finds none.
+        let seen = view.sees(0.04);
+        let plank = |k: f32| rounded_cuboid(q - point(0.0, SEAT - 0.45, -1.5 + k), point(6.0, 0.45, 0.48 + 0.04 * (1.0 - seen)), 0.05 * seen);
         let seat = union(union(plank(0.0), plank(1.0)), union(plank(2.0), plank(3.0)));
         let leg = |x: f32, z: f32, top: f32| cuboid(q - point(x, (top - 0.4) * 0.5, z), point(0.4, (top + 0.4) * 0.5, 0.4));
-        let front = union(leg(-5.0, 1.4, SEAT - 0.35), leg(5.0, 1.4, SEAT - 0.35));
+        let front = union(leg(-5.0, 1.4, SEAT - 0.9), leg(5.0, 1.4, SEAT - 0.9));
         let back = union(leg(-5.0, -1.6, 8.0), leg(5.0, -1.6, 8.0));
-        let rest = rounded_cuboid(q - point(0.0, 6.8, -1.6), point(5.6, 1.0, 0.18), 0.05);
+        let rest = rounded_cuboid(q - point(0.0, 6.8, -1.6), point(5.6, 1.0, 0.4), 0.05);
         let coarse = union(union(seat, rest), union(front, back));
         // The grain runs along the planks: noise drawn out ten times along x.
-        let grain = if coarse < 0.02 { detail(point(q.x * 0.1, q.y, q.z), view, 0.08, 0.06, self.seed ^ 0x3d) } else { -0.01 };
-        Answer::new(coarse + grain, Material::Wood)
+        // Near the wood, and faded out further off into the most it could add (a centimetre), so the
+        // distance never jumps.
+        let near = between(coarse, 0.03, 0.02);
+        let grain = if near > 0.0 { detail(point(q.x * 0.1, q.y, q.z), view, 0.08, 0.06, self.seed ^ 0x3d) } else { 0.0 };
+        Answer::new((coarse + mix(-0.01, grain, near)) * 0.8, Material::Wood)
     }
 }
 

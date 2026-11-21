@@ -1,12 +1,19 @@
-//! Plateau's engine (POC_PLAN.md). For now, an area as the engine sees it: a `Region`, answering
-//! what is where for a viewer of a size and what it is, from its module (`Wasm`, checked on load by
+//! Plateau's engine (POC_PLAN.md). An area as the engine sees it: a `Region`, answering what is
+//! where for a viewer of a size and what it is, from its module (`Wasm`, checked on load by
 //! `check`, run in wasmtime with the limits the engine keeps) or, in tests, from its source played
 //! natively. The interface is the WIT world `plateau:region@0.1.0` (`sdk/wit/region.wit`); the
 //! engine writes and reads its canonical ABI itself (`wasm`).
+//!
+//! What the engine makes of an area, without a window: the surface in chunks at the detail each
+//! size needs (`chunk`, `rings`), a player's body walking it at their size (`body`), pictures
+//! (`picture`), and the laws (`laws`). The window is `play/`.
 
+pub mod body;
 pub mod check;
+pub mod chunk;
 pub mod laws;
 pub mod picture;
+pub mod rings;
 pub mod wasm;
 
 pub use wasm::{Compiled, Limits, Wasm};
@@ -25,6 +32,10 @@ pub const WIDTH: f32 = 64.0;
 
 /// The three sizes, by name, and their heights in metres (CONCEPT.md, "Three sizes").
 pub const SIZES: [(Size, f32); 3] = [(Size::Tiny, 0.017), (Size::Person, 1.7), (Size::Giant, 17.0)];
+
+/// Where a player comes into an area, across the ground (x, z): the middle of its south edge, a
+/// little way in, facing north. Areas say nothing of it yet; borders will (step 8).
+pub const START: [f64; 2] = [32.0, 60.0];
 
 /// The smallest and largest a viewer may be, so an area is asked only at sizes it was made for:
 /// the tiny's height halved, a giant's doubled.
@@ -61,6 +72,10 @@ impl Material {
 
     pub fn from_number(n: u8) -> Option<Material> {
         Material::ALL.get(n as usize).copied()
+    }
+
+    pub fn name(self) -> &'static str {
+        ["soil", "grass", "sand", "mud", "stone", "wood", "leaf", "moss", "water"][self as usize]
     }
 }
 

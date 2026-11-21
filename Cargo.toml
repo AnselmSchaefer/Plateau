@@ -1,6 +1,6 @@
 # Plateau (CONCEPT.md, POC_PLAN.md): the SDK areas are written against, the engine, the areas, and the spike of step 0.
 [workspace]
-members = ["sdk", "engine", "areas/played", "spike/host", "spike/view-bevy", "spike/view-wgpu"]
+members = ["sdk", "engine", "play", "areas/played", "spike/host", "spike/view-bevy", "spike/view-wgpu"]
 resolver = "3"
 
 [workspace.package]
