@@ -1,5 +1,6 @@
-# Plateau's engine (POC_PLAN.md): for now an area's module checked on load and run in wasmtime with
-# the limits the engine keeps, its answers read out of the canonical ABI, and the first law.
+# Plateau's engine (POC_PLAN.md): an area's module checked on load and run in wasmtime with the
+# limits the engine keeps, its answers read out of the canonical ABI; its surface in chunks, a body
+# walking it, where each size can go, pictures, and the laws.
 [package]
 name = "plateau-engine"
 version = "0.0.0"

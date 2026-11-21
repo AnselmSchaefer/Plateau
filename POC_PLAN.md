@@ -220,6 +220,80 @@ Seeded, with the smallest failing case printed (as `LAWS_PLAN.md`).
 **Done when** the walled garden keeps all four, and an area made wrong on purpose (a crack wide
 enough for a person) breaks "gates are real" with a clear message.
 
+Done 2026-11-21. The laws are `engine/src/laws.rs`, where each search walks `reach` (below). Each is
+seeded, says in words where it broke, at what size and by how much, and what the law asks, for
+Claude to read in step 5. Seven laws:
+
+| Law | How it is searched |
+|---|---|
+| Sizes agree | For each size of a ladder from the tiny to a giant, each about three times the last (the sizes between are passed through while growing), and the next one up: looks from the larger's open air, each a ball a twentieth of the larger's height wide, as each size sees the area. Where either stops at a surface, the other must see one there too, within a tenth of the larger's height |
+| Gates are real | Each place is reached by its size, from the start, changing size on the way as a player may; and by nobody who is never that size |
+| No traps | From every stand reached, the start can be got back to, at some size |
+| The same everywhere | The answers of nine chunks (the finest level of each size, about the start and each place), hashed from the module, against `areas/<name>/hashes.txt`; `PLATEAU_KEEP=1` writes them, for a change made on purpose |
+| NaNs unseen | Step 1's |
+| Distances never too long | Rays at every size of the ladder, marched as the engine marches; a step landing beyond a surface is narrowed to how much too long it was; and points about each surface found, against the way to it |
+| Surfaces have an inside | New (below): about everywhere the distance comes to nought, something is solid |
+
+`engine/src/reach.rs` works out where each size can go. Columns are a body's radius wide. Down
+each, it finds the floors as the body finds ground, the ceiling over each, and whether a body
+fits there (its spheres, with the body's own rays). A body walks onto the highest floor in the
+next column that is no higher than it can jump, if there is room overhead; down any drop, sliding
+into a hollow whose edge has no room for it. It shrinks anywhere and grows where the larger fits.
+Persons and giants are searched over the whole area (63 000 columns and, since step 4,
+25 000). The tiny are
+searched only about their own places (2 m about each), from the place out through what no person
+covers to where a person stands within two columns and the tiny can walk straight to them. A
+person must also see open air just above the floor there. Elsewhere the tiny go where a person
+goes, so a place for a person is held only to giants. Every guess leans towards reaching more,
+never less, so a place one size alone should reach is never passed wrongly.
+
+The tests (`engine/tests/laws.rs`): every area of `areas/` keeps every law, natively and as its
+module. A yard made wrong on purpose, one way per law, breaks that law and no other:
+
+- a slot through a block wide enough for a person: "a gate is not real: "the room in the block",
+  meant for a tiny person alone, is reached by a person who is never tiny: as a giant (31.9, 0.0,
+  59.9), …, as a person (39.40, 0.00, 31.75), …, (40.93, 0.00, 32.00)…";
+- no slot at all ("…the way in is shut");
+- a pit too deep to climb out of and too narrow to grow in ("a trap: a person who comes to
+  (19.76, -8.00, 19.76) cannot get back to the start, at any size…");
+- the block half a metre further east for whoever is under half a metre (sizes agree);
+- the ground's distance half as long again (never too long, "1.50 times too long");
+- a hollow cut down exactly from the ground's surface (surfaces have an inside).
+
+Over the garden, `reach` takes 7 s: 1.5 s for persons and giants, 5 for the tiny about the
+cave, whose 30 000 columns are their room alone. The laws' tests take 10 s. Each ray law takes
+0.2 s at 600 rays a size.
+
+Found:
+
+- **The literal "sizes agree" would refuse the cave.** At random points, the distance a person
+  is told, 25 cm inside the wall, and the one the tiny are told, in the cave's air, differ far
+  beyond a person's detail. Yet nothing a person sees changes: the cave opens only through a
+  crack too small for them. So the law compares what each size sees from the larger's air, looking
+  as wide as the larger's detail, rather than the distances themselves.
+- **The garden broke "never too long" in three places, all fixed** (`areas/garden/area.rs`). The
+  wall's mortar was cut only below the coping, so at the top course's joint the distance jumped
+  from the groove's air to inside the coping: 17.5 times too long for a 17 cm viewer, at
+  (9.80, 2.40, 18.31). The groove is now closed at the top, continuous. The lawn's lumps add
+  octave upon octave of slope (1.10 times at 0.85): now 0.7. The pebbles, placed by their
+  height above the sloping ground, are sheared by it: scaled the same. The bench's grain: 1.01, now
+  0.75. Scaling moves no surface; the hashes and pictures are made again. Clean afterwards over
+  ten seeds of 8000 rays at each size.
+- **A shape cut out flush with a surface leaves a lid.** Where a pit is cut down from exactly
+  the ground's surface, or a door through exactly a wall's thickness, the distance is nought
+  across its mouth: a surface with nothing inside. A ray stops there; the body in play stands on
+  it, or walks into it. It is the trap of step 1's lily pads ("a bound answered right up to its
+  edge") in another form. A new law, **surfaces have an inside**, refuses it. `reach` steps over
+  floors thinner than its step. The guide (step 5) must say: cut out a little beyond what is cut.
+- **Thin hollows have edges with no room**: a pit 1.2 m wide fits a person only in its middle, so
+  walking needs to slide on into the column beyond as it drops, as the body does.
+- **Left open:** the tiny's world is searched only about their places, so a tiny way to a
+  giant's place elsewhere (up a staircase of pebbles) is not seen, nor a trap for the tiny far
+  from their places. A place for a person is held only to giants. Gaps are never jumped across.
+  Giants' sinking is not counted. Whether the tiny's 5 s about a large room matters when Claude's
+  areas run as modules, every round, is for step 5; the columns could be found on all cores, as the
+  chunks are.
+
 ### 4. Pictures (two days)
 
 - Ray-marched pictures at fixed views for each size: from above, from the start, at each place it
@@ -229,6 +303,63 @@ enough for a person) breaks "gates are real" with a clear message.
 
 **Done when** the pictures of the walled garden show the crack, the cave and the bench, and its
 reach map shows the cave as the tiny's alone.
+
+Done 2026-11-21. `engine/src/picture.rs` takes any area's pictures from what it describes, with
+nothing chosen by hand, as step 5 needs for Claude's areas:
+
+- **Views** (`views`): a giant over the whole area from the south; each size standing at the
+  start, looking in; and each place, seen at its own size from the first viewpoint that is in
+  the open with a clear sight of it (three of their heights off, then nearer, from the south and
+  then round).
+- **Plans** (`plans`, `plan`): straight down, north at the top. The whole area as a person sees
+  it; and about each place, thirty of its size's heights each way, cut away ten heights above
+  it, so the cave inside the wall shows as a floor plan, the wall flat and dark where cut. Light is
+  not stopped by what the cut takes away.
+- **Reach maps** (`map`, `tint`): each plan coloured by what each size opens, by the gates' own
+  rule. A spot is tinted a size's colour when a body reaches it, but not the body of anyone who
+  is never that size: the tiny orange and giants purple (the sketch's pens), persons yellow.
+  Where anyone gets, the plan is left as it is. Where nobody gets at the plan's heights it is
+  greyed, and darkened where nobody gets at all. Only the floor seen from above counts (the
+  highest under the cut). A body fills a spot only where the finest column found there has a floor
+  at its height with room for it, so a giant on the lawn does not fill a cave level with it.
+  Places are ringed in their size's colour.
+
+`cargo run --release -p plateau-engine --example look [module] [folder]` makes them all
+(`areas/garden/pictures/`, with the garden's hand-chosen views of step 1, which show the crack
+better than any viewpoint found). It takes about 35 s for the garden, 5.5 of them the four
+searches. `engine/tests/pictures.rs`: on the cave's reach map the cave is opened by the tiny alone
+and only the tiny stand in it; on the whole garden's, the seat and the wall's top are opened by
+giants alone and the start by nobody in particular; the cave's plan shows its earthen floor under
+the wall cut away.
+
+The whole garden's reach map shows the wall's top and the bench purple, and nothing else
+tinted. The cave is hidden under the wall's top there; its own map shows it, crack and all,
+orange. On that map, a strip of lawn under the coping's 10 cm overhang is yellow: a person's
+column there (25 cm) has room for a person under the overhang, not for a giant.
+
+Found:
+
+- **Each size's reach in its colour is stripes from edge to edge**: persons and giants both
+  stand almost everywhere. What is worth seeing is what each size opens, so the map follows the
+  gates' rule, and the map and the law cannot disagree.
+- **A column has several floors**, and counting them all left the seat as anyone's: anyone
+  reaches the lawn under it. Only the floor seen from above counts now.
+- **Feet are not fair between sizes; bodies are.** A person's feet keep 23 cm off a wall, while a
+  giant's column reached right up to it, so the lawn by every wall looked as if only giants got
+  there. Each body now fills the ground it stands over, checked against the finest columns there.
+- **A giant stood on no wall.** Its columns were its radius wide (2.5 m), and none of their
+  middles fell on the wall's 80 cm top, though the body in play stands there. The purple walls of
+  the first maps were giants on the lawn painting over them. Columns are now no wider than 40 cm
+  (`reach::WIDEST`), which costs a giant 25 000 columns, little at its size. The maps' first test
+  passed only by a rounding error at a plan's edge, which had hidden a giant's 2.5 m column.
+- **The tiny cannot be searched without persons.** The tiny's search spent its whole budget
+  without persons, since the tiny would have to be followed from wherever a giant shrinks. Without
+  persons the tiny are not searched, and a spot only the tiny stand on is never said to need a
+  person. The budget is now one per place and search, not shared.
+- **Left:** persons neither stand on a lily pad thinner than their step nor fit under one, which
+  is true to the rules but perhaps not to what was meant. The viewpoint found for the cave looks at
+  its floor and the back of the crack; Claude will need better viewpoints when shown its own areas
+  (step 5).
 
 ### 5. Claude makes an area (four or five days)
 

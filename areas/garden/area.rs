@@ -89,7 +89,9 @@ impl Garden {
         let r = (p - POND).flat_length();
         let shore = 8.0 + 0.6 * noise(p / 1.5, self.seed ^ 0x3c);
         let material = if r < shore { Material::Mud } else { Material::Grass };
-        let ground = Answer::new((p.y - surface) * 0.85, material);
+        // The lumps' octaves add up to slopes of nearly one where they line up: the distance made
+        // shorter to stay never too long (the law found it 1.1 times too long at 0.85).
+        let ground = Answer::new((p.y - surface) * 0.7, material);
         // Pebbles, a centimetre or so across, half sunk: boulders to the tiny, unseen by anyone else.
         let seen = view.sees(0.015);
         if seen == 0.0 || abs(p.y - surface) > 0.03 {
@@ -99,7 +101,9 @@ impl Garden {
             let r = s.next(0.004, 0.012) * seen;
             sphere(point(q.x, p.y - surface + r * 0.4, q.z), r)
         });
-        ground.or(Answer::new(pebbles, Material::Stone))
+        // Each is placed by its height above the sloping ground, which shears it: its distance
+        // made shorter as the ground's is.
+        ground.or(Answer::new(pebbles * 0.7, Material::Stone))
     }
 
     /// The wall, of stone blocks in courses, a coping on top, the gate cut through to the south;
@@ -119,7 +123,7 @@ impl Garden {
         // too long.
         let mut d = (coarse + detail(p, view, 0.3, 0.025, self.seed ^ 0x7f4a)) * 0.85;
         let depth = 0.025 * view.sees(0.03);
-        if depth > 0.0 && p.y < TOP {
+        if depth > 0.0 {
             // The courses are horizontal; the joints between blocks run across each wall, half a
             // block along on every other course.
             let along = if abs(q.z) > abs(q.x) { p.x } else { p.z };
@@ -129,8 +133,9 @@ impl Garden {
             let t = (along + shift) / BLOCK;
             let joint = abs(t - (t + 0.5).floor()) * BLOCK - 0.012;
             let mortar = min(bed, joint);
-            // Cut out where it is mortar, as deep as `depth` into the face.
-            d = max(d, min(-mortar, d + depth));
+            // Cut out where it is mortar, as deep as `depth` into the face, up to the coping: a
+            // groove closed at the top, so the distance runs on into the coping's without a jump.
+            d = max(d, min(min(-mortar, d + depth), TOP - p.y));
         }
         let mut wall = Answer::new(d, Material::Stone);
         // Moss at the wall's foot in patches, and always about the crack's mouth.
@@ -233,7 +238,7 @@ impl Garden {
         // distance never jumps.
         let near = between(coarse, 0.03, 0.02);
         let grain = if near > 0.0 { detail(point(q.x * 0.1, q.y, q.z), view, 0.08, 0.06, self.seed ^ 0x3d) } else { 0.0 };
-        Answer::new((coarse + mix(-0.01, grain, near)) * 0.8, Material::Wood)
+        Answer::new((coarse + mix(-0.01, grain, near)) * 0.75, Material::Wood)
     }
 }
 

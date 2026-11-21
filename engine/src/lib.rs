@@ -5,14 +5,16 @@
 //! engine writes and reads its canonical ABI itself (`wasm`).
 //!
 //! What the engine makes of an area, without a window: the surface in chunks at the detail each
-//! size needs (`chunk`, `rings`), a player's body walking it at their size (`body`), pictures
-//! (`picture`), and the laws (`laws`). The window is `play/`.
+//! size needs (`chunk`, `rings`), a player's body walking it at their size (`body`), where each
+//! size can go (`reach`), pictures (`picture`), and the laws an area must keep (`laws`). The window
+//! is `play/`.
 
 pub mod body;
 pub mod check;
 pub mod chunk;
 pub mod laws;
 pub mod picture;
+pub mod reach;
 pub mod rings;
 pub mod wasm;
 
@@ -148,7 +150,7 @@ pub fn hash(answers: &[Answer]) -> u64 {
 }
 
 /// Numbers from 0 to 1, the same every time for the same seed (xorshift).
-fn numbers(seed: u32) -> impl FnMut() -> f32 {
+pub(crate) fn numbers(seed: u32) -> impl FnMut() -> f32 {
     let mut state = seed | 1;
     move || {
         state ^= state << 13;

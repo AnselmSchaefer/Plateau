@@ -1,0 +1,12 @@
+# The hashes of the answers of chunks of areas/modules/garden.wasm, seed 7: the law "the same everywhere"
+# (POC_PLAN.md, step 3). Each chunk's level, its place on the level's grid, its hash. Written by
+# `PLATEAU_KEEP=1 cargo test -p plateau-engine --test laws`, when the world is changed on purpose.
+-11 2048 29 3840 773b69be9432637e
+-4 16 0 30 24f2a75e92c21a16
+-1 2 0 3 bad01f74c9d95325
+-11 3456 -3 1929 dc7bd6ea9386b0f2
+-4 27 -1 15 cf2d992caae5b4dc
+-1 3 -1 1 10f35f65ce6152e9
+-11 2560 288 1152 093116ced577454f
+-4 20 2 9 7f08ed55b9c89ba5
+-1 2 0 1 224f4144e30a0ebc

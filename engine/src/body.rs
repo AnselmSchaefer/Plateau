@@ -161,13 +161,17 @@ const UP: [f64; 3] = [0.0, 1.0, 0.0];
 impl Body {
     /// A body `size` tall standing on the ground under `from`, dropped from there.
     pub fn standing(area: &mut dyn Region, from: [f64; 3], size: f32) -> Result<Body> {
-        let size = size.clamp(SMALLEST, LARGEST);
-        let mut body = Body { feet: from, velocity: [0.0; 3], size, yaw: 0.0, on: None, seat: None, change: None, blocked: false };
+        let mut body = Body { feet: from, ..Body::of_size(size.clamp(SMALLEST, LARGEST)) };
         if let Hit::At(t, m) = body.cast(area, &[Ray { from, along: DOWN, length: 200.0 }])?[0] {
             body.feet[1] = from[1] - t - sinks(m, size) as f64;
             body.on = Some(m);
         }
         Ok(body)
+    }
+
+    /// A body `size` tall, nowhere yet: for asking what it touches (`reach`).
+    pub fn of_size(size: f32) -> Body {
+        Body { feet: [0.0; 3], velocity: [0.0; 3], size, yaw: 0.0, on: None, seat: None, change: None, blocked: false }
     }
 
     pub fn radius(&self) -> f32 {
@@ -267,9 +271,14 @@ impl Body {
 
     /// The middles of the spheres along the body's axis above its step.
     fn spheres(&self) -> [[f64; 3]; 4] {
+        self.spheres_at(self.feet)
+    }
+
+    /// The same, for the body standing at `feet`.
+    pub(crate) fn spheres_at(&self, feet: [f64; 3]) -> [[f64; 3]; 4] {
         let (h, r) = (self.size, self.radius());
         let (low, high) = (STEP * h + r, h - r);
-        [0.0, 1.0, 2.0, 3.0].map(|k| [self.feet[0], self.feet[1] + (low + (high - low) * k / 3.0) as f64, self.feet[2]])
+        [0.0, 1.0, 2.0, 3.0].map(|k| [feet[0], feet[1] + (low + (high - low) * k / 3.0) as f64, feet[2]])
     }
 
     /// The distance to a solid an answer says, for this body: none for water it does not float on.
@@ -279,7 +288,7 @@ impl Body {
 
     /// For each of `middles`, how far the nearest surface within `reach` is and which way, if one
     /// is: rays out in 26 directions, each from as far as the middle's distance says is clear.
-    fn touching(&self, area: &mut dyn Region, middles: &[[f64; 3]], reach: f64) -> Result<Vec<Option<Touch>>> {
+    pub(crate) fn touching(&self, area: &mut dyn Region, middles: &[[f64; 3]], reach: f64) -> Result<Vec<Option<Touch>>> {
         let mut out = Vec::new();
         let points: Vec<[f32; 3]> = middles.iter().map(|p| p.map(|c| c as f32)).collect();
         chunk::sample(area, &points, self.size, &mut out)?;
