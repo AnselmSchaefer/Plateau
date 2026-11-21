@@ -61,6 +61,16 @@ impl Key {
         o.map(|c| c + half)
     }
 
+    /// The chunk of the next level up that holds this one.
+    pub fn parent(self) -> Key {
+        Key { level: self.level + 1, at: self.at.map(|i| i.div_euclid(2)) }
+    }
+
+    /// The eight chunks of the next level down within this one.
+    pub fn children(self) -> [Key; 8] {
+        std::array::from_fn(|k| Key { level: self.level - 1, at: [0, 1, 2].map(|a| self.at[a] * 2 + (k as i32 >> a & 1)) })
+    }
+
     /// The viewer the chunk is asked for: twenty voxels tall, within the sizes an area is asked at.
     pub fn size(self) -> f32 {
         (self.voxel() as f32 * VOXELS_A_HEIGHT).clamp(SMALLEST, LARGEST)

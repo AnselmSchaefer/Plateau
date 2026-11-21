@@ -1,9 +1,12 @@
-person-at-the-start: 190 frames a second (worst frame 6.6 ms); 50 chunks shown, 103k triangles; 156 chunks made in 0.24 s, 2.6 ms each, the slowest 10 ms
-person-at-the-crack: 179 frames a second (worst frame 7.1 ms); 99 chunks shown, 179k triangles; 192 chunks made in 0.20 s, 4.7 ms each, the slowest 27 ms
-person-under-the-bench: 175 frames a second (worst frame 6.7 ms); 118 chunks shown, 210k triangles; 174 chunks made in 0.20 s, 5.7 ms each, the slowest 35 ms
-person-shrunk-at-the-crack: 114 frames a second (worst frame 20.8 ms); 223 chunks shown, 473k triangles; 552 chunks made in 1.01 s, 7.9 ms each, the slowest 61 ms
-tiny-at-the-crack: 113 frames a second (worst frame 10.0 ms); 237 chunks shown, 515k triangles; 208 chunks made in 0.30 s, 13.2 ms each, the slowest 178 ms
-tiny-in-the-cave: 112 frames a second (worst frame 9.6 ms); 244 chunks shown, 535k triangles; 312 chunks made in 0.43 s, 12.7 ms each, the slowest 78 ms
-tiny-on-the-pond: 153 frames a second (worst frame 15.9 ms); 165 chunks shown, 351k triangles; 538 chunks made in 0.30 s, 5.3 ms each, the slowest 38 ms
-giant-over-the-garden: 266 frames a second (worst frame 5.0 ms); 20 chunks shown, 35k triangles; 0 chunks made in 0.20 s, 0.0 ms each, the slowest 0 ms
-giant-on-the-bench: 256 frames a second (worst frame 4.6 ms); 31 chunks shown, 58k triangles; 2 chunks made in 0.20 s, 4.8 ms each, the slowest 7 ms
+person-at-the-start: 178 frames a second (worst frame 11.6 ms); 50 chunks shown, 103k triangles; 156 chunks made in 0.25 s, 3.2 ms each, the slowest 21 ms
+person-at-the-crack: 155 frames a second (worst frame 14.0 ms); 110 chunks shown, 199k triangles; 208 chunks made in 0.20 s, 5.7 ms each, the slowest 38 ms
+person-under-the-bench: 154 frames a second (worst frame 12.6 ms); 118 chunks shown, 210k triangles; 156 chunks made in 0.21 s, 7.0 ms each, the slowest 41 ms
+person-shrunk-at-the-crack: 122 frames a second (worst frame 14.1 ms); 223 chunks shown, 473k triangles; 2313 chunks made in 1.01 s, 3.3 ms each, the slowest 86 ms
+tiny-at-the-crack: 120 frames a second (worst frame 12.8 ms); 233 chunks shown, 502k triangles; 176 chunks made in 0.27 s, 13.4 ms each, the slowest 75 ms
+tiny-in-the-cave: 103 frames a second (worst frame 15.3 ms); 250 chunks shown, 543k triangles; 288 chunks made in 0.48 s, 16.0 ms each, the slowest 89 ms
+tiny-on-the-pond: 138 frames a second (worst frame 13.6 ms); 167 chunks shown, 352k triangles; 538 chunks made in 0.33 s, 5.6 ms each, the slowest 43 ms
+giant-over-the-garden: 216 frames a second (worst frame 8.9 ms); 20 chunks shown, 35k triangles; 0 chunks made in 0.20 s, 0.0 ms each, the slowest 0 ms
+giant-on-the-bench: 209 frames a second (worst frame 8.7 ms); 31 chunks shown, 58k triangles; 2 chunks made in 0.20 s, 7.0 ms each, the slowest 10 ms
+person-running-in-at-the-gate: 160 frames a second (worst frame 19.4 ms); 83 chunks shown, 146k triangles; 0 chunks made in 0.20 s, 0.0 ms each, the slowest 0 ms; going, 260 chunks made, 0 of 639 frames with holes, at most 0, choosing and placing chunks 2.5 ms at most
+tiny-running-along-the-wall: 102 frames a second (worst frame 26.6 ms); 236 chunks shown, 513k triangles; 156 chunks made in 0.24 s, 13.8 ms each, the slowest 87 ms; going, 184 chunks made, 0 of 408 frames with holes, at most 0, choosing and placing chunks 7.0 ms at most
+giant-walking-across-the-garden: 228 frames a second (worst frame 8.0 ms); 19 chunks shown, 34k triangles; 0 chunks made in 0.20 s, 0.0 ms each, the slowest 0 ms; going, 2 chunks made, 0 of 686 frames with holes, at most 0, choosing and placing chunks 0.6 ms at most

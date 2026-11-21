@@ -4,10 +4,10 @@
 
 mod played;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use plateau_engine::chunk::{self, CELLS, Key, Making, Mesh};
-use plateau_engine::rings::{self, COARSEST, finest, reach, wanted};
+use plateau_engine::rings::{self, COARSEST, Rings, finest, shown, wanted};
 use plateau_engine::{SIZES, WIDTH};
 
 const SEED: u64 = 7;
@@ -144,43 +144,127 @@ fn the_empty_sky_is_asked_once() {
     assert_eq!(samples, 1);
 }
 
+/// Numbers from 0 to 1, the same every time (xorshift).
+fn numbers(seed: u32) -> impl FnMut() -> f64 {
+    let mut s = seed | 1;
+    move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s as f64 / u32::MAX as f64
+    }
+}
+
+/// That `keys`, wanted by a viewer at `eye`, `size` tall, hold every point between `lo` and `hi`
+/// over the area once (`n` points, half of them near the eye), the finest about the eye.
+fn fill_once(keys: &[Key], eye: [f64; 3], size: f32, (lo, hi): ([f64; 3], [f64; 3]), n: usize) {
+    assert_eq!(keys[0].level, finest(size));
+    assert!(keys.iter().all(|k| k.level >= keys[0].level && k.level <= COARSEST));
+    let holds = |k: &Key, p: &[f64; 3]| (0..3).all(|a| (k.origin()[a]..k.origin()[a] + k.side()).contains(&p[a]));
+    assert!(keys.iter().any(|k| k.level == finest(size) && holds(k, &eye)), "the eye at {eye:?} is not in a finest chunk");
+    let mut next = numbers(0x2545_f491);
+    for k in 0..n {
+        let p: [f64; 3] = if k % 2 == 0 {
+            [0, 1, 2].map(|a| (eye[a] + (next() * 2.0 - 1.0) * size as f64 * 4.0).clamp(lo[a], hi[a] - 1e-9))
+        } else {
+            [0, 1, 2].map(|a| lo[a] + next() * (hi[a] - lo[a]))
+        };
+        if p[0] < 0.0 || p[2] < 0.0 || p[0] >= WIDTH as f64 || p[2] >= WIDTH as f64 {
+            continue;
+        }
+        let holders = keys.iter().filter(|k| holds(k, &p)).count();
+        assert_eq!(holders, 1, "{p:?} is in {holders} chunks for a viewer {size} m tall at {eye:?}");
+    }
+}
+
 #[test]
 fn the_chunks_a_viewer_wants_fill_the_space_about_them_once() {
     let eyes = [[32.0, 1.6, 60.0], [53.65, 0.06, 30.0], [40.0, 13.0, 23.0], [0.3, 0.0, 63.9], [12.0, 30.0, 5.0]];
     for (_, size) in SIZES.iter().chain(&[(SIZES[0].0, 0.2), (SIZES[0].0, 5.0)]) {
         for eye in eyes {
-            let keys = wanted(eye, *size);
-            assert_eq!(keys[0].level, finest(*size));
-            assert!(keys.iter().all(|k| k.level >= keys[0].level && k.level <= COARSEST));
-            // The finest chunks are about the eye.
-            assert!(keys.iter().any(|k| k.level == finest(*size) && (0..3).all(|a| (k.origin()[a]..k.origin()[a] + k.side()).contains(&eye[a]))));
-            let (lo, hi) = reach(eye);
-            let mut next = {
-                let mut s = 0x2545_f491u32;
-                move || {
-                    s ^= s << 13;
-                    s ^= s >> 17;
-                    s ^= s << 5;
-                    s as f64 / u32::MAX as f64
-                }
-            };
-            for k in 0..20_000 {
-                // Half the points close to the eye, where the levels are many.
-                let p: [f64; 3] = if k % 2 == 0 {
-                    [0, 1, 2].map(|a| (eye[a] + (next() * 2.0 - 1.0) * *size as f64 * 4.0).clamp(lo[a], hi[a] - 1e-9))
-                } else {
-                    [0, 1, 2].map(|a| lo[a] + next() * (hi[a] - lo[a]))
-                };
-                if p[0] < 0.0 || p[2] < 0.0 || p[0] >= WIDTH as f64 || p[2] >= WIDTH as f64 {
-                    continue;
-                }
-                let holders = keys.iter().filter(|k| (0..3).all(|a| (k.origin()[a]..k.origin()[a] + k.side()).contains(&p[a]))).count();
-                assert_eq!(holders, 1, "{p:?} is in {holders} chunks for a viewer {size} m tall at {eye:?}");
-            }
+            let mut rings = Rings::default();
+            let keys = rings.wanted(eye, *size);
+            fill_once(&keys, eye, *size, rings.reach().unwrap(), 20_000);
         }
     }
     // A tiny person sees twelve levels; a giant two.
     assert_eq!(rings::finest(0.017), -11);
     assert_eq!(rings::finest(1.7), -4);
     assert_eq!(rings::finest(17.0), -1);
+}
+
+#[test]
+fn blocks_lag_behind_a_walker_and_still_fill_the_space_once() {
+    for (_, size) in SIZES {
+        let mut rings = Rings::default();
+        let mut next = numbers(7);
+        let mut eye = [53.6, 0.5 * size as f64, 30.0];
+        let (mut changes, mut changes_without_lag, mut before, mut before_without_lag) = (0, 0, Vec::new(), Vec::new());
+        // To and fro about where it started, and drifting, a tenth of a height a step.
+        for step in 0..400 {
+            let way = if step % 40 < 20 { 1.0 } else { -1.0 };
+            for a in [0, 2] {
+                eye[a] = (eye[a] + (way * 0.7 + next() - 0.5) * 0.1 * size as f64).clamp(1.0, WIDTH as f64 - 1.0);
+            }
+            let mut keys = rings.wanted(eye, size);
+            fill_once(&keys, eye, size, rings.reach().unwrap(), 400);
+            keys.sort();
+            changes += (keys != before) as usize;
+            before = keys;
+            let mut plain = wanted(eye, size);
+            plain.sort();
+            changes_without_lag += (plain != before_without_lag) as usize;
+            before_without_lag = plain;
+        }
+        assert!(changes * 3 < changes_without_lag * 2, "a {size} m viewer's chunks changed {changes} times lagging, {changes_without_lag} not");
+    }
+}
+
+/// That no chunk shown overlaps another: none is shown twice, or within another shown.
+fn no_overlaps(shown: &[Key]) {
+    let set: HashSet<Key> = shown.iter().copied().collect();
+    assert_eq!(set.len(), shown.len(), "a chunk is shown twice");
+    for k in shown {
+        let mut p = *k;
+        while p.level < COARSEST {
+            p = p.parent();
+            assert!(!set.contains(&p), "{k:?} is shown within {p:?}, also shown");
+        }
+    }
+}
+
+#[test]
+fn what_is_shown_never_overlaps_and_stands_in_for_what_is_not_made() {
+    for (_, size) in SIZES {
+        let eye = [53.6, 0.5 * size as f64, 30.0];
+        let mut rings = Rings::default();
+        let old = rings.wanted(eye, size);
+        // All made: all shown, as wanted.
+        let (all, holes) = shown(&old, &|_| true);
+        assert_eq!((all.len(), holes), (old.len(), 0));
+        // Nothing made: nothing shown, every wanted chunk a hole.
+        let (none, holes) = shown(&old, &|_| false);
+        assert_eq!((none.len(), holes), (0, old.len()));
+        // Some made at random: no overlaps, and only made chunks.
+        let mut next = numbers(3);
+        let made: HashSet<Key> = old.iter().flat_map(|k| [*k, k.parent()]).filter(|_| next() < 0.6).collect();
+        let (some, _) = shown(&old, &|k| made.contains(&k));
+        no_overlaps(&some);
+        assert!(some.iter().all(|k| made.contains(k)));
+        // A few steps on, with only the old view made: the new view is all stood in for.
+        let mut eye = eye;
+        let made: HashSet<Key> = old.iter().copied().collect();
+        for _ in 0..6 {
+            eye[0] += 0.3 * size as f64;
+            let new = rings.wanted(eye, size);
+            let (stand_ins, holes) = shown(&new, &|k| made.contains(&k));
+            no_overlaps(&stand_ins);
+            assert_eq!(holes, 0, "a {size} m viewer walking to {eye:?} with only the old view made sees holes");
+        }
+        // Grown, with only the smaller view made: the finer chunks stand in for the coarser.
+        let grown = Rings::default().wanted(eye, size * 4.0);
+        let (finer, _) = shown(&grown, &|k| made.contains(&k));
+        no_overlaps(&finer);
+        assert!(finer.iter().any(|k| k.level < finest(size * 4.0)), "nothing finer stands in for a viewer grown");
+    }
 }

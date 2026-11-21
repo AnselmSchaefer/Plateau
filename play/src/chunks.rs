@@ -1,10 +1,13 @@
 //! The area's surface about the player, made off the frame (POC_PLAN.md, step 2): the chunks the
-//! player sees (`rings::wanted`), made by a thread for each core but two, each with its own instance
-//! of the area's module, finest and nearest first; shown as they come back, drawn relative to the
-//! player's eye and scaled to their size (`Chunks::place`).
+//! player sees (`rings::Rings`), made by a thread for each core but two, each with its own instance
+//! of the area's module, finest and nearest first; then those the player will see where they are
+//! going and at the size they are growing or shrinking to. Drawn relative to the player's eye and
+//! scaled to their size (`Chunks::place`).
 //!
-//! Chunks no longer wanted stay shown until every wanted chunk is made, so moving or changing size
-//! never opens a hole; then they are hidden, and kept a while in case they are wanted again.
+//! What is shown is chosen afresh each frame from what is made (`rings::shown`): a chunk wanted
+//! but not yet made is stood in for by the coarser chunk about it or the finer ones within it, so
+//! nothing shown overlaps and no hole opens while chunks are being made. Chunks no longer wanted
+//! are hidden and kept a while, in case they are wanted again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -56,7 +59,13 @@ pub struct Counts {
     pub shown: usize,
     pub empty: usize,
     pub waiting: usize,
+    /// Wanted chunks with nothing shown in their space; chunks made ahead and not yet wanted.
+    pub holes: usize,
+    pub ahead: usize,
+    /// Triangles drawn.
     pub triangles: usize,
+    /// The longest a frame's choosing and placing of chunks took, since the counts were cleared.
+    pub longest: Duration,
     /// Of the chunks made since the counts were last cleared: how many, the slowest, all together.
     pub made: usize,
     pub slowest: Duration,
@@ -68,7 +77,10 @@ pub struct Chunks {
     queue: Arc<Queue>,
     done: Mutex<Receiver<Done>>,
     known: HashMap<Key, Known>,
+    rings: rings::Rings,
     wanted: HashSet<Key>,
+    /// What is drawn: what `rings::shown` chose this frame.
+    shown: HashSet<Key>,
     frame: u64,
     material: Handle<StandardMaterial>,
     pub counts: Counts,
@@ -83,30 +95,55 @@ impl Chunks {
             let (queue, tell, compiled) = (queue.clone(), tell.clone(), compiled.clone());
             std::thread::Builder::new().name(format!("chunks {k}")).spawn(move || work(&queue, &tell, &compiled, seed)).expect("a thread to make chunks");
         }
-        Chunks { queue, done: Mutex::new(done), known: HashMap::new(), wanted: HashSet::new(), frame: 0, material, counts: Counts::default() }
+        Chunks {
+            queue,
+            done: Mutex::new(done),
+            known: HashMap::new(),
+            rings: rings::Rings::default(),
+            wanted: HashSet::new(),
+            shown: HashSet::new(),
+            frame: 0,
+            material,
+            counts: Counts::default(),
+        }
     }
 
-    /// Asks for the chunks a viewer at `eye`, `size` tall, sees, and brings to the screen those
-    /// made since the last frame.
-    pub fn update(&mut self, eye: [f64; 3], size: f32, commands: &mut Commands, meshes: &mut Assets<Mesh>) {
+    /// Asks for the chunks a viewer at `eye`, `size` tall, sees, then for those of each viewer
+    /// `ahead` (where they are going, the size they are changing to), and chooses what to show of
+    /// what is made, bringing to the screen what was made since the last frame.
+    pub fn update(&mut self, eye: [f64; 3], size: f32, ahead: &[([f64; 3], f32)], commands: &mut Commands, meshes: &mut Assets<Mesh>) {
         self.frame += 1;
-        let mut wanted = rings::wanted(eye, size);
         // Finest first, and on each level the nearest first.
-        let far = |k: &Key| {
-            let m = k.middle();
-            ((m[0] - eye[0]).powi(2) + (m[1] - eye[1]).powi(2) + (m[2] - eye[2]).powi(2)).sqrt() / k.side()
+        let order = |keys: &mut Vec<Key>, eye: [f64; 3]| {
+            let far = |k: &Key| {
+                let m = k.middle();
+                ((m[0] - eye[0]).powi(2) + (m[1] - eye[1]).powi(2) + (m[2] - eye[2]).powi(2)).sqrt() / k.side()
+            };
+            keys.sort_by(|a, b| a.level.cmp(&b.level).then(far(a).total_cmp(&far(b))));
         };
-        wanted.sort_by(|a, b| a.level.cmp(&b.level).then(far(a).total_cmp(&far(b))));
+        let mut wanted = self.rings.wanted(eye, size);
+        order(&mut wanted, eye);
         self.wanted = wanted.iter().copied().collect();
+        let mut later = Vec::new();
+        for &(e, s) in ahead {
+            let mut keys: Vec<Key> = self.rings.clone().wanted(e, s).into_iter().filter(|k| !self.wanted.contains(k)).collect();
+            order(&mut keys, e);
+            later.extend(keys);
+        }
         {
             let mut jobs = self.queue.jobs.lock().unwrap();
             let making = &jobs.making;
-            let todo: Vec<Key> = wanted.iter().rev().filter(|k| !self.known.contains_key(k) && !making.contains(k)).copied().collect();
-            jobs.todo = todo;
+            let mut seen = HashSet::new();
+            let todo: Vec<Key> =
+                wanted.iter().chain(&later).filter(|k| !self.known.contains_key(k) && !making.contains(k) && seen.insert(**k)).copied().collect();
+            jobs.todo = todo.into_iter().rev().collect();
             if !jobs.todo.is_empty() {
                 self.queue.more.notify_all();
             }
         }
+        // Chunks brought to the screen this frame are drawn from the next: until then, what they
+        // will stand in for stays shown.
+        let mut fresh = HashSet::new();
         let made: Vec<Done> = self.done.lock().unwrap().try_iter().take(MOST_A_FRAME).collect();
         for done in made {
             self.queue.jobs.lock().unwrap().making.remove(&done.key);
@@ -119,6 +156,7 @@ impl Chunks {
                     let entity = commands
                         .spawn((Mesh3d(meshes.add(to_bevy(mesh))), MeshMaterial3d(self.material.clone()), Transform::default(), Visibility::Hidden))
                         .id();
+                    fresh.insert(done.key);
                     Known::Shown { entity, triangles, wanted: self.frame }
                 }
                 Ok(Made { mesh: None, .. }) => Known::Empty,
@@ -129,12 +167,15 @@ impl Chunks {
             };
             self.known.insert(done.key, known);
         }
+        let (shown, holes) = rings::shown(&wanted, &|k| self.known.contains_key(&k) && !fresh.contains(&k));
+        self.shown = shown.into_iter().collect();
+        let later: HashSet<Key> = later.into_iter().collect();
         // Let go of the chunks wanted longest ago, if too many are kept.
         if self.known.len() > MOST_KEPT {
             let mut old: Vec<(u64, Key)> = self
                 .known
                 .iter()
-                .filter(|(k, _)| !self.wanted.contains(k))
+                .filter(|(k, _)| !self.wanted.contains(k) && !self.shown.contains(k) && !later.contains(k))
                 .map(|(k, known)| (if let Known::Shown { wanted, .. } = known { *wanted } else { 0 }, *k))
                 .collect();
             old.sort_unstable();
@@ -144,16 +185,22 @@ impl Chunks {
                 }
             }
         }
-        let mut counts = Counts { made: self.counts.made, slowest: self.counts.slowest, total: self.counts.total, ..Counts::default() };
+        let c = self.counts;
+        let mut counts = Counts { made: c.made, slowest: c.slowest, total: c.total, longest: c.longest, holes, ..Counts::default() };
         for key in &self.wanted {
-            match self.known.get_mut(key) {
-                Some(Known::Shown { triangles, wanted, .. }) => {
-                    counts.shown += 1;
-                    counts.triangles += *triangles;
-                    *wanted = self.frame;
-                }
+            match self.known.get(key) {
+                Some(Known::Shown { .. }) => counts.shown += 1,
                 Some(Known::Empty) => counts.empty += 1,
                 None => counts.waiting += 1,
+            }
+        }
+        counts.ahead = later.iter().filter(|k| !self.known.contains_key(k)).count();
+        for key in self.shown.iter().chain(&later) {
+            if let Some(Known::Shown { triangles, wanted, .. }) = self.known.get_mut(key) {
+                *wanted = self.frame;
+                if self.shown.contains(key) {
+                    counts.triangles += *triangles;
+                }
             }
         }
         self.counts = counts;
@@ -161,18 +208,18 @@ impl Chunks {
 
     /// Clears what is counted of the chunks made.
     pub fn clear_made(&mut self) {
-        (self.counts.made, self.counts.slowest, self.counts.total) = (0, Duration::ZERO, Duration::ZERO);
+        (self.counts.made, self.counts.slowest, self.counts.total, self.counts.longest) = (0, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     }
 
-    /// Every chunk shown drawn where it is from the eye, `scale` render units to a metre, and
-    /// those not wanted hidden once nothing wanted is still being made.
+    /// The chunks chosen to be shown drawn where they are from the eye, `scale` render units to a
+    /// metre; every other chunk hidden.
     pub fn place<F: bevy::ecs::query::QueryFilter>(&self, eye: [f64; 3], scale: f64, transforms: &mut Query<(&mut Transform, &mut Visibility), F>) {
-        let settled = self.counts.waiting == 0;
         for (key, known) in &self.known {
             let Known::Shown { entity, .. } = known else { continue };
             let Ok((mut transform, mut visibility)) = transforms.get_mut(*entity) else { continue };
-            let show = self.wanted.contains(key) || !settled;
-            *visibility = if show { Visibility::Visible } else { Visibility::Hidden };
+            let show = self.shown.contains(key);
+            // Only when it changes, so Bevy does not go over every chunk kept each frame.
+            visibility.set_if_neq(if show { Visibility::Visible } else { Visibility::Hidden });
             if show {
                 let o = key.origin();
                 transform.translation = Vec3::new(((o[0] - eye[0]) * scale) as f32, ((o[1] - eye[1]) * scale) as f32, ((o[2] - eye[2]) * scale) as f32);

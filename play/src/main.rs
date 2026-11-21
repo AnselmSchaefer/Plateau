@@ -36,6 +36,8 @@ use plateau_engine::{Compiled, Limits, Region, SIZES, START, Wasm};
 const HZ: f32 = 120.0;
 /// A person's height: the world is drawn scaled so the player is always this tall.
 const DRAWN_AS: f32 = 1.7;
+/// How far ahead, in seconds, the chunks where the player is going are made.
+const AHEAD: f32 = 0.75;
 const SKY: Color = Color::srgb(0.62, 0.72, 0.84);
 
 fn main() {
@@ -281,8 +283,18 @@ fn draw(
 ) {
     let size = player.body.size;
     let eye = player.eye.unwrap_or(player.body.eye());
-    chunks.update(eye, size, &mut commands, &mut meshes);
+    // Ahead: where the player will be in a little under a second, and the size they are growing or
+    // shrinking to, here and there.
+    let v = player.body.velocity;
+    let there = [0, 1, 2].map(|a| eye[a] + (v[a] * AHEAD) as f64);
+    let mut ahead = vec![(there, size)];
+    if let Some(change) = player.body.change {
+        ahead.extend([(eye, change.to), (there, change.to)]);
+    }
+    let started = Instant::now();
+    chunks.update(eye, size, &ahead, &mut commands, &mut meshes);
     chunks.place(eye, (DRAWN_AS / size) as f64, &mut transforms);
+    chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
         camera.rotation = look(player.body.yaw, player.pitch);
         // Haze is the air's, in metres, not the player's: a few hundred metres, a little more for a
@@ -316,11 +328,13 @@ fn hud(mut text: Query<&mut Text, With<Hud>>, player: Res<Player>, chunks: Res<C
     };
     let c = chunks.counts;
     let feet = b.seat.map_or(b.feet, |s| s.at);
+    let holes = if c.holes > 0 { format!(", {} not yet stood in for", c.holes) } else { String::new() };
     let mut s = format!(
-        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made  /  {}k triangles\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         c.shown,
         c.waiting,
+        c.ahead,
         c.triangles / 1000,
         feet[0],
         feet[1],
@@ -353,7 +367,8 @@ fn screenshot(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>, mut playe
 }
 
 /// A place the tour stops at: who, where (across the ground; dropped from a little above the
-/// ground there), facing which way, whether to sit, and a size to grow or shrink to there.
+/// ground there), facing which way, whether to sit, a size to grow or shrink to there, and how
+/// long to go forward, measuring, and whether running.
 struct Stop {
     name: &'static str,
     size: f32,
@@ -362,6 +377,7 @@ struct Stop {
     pitch: f32,
     sit: bool,
     then: Option<f32>,
+    walk: Option<(f32, bool)>,
 }
 
 #[derive(Resource)]
@@ -378,8 +394,9 @@ enum Phase {
     Arrive,
     /// There since then, the chunks being made.
     Wait(Instant),
-    /// The chunks all made, after this long and this many: the frames measured.
-    Measure { arrived: Instant, settled: Instant, made: usize, frames: Vec<f32> },
+    /// The chunks all made, after this long and this many: the frames measured, how many had
+    /// wanted chunks with nothing shown in their space, and the most such in a frame.
+    Measure { arrived: Instant, settled: Instant, made: usize, took: (Duration, Duration), frames: Vec<f32>, holey: usize, most: usize },
     /// The screenshot asked for: frames left until it is surely written.
     Shot(usize),
 }
@@ -389,16 +406,21 @@ impl Tour {
         use std::f32::consts::{FRAC_PI_2, PI};
         let [tiny, person, giant] = sizes();
         let stops = vec![
-            Stop { name: "person-at-the-start", size: person, at: START, yaw: 0.0, pitch: -0.05, sit: false, then: None },
-            Stop { name: "person-at-the-crack", size: person, at: [52.4, 30.0], yaw: -FRAC_PI_2, pitch: -0.55, sit: false, then: None },
-            Stop { name: "person-under-the-bench", size: person, at: [40.0, 21.5], yaw: 0.0, pitch: 0.55, sit: false, then: None },
+            Stop { name: "person-at-the-start", size: person, at: START, yaw: 0.0, pitch: -0.05, sit: false, then: None, walk: None },
+            Stop { name: "person-at-the-crack", size: person, at: [52.4, 30.0], yaw: -FRAC_PI_2, pitch: -0.55, sit: false, then: None, walk: None },
+            Stop { name: "person-under-the-bench", size: person, at: [40.0, 21.5], yaw: 0.0, pitch: 0.55, sit: false, then: None, walk: None },
             // Shrinking, the crack looked at stays in the middle of the view.
-            Stop { name: "person-shrunk-at-the-crack", size: person, at: [53.4, 30.0], yaw: -FRAC_PI_2, pitch: -1.38, sit: false, then: Some(tiny) },
-            Stop { name: "tiny-at-the-crack", size: tiny, at: [53.62, 30.0], yaw: -FRAC_PI_2, pitch: 0.05, sit: false, then: None },
-            Stop { name: "tiny-in-the-cave", size: tiny, at: [54.0, 30.25], yaw: 0.35, pitch: 0.0, sit: false, then: None },
-            Stop { name: "tiny-on-the-pond", size: tiny, at: [24.37, 36.82], yaw: 0.6, pitch: -0.08, sit: false, then: None },
-            Stop { name: "giant-over-the-garden", size: giant, at: [30.0, 62.0], yaw: 0.0, pitch: -0.45, sit: false, then: None },
-            Stop { name: "giant-on-the-bench", size: giant, at: [40.0, 23.5], yaw: PI, pitch: -0.4, sit: true, then: None },
+            Stop { name: "person-shrunk-at-the-crack", size: person, at: [53.4, 30.0], yaw: -FRAC_PI_2, pitch: -1.38, sit: false, then: Some(tiny), walk: None },
+            Stop { name: "tiny-at-the-crack", size: tiny, at: [53.62, 30.0], yaw: -FRAC_PI_2, pitch: 0.05, sit: false, then: None, walk: None },
+            Stop { name: "tiny-in-the-cave", size: tiny, at: [54.0, 30.25], yaw: 0.35, pitch: 0.0, sit: false, then: None, walk: None },
+            Stop { name: "tiny-on-the-pond", size: tiny, at: [24.37, 36.82], yaw: 0.6, pitch: -0.08, sit: false, then: None, walk: None },
+            Stop { name: "giant-over-the-garden", size: giant, at: [30.0, 62.0], yaw: 0.0, pitch: -0.45, sit: false, then: None, walk: None },
+            Stop { name: "giant-on-the-bench", size: giant, at: [40.0, 23.5], yaw: PI, pitch: -0.4, sit: true, then: None, walk: None },
+            // Going, measured as they go: in at the gate, along the wall's foot past the crack,
+            // across the garden.
+            Stop { name: "person-running-in-at-the-gate", size: person, at: START, yaw: 0.0, pitch: -0.1, sit: false, then: None, walk: Some((4.0, true)) },
+            Stop { name: "tiny-running-along-the-wall", size: tiny, at: [53.62, 30.12], yaw: 0.0, pitch: -0.05, sit: false, then: None, walk: Some((4.0, true)) },
+            Stop { name: "giant-walking-across-the-garden", size: giant, at: [20.0, 62.0], yaw: 0.3, pitch: -0.4, sit: false, then: None, walk: Some((3.0, false)) },
         ];
         Tour { folder, stops, next: 0, phase: Phase::Arrive, written: String::new() }
     }
@@ -439,32 +461,57 @@ fn go_on_tour(
             let waited = arrived.elapsed();
             let still = player.body.change.is_none();
             if still && chunks.counts.waiting == 0 && waited > Duration::from_millis(200) || waited > Duration::from_secs(60) {
-                tour.phase = Phase::Measure { arrived: *arrived, settled: Instant::now(), made: chunks.counts.made, frames: Vec::new() };
+                let c = chunks.counts;
+                tour.phase =
+                    Phase::Measure { arrived: *arrived, settled: Instant::now(), made: c.made, took: (c.total, c.slowest), frames: Vec::new(), holey: 0, most: 0 };
             }
         }
-        Phase::Measure { arrived, settled, made, frames } => {
-            // A second for the last chunks to be drawn, then two seconds measured.
+        Phase::Measure { arrived, settled, made, took, frames, holey, most } => {
+            // A second for the last chunks to be drawn, then two seconds measured, or the walk.
+            let stop = &tour.stops[tour.next];
             if settled.elapsed() > Duration::from_secs(1) {
                 frames.push(time.delta_secs());
+                *holey += (chunks.counts.holes > 0) as usize;
+                *most = (*most).max(chunks.counts.holes);
+                if let Some((_, run)) = stop.walk {
+                    player.intent = Intent { forward: 1.0, run, ..Intent::default() };
+                }
             }
-            if frames.len() < 240 {
+            if settled.elapsed() <= Duration::from_secs(1) {
+                chunks.counts.longest = Duration::ZERO;
+            }
+            let done = match stop.walk {
+                Some((seconds, _)) => frames.iter().sum::<f32>() >= seconds,
+                None => frames.len() >= 240,
+            };
+            if !done {
                 return;
             }
-            let stop = &tour.stops[tour.next];
+            player.intent = Intent::default();
+            let walked = if stop.walk.is_some() {
+                format!(
+                    "; going, {} chunks made, {holey} of {} frames with holes, at most {most}, choosing and placing chunks {:.1} ms at most",
+                    chunks.counts.made - *made,
+                    frames.len(),
+                    chunks.counts.longest.as_secs_f32() * 1000.0
+                )
+            } else {
+                String::new()
+            };
             frames.sort_by(f32::total_cmp);
             let mean = frames.iter().sum::<f32>() / frames.len() as f32;
             let c = chunks.counts;
             tour.written += &format!(
                 "{}: {:.0} frames a second (worst frame {:.1} ms); {} chunks shown, {}k triangles; {made} chunks made in {:.2} s, \
-                 {:.1} ms each, the slowest {:.0} ms\n",
+                 {:.1} ms each, the slowest {:.0} ms{walked}\n",
                 stop.name,
                 1.0 / mean,
                 frames[frames.len() - 1] * 1000.0,
                 c.shown,
                 c.triangles / 1000,
                 (*settled - *arrived).as_secs_f32(),
-                c.total.as_secs_f32() * 1000.0 / (*made).max(1) as f32,
-                c.slowest.as_secs_f32() * 1000.0,
+                took.0.as_secs_f32() * 1000.0 / (*made).max(1) as f32,
+                took.1.as_secs_f32() * 1000.0,
             );
             commands.spawn(Screenshot::primary_window()).observe(save_to_disk(tour.folder.join(format!("{}.png", stop.name))));
             tour.phase = Phase::Shot(15);

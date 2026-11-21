@@ -183,6 +183,17 @@ Found:
   whole metres and its shadow bias is in metres, which would make the tiny's shadows coarse and
   loose. Drawing the world scaled to the player keeps them right at every size. Haze is the
   air's, in metres, so it is set against the scale (the tiny saw haze 70 cm away before).
+- **Played by hand, it flickered while moving** (2026-11-21, after the first commit): old chunks
+  stayed shown until every new one anywhere was made, so while moving, old and new overlapped and
+  then the old vanished all at once. Now what is shown is chosen each frame from what is made
+  (`rings::shown`): a chunk not yet made is stood in for by the coarser chunk about it or the
+  finer ones within it, never overlapping; blocks lag a little behind the viewer (`rings::Rings`),
+  so walking to and fro does not swap chunks; and the chunks where the player is going, and at
+  the size they are changing to, are made ahead. The tour's walks (in at the gate, the tiny along
+  the wall, a giant across the garden) have no frame with a hole. Left: chunks still change from
+  coarse to fine at once, without blending; and the worst frame while the tiny run is 20 to 45 ms
+  (the choosing and placing of chunks takes up to 7 ms of it, the rest is Bevy's), a dropped frame
+  now and then under vsync.
 - **One answer a point hides the floor under water** (step 1) cost little: rays through water a
   body does not float on step a twentieth of its height at a time and stop where the answers turn
   solid. A person wades the pond, a giant sinks in its mud.
