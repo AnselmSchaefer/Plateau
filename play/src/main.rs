@@ -1,14 +1,16 @@
-//! Plateau, played (POC_PLAN.md, step 2): one area, walked first person at three sizes.
+//! Plateau, played (POC_PLAN.md, step 2): one area, walked at three sizes, the player seen from
+//! behind (`figure`) or through their own eyes.
 //!
-//! `cargo run --release -p plateau-play [-- area.wasm] [--seed N] [--tour folder]`; the walled
+//! `cargo run --release -p plateau-play [-- area.wasm] [--seed N] [--tour folder [--behind]]`; the walled
 //! garden (`areas/modules/garden.wasm`) unless another module is given. W A S D to walk, Shift to
 //! run, Space to jump, the mouse to look (click to take it, Esc to let it go); 1, 2 and 3 to become
-//! tiny, a person or a giant, Q and E to shrink and grow a size; C to sit or stand; F12 for a
-//! screenshot (into `target/shots/`).
+//! tiny, a person or a giant, Q and E to shrink and grow a size; C to sit or stand; V to see from
+//! behind or through the eyes; F12 for a screenshot (into `target/shots/`).
 //!
 //! `--tour folder` goes instead to fixed places at each size, waits for the chunks there, measures
 //! the frames a second, takes a screenshot of each into the folder, writes what it measured to
-//! `tour.txt` there, and exits (vsync off, to see how many frames it could).
+//! `tour.txt` there, and exits (vsync off, to see how many frames it could). It sees through the
+//! eyes, as it did when its numbers were first written, unless `--behind` is given too.
 //!
 //! The engine does the rest (`plateau_engine`): the body walks at its size (`body`), the surface is
 //! made in chunks off the frame (`chunks`). The world is drawn about the player's eye and scaled so
@@ -16,6 +18,7 @@
 //! the haze are made for a person, and hold at every size.
 
 mod chunks;
+mod figure;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,16 +41,23 @@ const HZ: f32 = 120.0;
 const DRAWN_AS: f32 = 1.7;
 /// How far ahead, in seconds, the chunks where the player is going are made.
 const AHEAD: f32 = 0.75;
+/// Seen from behind: the camera turns about a point this far above the eye (over the head, so the
+/// figure is below the middle of the view), this far behind it at most, and no nearer to what is in
+/// the way than `MARGIN`; in the renderer's units, a person's metres.
+const PIVOT: f32 = 0.35;
+const BEHIND: f32 = 3.4;
+const MARGIN: f32 = 0.25;
 const SKY: Color = Color::srgb(0.62, 0.72, 0.84);
 
 fn main() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut args = std::env::args().skip(1);
-    let (mut module, mut seed, mut tour) = (here.join("areas/modules/garden.wasm"), 7u64, None);
+    let (mut module, mut seed, mut tour, mut behind) = (here.join("areas/modules/garden.wasm"), 7u64, None, false);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
             "--tour" => tour = Some(PathBuf::from(args.next().expect("--tour takes a folder"))),
+            "--behind" => behind = true,
             _ => module = PathBuf::from(arg),
         }
     }
@@ -65,10 +75,21 @@ fn main() {
         .insert_resource(ClearColor(SKY))
         .insert_resource(GlobalAmbientLight { brightness: 500.0, ..default() })
         .insert_resource(Area { compiled, seed, places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect() })
-        .insert_resource(Player { body, pitch: -0.05, eye: None, focus: None, said: None, intent: Intent::default(), owed: 0.0 })
+        .insert_resource(Player {
+            body,
+            pitch: -0.15,
+            eye: None,
+            focus: None,
+            said: None,
+            intent: Intent::default(),
+            owed: 0.0,
+            third: tour.is_none() || behind,
+            back: 0.0,
+        })
+        .insert_resource(figure::Gait::default())
         .insert_non_send(Physics(physics))
         .add_systems(Startup, setup)
-        .add_systems(Update, (look_and_ask, step, draw, hud).chain());
+        .add_systems(Update, (look_and_ask, step, frame, draw, figure::animate, hud).chain());
     if let Some(folder) = tour {
         std::fs::create_dir_all(&folder).expect("the tour's folder");
         app.insert_resource(Tour::new(folder)).add_systems(Update, go_on_tour.before(step));
@@ -102,6 +123,11 @@ struct Player {
     intent: Intent,
     /// Time not yet stepped.
     owed: f32,
+    /// Seen from behind, not through the eyes.
+    third: bool,
+    /// How far behind the camera is, in the renderer's units: `BEHIND`, or nearer where something
+    /// is in the way.
+    back: f32,
 }
 
 impl Player {
@@ -125,9 +151,10 @@ fn look(yaw: f32, pitch: f32) -> Quat {
     Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0)
 }
 
-fn setup(mut commands: Commands, area: Res<Area>, mut materials: ResMut<Assets<StandardMaterial>>) {
+fn setup(mut commands: Commands, area: Res<Area>, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
     let material = materials.add(StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 0.92, reflectance: 0.3, ..default() });
     commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, material));
+    figure::spawn(&mut commands, &mut meshes, &mut materials);
     let sun = Vec3::new(0.48, 0.70, 0.53).normalize();
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
@@ -144,7 +171,7 @@ fn setup(mut commands: Commands, area: Res<Area>, mut materials: ResMut<Assets<S
     let text = |size: f32| TextFont { font_size: bevy::text::FontSize::Px(size), ..default() };
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
-        Text::new("W A S D walk  /  Shift run  /  Space jump  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  F12 screenshot"),
+        Text::new("W A S D walk  /  Shift run  /  Space jump  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  V from behind or through the eyes  /  F12 screenshot"),
         text(15.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         Node { position_type: PositionType::Absolute, bottom: px(10.0), left: px(12.0), ..default() },
@@ -212,6 +239,9 @@ fn look_and_ask(
     if let Some(to) = to {
         change_size(&mut player, &mut physics.0, to);
     }
+    if keys.just_pressed(KeyCode::KeyV) {
+        player.third = !player.third;
+    }
     if keys.just_pressed(KeyCode::KeyC) {
         if player.body.seat.is_some() {
             let stood = player.body.seat.unwrap().stood;
@@ -269,6 +299,32 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Phy
     });
 }
 
+/// How far behind the camera goes, seen from behind: `BEHIND`, or as near as what is in the way
+/// makes it (a ray from the point it turns about, back along the view, as the player's size sees the
+/// area), at once if nearer, slowly back out.
+fn frame(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Physics>) {
+    let want = if player.third { BEHIND } else { 0.0 };
+    let size = player.body.size;
+    // Metres of the area to a unit of the renderer.
+    let per = (size / DRAWN_AS) as f64;
+    let eye = player.eye.unwrap_or(player.body.eye());
+    let pivot = [eye[0], eye[1] + PIVOT as f64 * per, eye[2]];
+    let away = -player.looking();
+    let room = if want > 0.0 {
+        match body::look(&mut physics.0, pivot, away.to_array(), size, want * size / DRAWN_AS).expect("the area asked") {
+            Some(hit) => {
+                let far = ((hit[0] - pivot[0]).powi(2) + (hit[1] - pivot[1]).powi(2) + (hit[2] - pivot[2]).powi(2)).sqrt();
+                (far / per) as f32 - MARGIN
+            }
+            None => want,
+        }
+    } else {
+        0.0
+    };
+    let target = room.clamp(0.0, want);
+    player.back = if target < player.back { target } else { player.back + (target - player.back) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
+}
+
 /// Where the chunks are drawn, and whether: everything but the camera and the sun.
 type Placed<'w, 's> = Query<'w, 's, (&'static mut Transform, &'static mut Visibility), (Without<Camera3d>, Without<Sun>)>;
 
@@ -297,6 +353,7 @@ fn draw(
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
         camera.rotation = look(player.body.yaw, player.pitch);
+        camera.translation = if player.third { Vec3::Y * PIVOT - player.looking() * player.back } else { Vec3::ZERO };
         // Haze is the air's, in metres, not the player's: a few hundred metres, a little more for a
         // giant, whose eyes are high above it.
         fog.falloff = FogFalloff::from_visibility((200.0 + 60.0 * size) * DRAWN_AS / size);

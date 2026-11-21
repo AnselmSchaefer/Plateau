@@ -445,5 +445,11 @@ notices.
 
 - The sizes' ratios (a thousand from tiny to giant, or less).
 - Changing size anywhere, or at places in the world. The PoC allows it anywhere, to try.
-- First person or from behind. The PoC starts first person.
+- First person or from behind. The PoC started first person; since 2026-11-21 it starts from
+  behind (`play/src/figure.rs`), V switching. The figure is a person made once and never
+  scaled, since the world is drawn so the player is always 1.7 m tall. It walks, runs, jumps
+  and sits from the body's own motion, and turns to face the way it goes. The camera orbits
+  above its head and pulls in where the area is in the way, so it stays out of the walls in the
+  crack and the cave. The tour still sees through the eyes unless given `--behind`. Seen from
+  behind measured as fast as through the eyes.
 - The look that holds at every size.
