@@ -8,14 +8,14 @@ use std::collections::{HashMap, HashSet};
 
 use plateau_engine::chunk::{self, CELLS, Key, Making, Mesh};
 use plateau_engine::rings::{self, COARSEST, Rings, finest, shown, wanted};
-use plateau_engine::{SIZES, WIDTH};
+use plateau_engine::{Region, SIZES, WIDTH};
 
 const SEED: u64 = 7;
 
 /// The chunk at level `level` holding the point `at`.
 fn holding(at: [f64; 3], level: i32) -> Key {
     let side = 2f64.powi(level) * CELLS as f64;
-    Key { level, at: at.map(|c| (c / side).floor() as i32) }
+    Key::new(level, at.map(|c| (c / side).floor() as i32))
 }
 
 /// Chunks where the garden has something to mesh, at each size's finest level and coarser: the
@@ -267,4 +267,47 @@ fn what_is_shown_never_overlaps_and_stands_in_for_what_is_not_made() {
         no_overlaps(&finer);
         assert!(finer.iter().any(|k| k.level < finest(size * 4.0)), "nothing finer stands in for a viewer grown");
     }
+}
+
+/// The tiny in the cave: a person's world, and every larger, has wall where they stand, so the
+/// coarser levels would be drawn as solid all about the eye, and the cave's far walls and roof
+/// facing away. So the levels coarser than the last that sees the eye in the open are asked for
+/// that one's viewer; in the open nothing changes. Found walking the table of step 5, in the
+/// village under its bowl.
+#[test]
+fn in_a_hollow_only_the_small_see_the_coarser_levels_are_asked_for_a_viewer_who_sees_it() {
+    let mut area = played::area("garden", SEED);
+    let floor = area.describe().unwrap().places.iter().find(|p| p.name.contains("cave")).unwrap().at[1] as f64;
+    let tiny = SIZES[0].1;
+    let cave = [54.0, floor + 0.015, 30.15];
+    let open = rings::open(&mut area, cave, tiny).unwrap();
+    assert!(open < finest(SIZES[1].1), "in the cave the coarser levels are asked for a person ({open})");
+    assert!(open > finest(tiny), "the tiny's own level and some above it see the cave ({open})");
+    // In the open, nothing is capped: on the lawn, at every size.
+    for (_, size) in SIZES {
+        assert_eq!(rings::open(&mut area, [32.0, 0.9 * size as f64, 50.0], size).unwrap(), COARSEST, "a {size} m viewer on the lawn");
+    }
+    // The chunks wanted still fill the space once, and stand in for one another as before.
+    let mut rings = Rings::default();
+    let keys = rings.wanted_open(cave, tiny, open);
+    fill_once(&keys, cave, tiny, rings.reach().unwrap(), 20_000);
+    assert!(keys.iter().all(|k| k.asked == k.level.min(open)));
+    let (all, holes) = shown(&keys, &|_| true);
+    assert_eq!((all.len(), holes), (keys.len(), 0));
+    let mut next = numbers(5);
+    let made: HashSet<Key> = keys.iter().flat_map(|k| [*k, k.parent().capped(open)]).filter(|_| next() < 0.6).collect();
+    let (some, _) = shown(&keys, &|k| made.contains(&k));
+    no_overlaps(&some);
+    assert!(some.iter().all(|k| made.contains(k)));
+    // And the cave's roof is there in a coarse chunk over it, asked so, and not asked as before.
+    let over = [54.0, floor + 0.3, 30.15];
+    let level = finest(SIZES[1].1);
+    let surface_near = |key: Key| {
+        let mesh = chunk::make(&mut played::area("garden", SEED), key).unwrap().mesh;
+        let o = key.origin();
+        mesh.is_some_and(|m| m.positions.iter().any(|p| ((o[0] + p[0] as f64 - 54.0).powi(2) + (o[2] + p[2] as f64 - 30.15).powi(2)).sqrt() < 0.05 && o[1] + (p[1] as f64) < floor + 0.3))
+    };
+    let key = holding(over, level);
+    assert!(!surface_near(key), "a person's chunk has no cave in it");
+    assert!(surface_near(key.capped(open)), "asked for a viewer who sees the cave, it has");
 }

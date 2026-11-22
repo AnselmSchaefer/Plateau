@@ -564,7 +564,7 @@ pub fn kept_chunks(description: &Description) -> Vec<Key> {
         for &(_, size) in &SIZES {
             let level = rings::finest(size);
             let side = 2f64.powi(level) * CELLS as f64;
-            let key = Key { level, at: spot.map(|c| (c as f64 / side).floor() as i32) };
+            let key = Key::new(level, spot.map(|c| (c as f64 / side).floor() as i32));
             if !keys.contains(&key) {
                 keys.push(key);
             }
@@ -605,7 +605,7 @@ pub fn same_everywhere(area: &mut dyn Region, kept: &str) -> Result<Verdict> {
         else {
             return Ok(Err(format!("the kept hashes cannot be read: \"{line}\"")));
         };
-        keys.push(Key { level, at: [x, y, z] });
+        keys.push(Key::new(level, [x, y, z]));
         wanted.push(h);
     }
     if keys.is_empty() {

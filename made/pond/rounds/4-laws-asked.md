@@ -1,0 +1,5 @@
+It builds, but it breaks a law:
+
+- **sizes agree**: sizes do not agree: at (33.94, 2.18, 26.43) a 1.70 m viewer sees a surface that a 5.40 m viewer does not: to the larger, the nearest surface there is at least 1.43 m away, more than the 54.0 cm allowed (6 of 1921 looks found such a place; seed 1). What a smaller viewer sees must be the larger's world with more in it: detail may roughen a surface by up to a tenth of the larger's height, and open cracks and caves behind openings too small for the larger to see, but never move, raise or take away what the larger sees. Give a detail only where `View::sees` says it is seen, faded in by it, and work out the shapes the larger sees the same way at every size.
+
+Answer with the whole of `area.rs` again, fixed, in one ```rust block. Keep what is right; change what the laws found.

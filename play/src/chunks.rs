@@ -108,10 +108,11 @@ impl Chunks {
         }
     }
 
-    /// Asks for the chunks a viewer at `eye`, `size` tall, sees, then for those of each viewer
-    /// `ahead` (where they are going, the size they are changing to), and chooses what to show of
-    /// what is made, bringing to the screen what was made since the last frame.
-    pub fn update(&mut self, eye: [f64; 3], size: f32, ahead: &[([f64; 3], f32)], commands: &mut Commands, meshes: &mut Assets<Mesh>) {
+    /// Asks for the chunks a viewer at `eye`, `size` tall, sees (the levels coarser than `open`
+    /// asked for its viewer, `rings::open`), then for those of each viewer `ahead` (where they are
+    /// going, the size they are changing to, with theirs), and chooses what to show of what is
+    /// made, bringing to the screen what was made since the last frame.
+    pub fn update(&mut self, eye: [f64; 3], size: f32, open: i32, ahead: &[([f64; 3], f32, i32)], commands: &mut Commands, meshes: &mut Assets<Mesh>) {
         self.frame += 1;
         // Finest first, and on each level the nearest first.
         let order = |keys: &mut Vec<Key>, eye: [f64; 3]| {
@@ -121,12 +122,12 @@ impl Chunks {
             };
             keys.sort_by(|a, b| a.level.cmp(&b.level).then(far(a).total_cmp(&far(b))));
         };
-        let mut wanted = self.rings.wanted(eye, size);
+        let mut wanted = self.rings.wanted_open(eye, size, open);
         order(&mut wanted, eye);
         self.wanted = wanted.iter().copied().collect();
         let mut later = Vec::new();
-        for &(e, s) in ahead {
-            let mut keys: Vec<Key> = self.rings.clone().wanted(e, s).into_iter().filter(|k| !self.wanted.contains(k)).collect();
+        for &(e, s, o) in ahead {
+            let mut keys: Vec<Key> = self.rings.clone().wanted_open(e, s, o).into_iter().filter(|k| !self.wanted.contains(k)).collect();
             order(&mut keys, e);
             later.extend(keys);
         }

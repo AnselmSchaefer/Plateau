@@ -4,7 +4,10 @@
 //! - **Levels.** A chunk's voxel is a power of two metres (`Key::level`), so the grids of every
 //!   level line up: a chunk is eight of the level below it. It is asked for the viewer twenty
 //!   voxels tall (`Key::size`), the one whose detail it is near them, so the same chunk serves any
-//!   viewer who needs that level, and what is far off is asked only coarsely.
+//!   viewer who needs that level, and what is far off is asked only coarsely. Except in a hollow
+//!   only smaller viewers see (the tiny in a cave): there the larger viewers of the coarser levels
+//!   would see solid all about the eye, so those levels are asked for a smaller one (`Key::asked`,
+//!   `rings::open`).
 //! - **No seams within a level.** Each chunk asks one cell beyond its own on every side, makes the
 //!   vertices of the cells along its edges as its neighbours make them, and makes the quads only of
 //!   the grid edges it owns (those whose first corner is its own): neighbours meet exactly.
@@ -32,14 +35,28 @@ const SMALLEST_BLOCK: usize = 4;
 /// "Detail per size").
 pub const VOXELS_A_HEIGHT: f32 = 20.0;
 
-/// Where a chunk is: its level (its voxel is `2^level` metres) and its place on that level's grid.
+/// Where a chunk is: its level (its voxel is `2^level` metres) and its place on that level's grid;
+/// and the level whose viewer it is asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     pub level: i32,
     pub at: [i32; 3],
+    /// Its own level, or a finer one, when the viewer is in a hollow that the viewer of its own
+    /// level does not see (`capped`).
+    pub asked: i32,
 }
 
 impl Key {
+    /// The chunk at `at` on the grid of `level`, asked for its own level's viewer.
+    pub fn new(level: i32, at: [i32; 3]) -> Key {
+        Key { level, at, asked: level }
+    }
+
+    /// The same chunk asked for no larger a viewer than level `open`'s.
+    pub fn capped(self, open: i32) -> Key {
+        Key { asked: self.level.min(open), ..self }
+    }
+
     /// A voxel's width, in metres: a power of two, so every level's grid lines up with the next.
     pub fn voxel(self) -> f64 {
         2f64.powi(self.level)
@@ -61,20 +78,27 @@ impl Key {
         o.map(|c| c + half)
     }
 
-    /// The chunk of the next level up that holds this one.
+    /// The chunk of the next level up that holds this one, asked for its own level's viewer.
     pub fn parent(self) -> Key {
-        Key { level: self.level + 1, at: self.at.map(|i| i.div_euclid(2)) }
+        Key::new(self.level + 1, self.at.map(|i| i.div_euclid(2)))
     }
 
-    /// The eight chunks of the next level down within this one.
+    /// The eight chunks of the next level down within this one, asked for their own level's viewer.
     pub fn children(self) -> [Key; 8] {
-        std::array::from_fn(|k| Key { level: self.level - 1, at: [0, 1, 2].map(|a| self.at[a] * 2 + (k as i32 >> a & 1)) })
+        std::array::from_fn(|k| Key::new(self.level - 1, [0, 1, 2].map(|a| self.at[a] * 2 + (k as i32 >> a & 1))))
     }
 
-    /// The viewer the chunk is asked for: twenty voxels tall, within the sizes an area is asked at.
+    /// The viewer the chunk is asked for: twenty voxels of level `asked` tall, within the sizes an
+    /// area is asked at.
     pub fn size(self) -> f32 {
-        (self.voxel() as f32 * VOXELS_A_HEIGHT).clamp(SMALLEST, LARGEST)
+        level_size(self.asked)
     }
+}
+
+/// The viewer the chunks of `level` are asked for: twenty of its voxels tall, within the sizes an
+/// area is asked at.
+pub fn level_size(level: i32) -> f32 {
+    (2f32.powi(level) * VOXELS_A_HEIGHT).clamp(SMALLEST, LARGEST)
 }
 
 /// A chunk's surface: positions relative to its origin, normals pointing out of the solid, each

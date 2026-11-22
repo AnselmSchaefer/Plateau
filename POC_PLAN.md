@@ -39,7 +39,7 @@ Out, until the PoC has answered:
 | Detail per size | Near the viewer, a voxel about a twentieth of their height (tiny ~1 mm, person ~8 cm, giant ~85 cm), coarser further off | To be tuned in step 2 |
 | Positions | 64-bit floats in the engine, 32-bit relative to the area within it | Precision over a range of a thousand |
 | Compiling | The machine's rustc (the version pinned in the repo), `--target wasm32-unknown-unknown -O` | The tab's toolchain is for the browser, later |
-| Claude | `claude-opus-5-5` at effort medium, as Caprice's theme writer (`web/api/theme.js`); the key from the environment | Known to write good theme programs |
+| Claude | `claude-opus-5-5` at effort medium, as Caprice's theme writer (`web/api/theme.js`), asked through the Claude Code command line (`claude -p`) with the owner's own subscription login, never an API key (changed 2026-11-21) | Known to write good theme programs; a subscription, not an API account, is what the owner has |
 | Tests | Never call Claude (stand-ins, as Caprice's R12); never run WebAssembly where the area's source can be played natively | As Caprice; fast and offline |
 | Pictures | Ray-marched on the CPU from the area's own `sample`, headless | Needs no GPU, the same in tests, on any machine and for Claude |
 
@@ -380,6 +380,103 @@ Found:
   long it took. Written in this file.
 
 **Done when** at least three of the five keep every law and are worth walking at each size.
+
+Made 2026-11-22; all five keep every law. Not yet walked by hand, so "worth walking" is judged
+from the pictures alone. `make/` is the command line (`cargo run --release -p plateau-make --bin
+plateau -- make "<words>"`, or `-- test-set [NAME ...]`) and the loop (`make/src/lib.rs`): each
+answer built as `areas/build.sh` builds, checked, held to six laws (all but "the same
+everywhere", which needs kept hashes), the laws' own words sent back, the pictures and reach maps
+shown once, the last version that kept every law kept. The guide is `make/GUIDE.md`, followed by
+the SDK's source, the WIT and the walled garden, whole. Claude is asked through `claude -p`, one
+session for each area, resumed every round, with no tools except Read on the pictures. The
+stand-in tests (`make/tests/make.rs`) never call Claude. What came of each area is in `made/NAME/`
+(the area, its module, its pictures as Claude saw them, every question and answer in `rounds/`, and
+`log.md`); `made/results.md` sums them up. In play, M shows flags over the tiny's places
+(`play/src/flags.rs`), since they are too small to find otherwise.
+
+| Area | Kept every law | Rounds | Fixes | Took | Reckoned | What broke, and when |
+|---|---|---|---|---|---|---|
+| table | yes | 2 | 0 | 18 min | $2.42 | nothing |
+| headland | yes | 3 | 1 | 22 min | $3.41 | no traps (a drop too high to climb back, where the tiny's tunnel enters the hold), first answer |
+| pond | yes | 4 | 2 | 18 min | $3.22 | after the look: did not build (a closure), then sizes agree (2 m reeds a person sees and a giant does not) |
+| forest | yes | 2 | 0 | 19 min | $2.31 | nothing |
+| castle | yes | 3 | 1 | 17 min | $2.61 | surfaces have an inside (the tower stump's jagged parapet), first answer |
+
+"Reckoned" is what the API would charge. With the owner's subscription, nothing is paid but the
+plan's usage. Each area was made in under 25 minutes and within the rounds allowed (at most 3 fixes
+and 1 look). Four areas were made side by side. The first answer takes most of the time: 8 to 15
+minutes, about 50 000 tokens of thinking.
+
+What the pictures show, at each size:
+
+- **table**: a table set with a loaf, a mug and herbs, and a chair. The tabletop and the chair's
+  seat are giants' alone. The tiny's village of houses with chimneys lies under an upturned bowl,
+  and a person has spilled sugar under the table.
+- **headland**: a grassy ridge to a cliff, a lighthouse with a keeper's room for a person, a sea
+  stack only giants reach, and a smugglers' hold for the tiny under a rock, with casks and a
+  tunnel each way.
+- **pond**: a pond with lily pads, a mossy stone with a room for the tiny, and a broken alder
+  holding the heron's nest for giants. After the look it also has reeds and bushes.
+- **forest**: tall trees around three stumps that are giants' stools, with a stone table between
+  them. Two stumps hold the tiny's houses, furnished after the look; the old oak's hollow is for a
+  person.
+- **castle**: a moated, ruined curtain wall grassed over (hills to the tiny), with a hollow inside
+  the south wall. The keep's hall is for a person, and a giant looks in over its broken top. The
+  east tower's stump is a giant's.
+
+Found:
+
+- **The cost was counted wrongly at first.** Claude Code's `total_cost_usd` is the session's
+  total, and a resumed session includes every earlier question. Adding up each round's figure
+  counted the first question again in every round, so the pond came to $9.30 instead of $3.22.
+  The caller now keeps each round's own share, and the logs are corrected.
+- **The laws did their work.** Two areas broke a law with their first answer (a trap; a surface
+  with no inside). Each broken law was fixed in one round, from the law's own words. The guide's
+  warnings about lids and traps were not enough on their own.
+- **The look is where things went wrong.** The pond's improved version did not build, and once
+  built it broke "sizes agree": its new reeds, 2 m tall to a person, were not there at all for a
+  larger viewer. Claude faded their height by size. It still kept every law within the fixes
+  allowed. Had the fixes run out, the version from round 1
+  would have been kept, as meant.
+- **Claude does not look at every picture.** On the headland it read five of the sixteen, and none
+  of the reach maps. The look should show fewer pictures, or say which matter (the places, and the
+  reach maps), or put the maps side by side in one picture.
+- **The tiny's places are poorly pictured**, as step 4 left them. The viewpoint for a room inside a
+  rock or a stump stands in the room, which no sun reaches. It is lit only by the dim ambient
+  light, so in three of the five areas the picture was "brown fog". Claude itself said so of the
+  headland's hold and the forest's houses. A lamp at the eye now lights what the sun does not
+  (`picture.rs`; the garden's pictures were made again). The viewpoints themselves still look at
+  floors: a room's picture should look across it, from its door.
+- **A way in only the tiny see is invisible to everyone else.** Walked by hand, the table's
+  village could not be found: its door, 2 cm wide, is not there at all for a person, so the bowl
+  is a plain dome. Painted by hand, for whoever cannot see the door, a dark arch where it is
+  (only the material, so no law is touched); `plateau check NAME` builds and judges an area
+  changed by hand. The guide should ask for it: a way in for a smaller size shows to the larger
+  as a mark they can see.
+- **A hollow larger than the finest levels had no roof.** Walked by hand, the tiny in the
+  table's village saw sky through the bowl. Far chunks are asked for larger viewers, and to any
+  viewer over 60 cm the bowl is closed. The garden's cave is small enough to lie within the tiny's
+  finest levels and never showed it; the bowl is 3 m across, 180 of the tiny's heights. Each
+  frame the eye is now asked at each level's size (`rings::open`). The first level that sees it
+  deeper in a surface than a tenth of its viewer's height (the roughness "sizes agree" allows)
+  caps every coarser level, which is then asked for the viewer of the last level that saw the
+  eye in the open (`Key::asked`). It does the same where the player is going, so the inside is
+  made before they walk in. In the open nothing changes. The cap is one level finer than the
+  last that sees the eye in the open, since a hollow fades in over a factor of two
+  (`View::sees`): at 93% open, the bowl's last 7% of closed dome filled its floor 5 cm deep about
+  the houses, and the seam with the finer level gaped.
+- **Seams between levels showed sky, from within and at the foot of walls.** Two causes, both
+  fixed. A skirt hangs into the solid and faces away from its chunk, so where the finer surface
+  stood out of the coarser one, the skirt that closed the gap faced away from the viewer: the
+  chunks are now drawn with both sides of every triangle. And a level's block was centred on the
+  eye, snapped to the next level's grid, which has a face at the ground's height (y = 0). Once
+  the eye was more than half a block above the ground, the finest level ended at the ground: the
+  floor was drawn by the next level down and the walls above it by the finer, and wedges of sky
+  opened at every wall's foot. Blocks are now about the middle of the body. The village has no
+  holes as the tiny or at 30 cm, at 200 to 300 frames a second. The garden's tour is as fast as
+  before, with no frame with a hole.
+- **Left:** walking each area by hand at each size, to judge whether it is worth walking. That is
+  the other half of "done when", and the first look at question 2 for step 9.
 
 ### 6. The sketch (two or three days)
 

@@ -1,0 +1,19 @@
+# Claude makes an area (POC_PLAN.md, step 5): `plateau make "<words>"` asks Claude, through the
+# Claude Code command line and the owner's own login, for an area's program; builds it, checks it,
+# holds it to the laws and tells Claude what broke, shows it its pictures once, and keeps the last
+# version that kept every law.
+[package]
+name = "plateau-make"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "plateau"
+path = "src/main.rs"
+
+[dependencies]
+plateau-engine = { path = "../engine" }
+# Claude Code's answers (`claude -p --output-format json`).
+serde_json = "1.0.145"
+png = "0.18.1"

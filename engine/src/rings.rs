@@ -8,9 +8,22 @@
 //! the power of two at or below a twentieth of the viewer's height; the coarsest (`COARSEST`, a
 //! metre) has a block that holds the whole area from anywhere in it.
 //!
+//! **Blocks are about the middle of the body**, not the eye: a block's faces lie on the next
+//! level's grid, which has a face at every multiple of its width, at the ground's height (y = 0)
+//! too. About the eye, once it was more than half a block's height above the ground, the finest
+//! level's block ended at the ground: above it one level was drawn, the ground and the feet of
+//! walls just below it the next, and between them gaps opened at every foot of a wall. About the
+//! middle of the body, the ground under the player lies well within every level's block.
+//!
 //! **Blocks lag.** A level's block follows the viewer only once they are `LAG` past the middle
 //! between two of its places (`Rings`), so walking to and fro about that middle does not swap its
 //! chunks to and fro. A lag under a sixth keeps every level within the next.
+//!
+//! **In a hollow only smaller viewers see** (a cave behind a crack too small for a person, a
+//! village under a bowl), the viewers of the coarser levels see solid all about the eye, and a
+//! solid's surface faces away from whoever is inside it: the far walls and the roof would not be
+//! drawn. So the eye is asked at each level's size (`open`), and every level coarser than the last
+//! that sees it in the open is asked for a viewer a level finer than that (`Key::capped`).
 //!
 //! **What is shown never overlaps** (`shown`): a chunk wanted but not yet made is stood in for by
 //! the coarser chunk about it, if that is made, or by the finer chunks within it, if those are;
@@ -18,8 +31,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::WIDTH;
-use crate::chunk::{CELLS, Key, VOXELS_A_HEIGHT};
+use crate::chunk::{CELLS, Key, VOXELS_A_HEIGHT, level_size};
+use crate::{Region, Result, WIDTH};
 
 /// The coarsest level: voxels of a metre, chunks of 32 m, a block of 128 m about the viewer.
 pub const COARSEST: i32 = 0;
@@ -28,6 +41,8 @@ pub const FINEST: i32 = -12;
 /// How far past the middle between two places of a level's block the viewer goes before it
 /// follows them, as a fraction of the way between the places.
 pub const LAG: f64 = 0.15;
+/// How far below the eye the middle of a body is, as a fraction of its height.
+const MIDDLE: f64 = 0.45;
 /// How many levels finer a chunk not yet made may be stood in for by the chunks within it.
 const FINER_AT_MOST: u32 = 3;
 
@@ -35,6 +50,31 @@ const FINER_AT_MOST: u32 = 3;
 /// (a giant's half a metre, a person's 6 cm, the tiny's half a millimetre).
 pub fn finest(size: f32) -> i32 {
     ((size / VOXELS_A_HEIGHT).log2().floor() as i32).clamp(FINEST, COARSEST)
+}
+
+/// How deep in a surface the eye may be, as a fraction of a viewer's height, and still be in the
+/// open to them: the roughness the law "sizes agree" allows between a viewer and a smaller one.
+const ROUGH: f32 = 0.1;
+
+/// The level whose viewer every coarser level is to be asked for (`Rings::wanted_open`), for a
+/// viewer `size` tall with their eye at `eye`: `COARSEST` when every level's viewer sees the eye in
+/// the open. Otherwise one finer than the last that does, and no finer than the viewer's own: a
+/// hollow that opens to smaller viewers fades in over a factor of two (`View::sees`), one level,
+/// so the last level that sees the eye in the open may see the hollow only partly. (Inside the
+/// table's bowl, 93% open to a 31 cm viewer, the last 7% of the closed bowl filled its floor 5 cm
+/// deep about the houses, and the seam with the finer level gaped.)
+pub fn open(area: &mut dyn Region, eye: [f64; 3], size: f32) -> Result<i32> {
+    let p = [eye.map(|c| c as f32)];
+    let mut out = Vec::new();
+    let own = finest(size);
+    for level in own + 1..=COARSEST {
+        let s = level_size(level);
+        area.sample(&p, s, &mut out)?;
+        if out[0].distance < -ROUGH * s {
+            return Ok((level - 2).max(own));
+        }
+    }
+    Ok(COARSEST)
 }
 
 /// The blocks about a viewer, remembered from one moment to the next so they can lag.
@@ -45,16 +85,23 @@ pub struct Rings {
 }
 
 impl Rings {
-    /// Every chunk a viewer with their eye at `eye`, `size` tall, sees, finest first: only chunks
-    /// over the area (x and z from 0 to `WIDTH`).
+    /// Every chunk a viewer with their eye at `eye`, `size` tall, sees, finest first, each level's
+    /// block about the middle of their body: only chunks over the area (x and z from 0 to
+    /// `WIDTH`).
     pub fn wanted(&mut self, eye: [f64; 3], size: f32) -> Vec<Key> {
+        self.wanted_open(eye, size, COARSEST)
+    }
+
+    /// The same, every level coarser than `open` asked for its viewer (`open`, `Key::capped`).
+    pub fn wanted_open(&mut self, eye: [f64; 3], size: f32, open: i32) -> Vec<Key> {
         let finest = finest(size);
+        let middle_of_body = [eye[0], eye[1] - MIDDLE * size as f64, eye[2]];
         // From the coarsest down, each block lagging, and kept within the one about it.
         let mut middles = Vec::new();
         let mut outer: Option<[i32; 3]> = None;
         for level in (finest..=COARSEST).rev() {
             let between = 2.0 * 2f64.powi(level) * CELLS as f64;
-            let exact = eye.map(|c| c / between);
+            let exact = middle_of_body.map(|c| c / between);
             let mut middle = match self.middles.get(&level) {
                 Some(&m) => [0, 1, 2].map(|a| if (exact[a] - m[a] as f64).abs() > 0.5 + LAG { exact[a].round() as i32 } else { m[a] }),
                 None => exact.map(|c| c.round() as i32),
@@ -79,7 +126,7 @@ impl Rings {
                         {
                             continue;
                         }
-                        let key = Key { level, at };
+                        let key = Key::new(level, at).capped(open);
                         if over(key) {
                             keys.push(key);
                         }
@@ -121,21 +168,24 @@ pub fn over(key: Key) -> bool {
 /// without): chunks that never overlap, filling as much of the wanted space as can be, each
 /// wanted chunk not yet made stood in for by the coarser chunk about it or the finer ones within
 /// it. With how many wanted chunks have nothing shown in their space.
+/// The wanted chunks are asked for one viewer at most (`Rings::wanted_open`), and so are those
+/// that stand in for them.
 pub fn shown(wanted: &[Key], made: &dyn Fn(Key) -> bool) -> (Vec<Key>, usize) {
     let wanted_set: HashSet<Key> = wanted.iter().copied().collect();
+    let open = wanted.iter().filter(|k| k.asked < k.level).map(|k| k.asked).min().unwrap_or(COARSEST);
     // Every chunk about a wanted one, up to the coarsest.
     let mut about: HashSet<Key> = HashSet::new();
     for k in wanted {
         let mut p = *k;
         while p.level < COARSEST {
-            p = p.parent();
+            p = p.parent().capped(open);
             if !about.insert(p) {
                 break;
             }
         }
     }
     let roots: HashSet<Key> = wanted_set.iter().chain(&about).filter(|k| k.level == COARSEST).copied().collect();
-    let look = Look { wanted: &wanted_set, about: &about, made };
+    let look = Look { wanted: &wanted_set, about: &about, made, open };
     let (mut shown, mut holes) = (Vec::new(), 0);
     for root in roots {
         let (keys, h) = look.show(root);
@@ -149,6 +199,8 @@ struct Look<'a> {
     wanted: &'a HashSet<Key>,
     about: &'a HashSet<Key>,
     made: &'a dyn Fn(Key) -> bool,
+    /// The level whose viewer every chunk is asked for at most.
+    open: i32,
 }
 
 impl Look<'_> {
@@ -168,7 +220,7 @@ impl Look<'_> {
         }
         let (mut keys, mut holes) = (Vec::new(), 0);
         for child in key.children() {
-            let (k, h) = self.show(child);
+            let (k, h) = self.show(child.capped(self.open));
             keys.extend(k);
             holes += h;
         }
@@ -192,7 +244,7 @@ impl Look<'_> {
         }
         let mut keys = Vec::new();
         for child in key.children() {
-            keys.extend(self.finer(child, depth + 1)?);
+            keys.extend(self.finer(child.capped(self.open), depth + 1)?);
         }
         Some(keys)
     }

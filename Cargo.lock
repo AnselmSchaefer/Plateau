@@ -4797,6 +4797,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "plateau-make"
+version = "0.0.0"
+dependencies = [
+ "plateau-engine",
+ "png",
+ "serde_json",
+]
+
+[[package]]
 name = "plateau-play"
 version = "0.0.0"
 dependencies = [

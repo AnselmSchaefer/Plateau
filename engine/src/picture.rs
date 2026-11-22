@@ -211,7 +211,14 @@ fn draw(area: &mut dyn Region, shot: &Shot, width: usize, height: usize, first: 
                 let base = colour(a.material);
                 let sun = dot(n, SUN).max(0.0) * light[k];
                 let ambient = (0.30 + 0.15 * n[1]) * open[k].clamp(0.0, 1.0);
-                let mut c = base.map(|b| b * (ambient + 1.6 * sun));
+                // A lamp at the eye, lighting what the sun does not, within a few of the
+                // viewer's heights: a room the tiny stand in is otherwise lit by the hollows'
+                // dim ambient alone, a brown fog (found in step 5, by Claude, of its own areas).
+                let lamp = match shot {
+                    Shot::View(_) => 0.9 * (1.0 - light[k]) * (-dot(d, n)).max(0.0) / (1.0 + (t[i] / (4.0 * size)).powi(2)),
+                    Shot::Plan(_) => 0.0,
+                };
+                let mut c = base.map(|b| b * (ambient + 1.6 * sun + lamp));
                 if a.material == Material::Water {
                     let fresnel = 0.1 + 0.6 * (1.0 + dot(d, n)).powi(4);
                     c = mix(c, sky, fresnel);

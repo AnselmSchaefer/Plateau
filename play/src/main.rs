@@ -5,7 +5,8 @@
 //! garden (`areas/modules/garden.wasm`) unless another module is given. W A S D to walk, Shift to
 //! run, Space to jump, the mouse to look (click to take it, Esc to let it go); 1, 2 and 3 to become
 //! tiny, a person or a giant, Q and E to shrink and grow a size; C to sit or stand; V to see from
-//! behind or through the eyes; F12 for a screenshot (into `target/shots/`).
+//! behind or through the eyes; M to hide or show the flags over the tiny's places (`flags`); F12
+//! for a screenshot (into `target/shots/`).
 //!
 //! `--tour folder` goes instead to fixed places at each size, waits for the chunks there, measures
 //! the frames a second, takes a screenshot of each into the folder, writes what it measured to
@@ -19,6 +20,7 @@
 
 mod chunks;
 mod figure;
+mod flags;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +35,7 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 use chunks::Chunks;
 use plateau_engine::body::{self, Body, Intent};
-use plateau_engine::{Compiled, Limits, Region, SIZES, START, Wasm};
+use plateau_engine::{Compiled, Limits, Region, SIZES, START, Wasm, rings};
 
 /// The physics' steps a second.
 const HZ: f32 = 120.0;
@@ -65,6 +67,12 @@ fn main() {
     let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", module.display())));
     let mut physics = compiled.instantiate(seed).expect("the area made");
     let described = physics.describe().expect("the area described");
+    let flags: Vec<_> = described
+        .places
+        .iter()
+        .filter(|p| flags::flagged(p.size))
+        .map(|p| (p.size, flags::foot(&mut physics, p.at.map(|c| c as f64))))
+        .collect();
     let body = Body::standing(&mut physics, [START[0], 40.0, START[1]], SIZES[1].1).expect("the area asked");
 
     let present_mode = if tour.is_some() || std::env::var_os("PLATEAU_NO_VSYNC").is_some() { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync };
@@ -74,7 +82,7 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(ClearColor(SKY))
         .insert_resource(GlobalAmbientLight { brightness: 500.0, ..default() })
-        .insert_resource(Area { compiled, seed, places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect() })
+        .insert_resource(Area { compiled, seed, places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect(), flags })
         .insert_resource(Player {
             body,
             pitch: -0.15,
@@ -85,11 +93,12 @@ fn main() {
             owed: 0.0,
             third: tour.is_none() || behind,
             back: 0.0,
+            flags: tour.is_none() || behind,
         })
         .insert_resource(figure::Gait::default())
         .insert_non_send(Physics(physics))
         .add_systems(Startup, setup)
-        .add_systems(Update, (look_and_ask, step, frame, draw, figure::animate, hud).chain());
+        .add_systems(Update, (look_and_ask, step, frame, draw, figure::animate, flags::place, hud).chain());
     if let Some(folder) = tour {
         std::fs::create_dir_all(&folder).expect("the tour's folder");
         app.insert_resource(Tour::new(folder)).add_systems(Update, go_on_tour.before(step));
@@ -105,6 +114,8 @@ struct Area {
     compiled: Arc<Compiled>,
     seed: u64,
     places: Vec<(String, plateau_engine::Size, [f64; 3])>,
+    /// Where each flagged place's flag stands (`flags::flagged`), in the places' order.
+    flags: Vec<(plateau_engine::Size, [f64; 3])>,
 }
 
 /// The instance the player's body is moved through.
@@ -128,6 +139,8 @@ struct Player {
     /// How far behind the camera is, in the renderer's units: `BEHIND`, or nearer where something
     /// is in the way.
     back: f32,
+    /// The flags over the places shown.
+    flags: bool,
 }
 
 impl Player {
@@ -152,9 +165,13 @@ fn look(yaw: f32, pitch: f32) -> Quat {
 }
 
 fn setup(mut commands: Commands, area: Res<Area>, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
-    let material = materials.add(StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 0.92, reflectance: 0.3, ..default() });
+    // Both sides of every triangle drawn: a skirt hangs from the edge of a chunk into the solid and
+    // faces away from it, so where the finer surface stands out of the coarser one at a seam, the
+    // skirt that closes the gap faces away from whoever looks (slits of sky along the bowl's roof).
+    let material = materials.add(StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 0.92, reflectance: 0.3, cull_mode: None, ..default() });
     commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, material));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
+    flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
     let sun = Vec3::new(0.48, 0.70, 0.53).normalize();
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
@@ -171,7 +188,7 @@ fn setup(mut commands: Commands, area: Res<Area>, mut meshes: ResMut<Assets<Mesh
     let text = |size: f32| TextFont { font_size: bevy::text::FontSize::Px(size), ..default() };
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
-        Text::new("W A S D walk  /  Shift run  /  Space jump  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  V from behind or through the eyes  /  F12 screenshot"),
+        Text::new("W A S D walk  /  Shift run  /  Space jump  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  V from behind or through the eyes  /  M flags  /  F12 screenshot"),
         text(15.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         Node { position_type: PositionType::Absolute, bottom: px(10.0), left: px(12.0), ..default() },
@@ -241,6 +258,9 @@ fn look_and_ask(
     }
     if keys.just_pressed(KeyCode::KeyV) {
         player.third = !player.third;
+    }
+    if keys.just_pressed(KeyCode::KeyM) {
+        player.flags = !player.flags;
     }
     if keys.just_pressed(KeyCode::KeyC) {
         if player.body.seat.is_some() {
@@ -334,6 +354,7 @@ fn draw(
     mut meshes: ResMut<Assets<Mesh>>,
     mut chunks: ResMut<Chunks>,
     player: Res<Player>,
+    mut physics: NonSendMut<Physics>,
     mut transforms: Placed,
     mut camera: Query<(&mut Transform, &mut DistanceFog), With<Camera3d>>,
 ) {
@@ -348,7 +369,12 @@ fn draw(
         ahead.extend([(eye, change.to), (there, change.to)]);
     }
     let started = Instant::now();
-    chunks.update(eye, size, &ahead, &mut commands, &mut meshes);
+    // In a hollow only the smaller see, the coarser levels asked for a viewer who sees it too;
+    // likewise ahead, so the chunks inside are made before the player walks in.
+    let mut open = |e: [f64; 3], s: f32| rings::open(&mut physics.0, e, s).expect("the area asked");
+    let here = open(eye, size);
+    let ahead: Vec<_> = ahead.into_iter().map(|(e, s)| (e, s, open(e, s))).collect();
+    chunks.update(eye, size, here, &ahead, &mut commands, &mut meshes);
     chunks.place(eye, (DRAWN_AS / size) as f64, &mut transforms);
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
@@ -397,11 +423,15 @@ fn hud(mut text: Query<&mut Text, With<Hud>>, player: Res<Player>, chunks: Res<C
         feet[1],
         feet[2]
     );
-    // The area's places, when at one: within twice the smaller of the player and whom it is for.
+    // The area's places: when at one (within twice the smaller of the player and whom it is
+    // for), so; and with the flags shown, how far each is and which way.
     for (name, size, at) in &area.places {
         let far = ((at[0] - feet[0]).powi(2) + (at[1] - feet[1]).powi(2) + (at[2] - feet[2]).powi(2)).sqrt();
         if far < 2.0 * b.size.min(size.height()) as f64 {
             s += &format!("\nhere: {name}, a place for the {}", size.name());
+        } else if player.flags && flags::flagged(*size) {
+            let far = if far < 1.0 { format!("{:.0} cm", far * 100.0) } else { format!("{far:.1} m") };
+            s += &format!("\nflag: {name}, for the {}: {far} {}", size.name(), flags::compass(feet, *at));
         }
     }
     if let Some((said, until)) = &player.said
