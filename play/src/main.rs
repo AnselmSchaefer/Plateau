@@ -44,8 +44,9 @@ const DRAWN_AS: f32 = 1.7;
 /// How far ahead, in seconds, the chunks where the player is going are made.
 const AHEAD: f32 = 0.75;
 /// Seen from behind: the camera turns about a point this far above the eye (over the head, so the
-/// figure is below the middle of the view), this far behind it at most, and no nearer to what is in
-/// the way than `MARGIN`; in the renderer's units, a person's metres.
+/// figure is below the middle of the view; lower where the area is just over the head), this far
+/// behind it at most, and no nearer to what is in the way than `MARGIN`; in the renderer's units,
+/// a person's metres.
 const PIVOT: f32 = 0.35;
 const BEHIND: f32 = 3.4;
 const MARGIN: f32 = 0.25;
@@ -93,6 +94,7 @@ fn main() {
             owed: 0.0,
             third: tour.is_none() || behind,
             back: 0.0,
+            lift: PIVOT,
             flags: tour.is_none() || behind,
         })
         .insert_resource(figure::Gait::default())
@@ -139,6 +141,9 @@ struct Player {
     /// How far behind the camera is, in the renderer's units: `BEHIND`, or nearer where something
     /// is in the way.
     back: f32,
+    /// How far above the eye the camera turns about, in the renderer's units: `PIVOT`, or lower
+    /// where a roof is just over the head, so the camera is never in it.
+    lift: f32,
     /// The flags over the places shown.
     flags: bool,
 }
@@ -328,7 +333,13 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Ph
     // Metres of the area to a unit of the renderer.
     let per = (size / DRAWN_AS) as f64;
     let eye = player.eye.unwrap_or(player.body.eye());
-    let pivot = [eye[0], eye[1] + PIVOT as f64 * per, eye[2]];
+    // The point turned about: no nearer to what is over the head than a tenth of a unit.
+    let over = match body::look(&mut physics.0, eye, [0.0, 1.0, 0.0], size, (PIVOT + 0.1) * size / DRAWN_AS).expect("the area asked") {
+        Some(hit) => (((hit[1] - eye[1]) / per) as f32 - 0.1).clamp(0.0, PIVOT),
+        None => PIVOT,
+    };
+    player.lift = if over < player.lift { over } else { player.lift + (over - player.lift) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
+    let pivot = [eye[0], eye[1] + player.lift as f64 * per, eye[2]];
     let away = -player.looking();
     let room = if want > 0.0 {
         match body::look(&mut physics.0, pivot, away.to_array(), size, want * size / DRAWN_AS).expect("the area asked") {
@@ -379,7 +390,7 @@ fn draw(
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
         camera.rotation = look(player.body.yaw, player.pitch);
-        camera.translation = if player.third { Vec3::Y * PIVOT - player.looking() * player.back } else { Vec3::ZERO };
+        camera.translation = if player.third { Vec3::Y * player.lift - player.looking() * player.back } else { Vec3::ZERO };
         // Haze is the air's, in metres, not the player's: a few hundred metres, a little more for a
         // giant, whose eyes are high above it.
         fog.falloff = FogFalloff::from_visibility((200.0 + 60.0 * size) * DRAWN_AS / size);
