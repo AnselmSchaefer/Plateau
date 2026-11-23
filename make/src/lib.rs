@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use plateau_engine::picture::{Camera, map, picture, plan, plans, tint, views};
 use plateau_engine::reach::World;
+use plateau_engine::sketch::Sketch;
 use plateau_engine::{Compiled, Description, Limits, Region, Size, Wasm, check, laws, points};
 
 /// The seed every area is made and judged with.
@@ -161,11 +162,12 @@ impl Judged {
 }
 
 /// The module checked (`check::check`), made with `SEED`, and held to the laws: sizes agree,
-/// distances never too long, surfaces have an inside, gates are real, no traps, NaNs unseen. ("The
+/// distances never too long, surfaces have an inside, gates are real, no traps, NaNs unseen, and
+/// (when `sketch` is given) the sketch's two laws (`sketch_materials`, `sketch_places`). ("The
 /// same everywhere" asks for hashes kept, which a new area has none of; it is the areas of `areas/`
 /// that keep them.) A law that cannot be asked of it (the module traps, or runs out of fuel) is
 /// broken.
-pub fn judge(module: &[u8], settings: Settings) -> Judged {
+pub fn judge(module: &[u8], sketch: Option<&Sketch>, settings: Settings) -> Judged {
     let started = Instant::now();
     let mut judged = Judged::default();
     if let Err(why) = check::check(module) {
@@ -201,10 +203,16 @@ pub fn judge(module: &[u8], settings: Settings) -> Judged {
     with!("sizes agree", |a: &mut Wasm| laws::sizes_agree(a, &d, 1, settings.rays));
     with!("distances never too long", |a: &mut Wasm| laws::never_too_long(a, &d, 1, settings.rays));
     with!("surfaces have an inside", |a: &mut Wasm| laws::surfaces_have_an_inside(a, &d, 1, settings.rays));
+    if let Some(s) = sketch {
+        with!("sketch materials", |a: &mut Wasm| laws::sketch_materials(a, s));
+    }
     let mut world = World::new(&mut area, &d.places);
     match world.reach(&Size::ALL) {
         Ok(all) => {
             ran("gates are real", laws::gates_are_real(&mut world, &all, &d), &mut judged.broken);
+            if let Some(s) = sketch {
+                ran("sketch places", laws::sketch_places(&mut world, &all, &d, s), &mut judged.broken);
+            }
             ran("no traps", laws::no_traps(&world, &all), &mut judged.broken);
         }
         Err(e) => judged.broken.push(("gates are real".into(), format!("working out where each size can go failed: {e:#}"))),
@@ -323,35 +331,94 @@ fn laws_said(broken: &[(String, String)]) -> String {
 }
 
 /// What to say when it keeps every law: look at the pictures, then make it better.
-fn look_said(dir: &Path, shown: &[(String, String)]) -> String {
+fn look_said(dir: &Path, shown: &[(String, String)], has_sketch: bool) -> String {
     let list: String = shown.iter().map(|(file, what)| format!("- `{}`: {what}\n", dir.join(file).display())).collect();
+    let sketch_note = if has_sketch {
+        format!(
+            " Compare `plan.png` and `reach.png` against the sketch at `{}` to make sure the layout, features and places match what \
+             was drawn.",
+            dir.join("sketch.png").display()
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "It builds and keeps every law. These are pictures of it, as the engine draws it (read each with your Read tool):\n\n\
-         {list}\nLook at them as the one who asked for it would. Does it look like what was asked? Is each size's world worth \
-         walking: the tiny's, a person's, a giant's? Is anything missing, wrong, too plain, or broken up? Then answer with the \
-         whole of `area.rs` again, made better, in one ```rust block, keeping every law. If it is already as good as you can \
-         make it, answer with it unchanged."
+        "It builds and keeps every law. These are pictures of it, as the engine draws it (read them with your Read tool; start with \
+         `giant-over-the-area.png`, `plan.png`, `reach.png`, and each place's view and reach map):\n\n\
+         {list}\nLook at them as the one who asked for it would.{sketch_note} Does it look like what was asked? Is each size's world \
+         worth walking: the tiny's, a person's, a giant's? Is anything missing, wrong, too plain, or broken up? Then answer with the \
+         whole of `area.rs` again, made better, in one ```rust block, keeping every law. If it is already as good as you can make \
+         it, answer with it unchanged."
     )
 }
 
-/// Makes an area of `words` with `writer`, in `dir`: each round's answer and source kept in
-/// `dir/rounds/`, the version kept as `dir/area.rs` and `dir/area.wasm`, its pictures in
-/// `dir/pictures/`. `say` is told how it goes, a line at a time.
-pub fn make(writer: &mut dyn Writer, builder: &Builder, words: &str, dir: &Path, settings: Settings, say: &mut dyn FnMut(&str)) -> Result<Made, String> {
+/// The first prompt, with or without a sketch map.
+fn first_prompt(words: &str, sketch: Option<(&Path, &Sketch)>) -> String {
+    match sketch {
+        None => format!("Make this area: {words}\n\nAnswer with the whole of `area.rs` in one ```rust block."),
+        Some((path, s)) => format!(
+            "Make this area: {words}\n\n\
+             A sketch map from above is at `{}` — read it with your Read tool before writing. North is at the top (z = 0), south at \
+             the bottom (z = 64), west on the left (x = 0), east on the right (x = 64). Below are the shapes the engine read from \
+             the sketch in area metres:\n\n{}\
+             Follow the sketch's layout and keep its two laws (materials within 3 m; orange places for the tiny only and purple \
+             places for giants only), while making the world natural, rich and finished at every size.\n\n\
+             Answer with the whole of `area.rs` in one ```rust block.",
+            path.display(),
+            s.describe()
+        ),
+    }
+}
+
+/// Makes an area of `words` (and an optional `sketch` PNG) with `writer`, in `dir`: each round's
+/// answer and source kept in `dir/rounds/`, the version kept as `dir/area.rs` and `dir/area.wasm`,
+/// its pictures in `dir/pictures/`, and any sketch copied to `dir/sketch.png`. `say` is told how
+/// it goes, a line at a time.
+pub fn make(
+    writer: &mut dyn Writer,
+    builder: &Builder,
+    words: &str,
+    sketch_path: Option<&Path>,
+    dir: &Path,
+    settings: Settings,
+    say: &mut dyn FnMut(&str),
+) -> Result<Made, String> {
     let started = Instant::now();
     let rounds_dir = dir.join("rounds");
     std::fs::create_dir_all(&rounds_dir).map_err(|e| e.to_string())?;
+    let sketch_info: Option<(PathBuf, Sketch)> = match sketch_path {
+        Some(path) => {
+            let parsed = Sketch::open(path)?;
+            let copied = dir.join("sketch.png");
+            std::fs::copy(path, &copied).map_err(|e| format!("{}: {e}", copied.display()))?;
+            Some((copied, parsed))
+        }
+        None => None,
+    };
+    let sketch = sketch_info.as_ref().map(|(_, s)| s);
     let mut made = Made { kept: None, rounds: Vec::new(), fixes: 0, looked: false, seconds: 0.0 };
-    let mut prompt = format!("Make this area: {words}\n\nAnswer with the whole of `area.rs` in one ```rust block.");
+    let mut prompt = first_prompt(words, sketch_info.as_ref().map(|(p, s)| (p.as_path(), s)));
     let mut asked = "write";
-    let mut pictures_for: Option<PathBuf> = None;
+    let mut pictures_for: Option<PathBuf> = sketch_info.as_ref().map(|_| dir.to_path_buf());
     loop {
         say(&format!("round {}: asking Claude ({asked})", made.rounds.len() + 1));
-        let reply = writer.write(&prompt, pictures_for.as_deref())?;
+        let reply = match writer.write(&prompt, pictures_for.as_deref()) {
+            Ok(reply) => reply,
+            Err(e) if made.kept.is_some() => {
+                // A version that kept every law is never lost (CONCEPT.md): keep it if a later
+                // round (such as the look) cannot reach Claude.
+                say(&format!("round {}: stopped ({e}); keeping the last version that kept every law", made.rounds.len() + 1));
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         let n = made.rounds.len() + 1;
         std::fs::write(rounds_dir.join(format!("{n}-{asked}-asked.md")), &prompt).ok();
         std::fs::write(rounds_dir.join(format!("{n}-{asked}-answer.md")), &reply.text).ok();
         say(&format!("round {n}: answered in {:.0} s, reckoned at ${:.2}", reply.seconds, reply.cost));
+        if asked == "write" {
+            pictures_for = None;
+        }
         if asked == "look" {
             made.looked = true;
             pictures_for = None;
@@ -364,7 +431,7 @@ pub fn make(writer: &mut dyn Writer, builder: &Builder, words: &str, dir: &Path,
                 match builder.build(&source, &dir.join("build")) {
                     Err(words) => ("does not build".into(), Some(("compile", compiler_said(&words)))),
                     Ok(module) => {
-                        let judged = judge(&module, settings);
+                        let judged = judge(&module, sketch, settings);
                         if judged.kept() {
                             std::fs::write(dir.join("area.rs"), &source).map_err(|e| e.to_string())?;
                             std::fs::write(dir.join("area.wasm"), &module).map_err(|e| e.to_string())?;
@@ -374,8 +441,11 @@ pub fn make(writer: &mut dyn Writer, builder: &Builder, words: &str, dir: &Path,
                             } else {
                                 let pics = dir.join("pictures");
                                 let shown = pictures(&module, &pics, settings)?;
+                                if let Some((copied, _)) = &sketch_info {
+                                    std::fs::copy(copied, pics.join("sketch.png")).ok();
+                                }
                                 pictures_for = Some(pics.clone());
-                                ("keeps every law".into(), Some(("look", look_said(&pics, &shown))))
+                                ("keeps every law".into(), Some(("look", look_said(&pics, &shown, sketch.is_some()))))
                             }
                         } else {
                             let names: Vec<_> = judged.broken.iter().map(|b| b.0.clone()).collect();

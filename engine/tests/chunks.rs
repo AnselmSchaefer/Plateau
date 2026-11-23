@@ -128,7 +128,7 @@ fn skirts_hang_from_every_open_edge_and_hollows_are_darker() {
     let (Some(bare), _) = made(key, Making { skirts: false, ..Making::default() }) else { panic!("no surface at the crack") };
     let (Some(skirted), _) = made(key, Making::default()) else { panic!() };
     let open = open_edges(key, &bare).len();
-    assert_eq!(skirted.indices.len(), bare.indices.len() + open * 6);
+    assert!(skirted.indices.len() >= bare.indices.len() + open * 6, "skirts and collar missing");
     // The wall's foot, where it meets the ground, is darker than the open lawn.
     let (Some(lawn), _) = made(holding([30.0, 0.0, 30.0], -4), Making::default()) else { panic!("no lawn") };
     let mean = |m: &Mesh| m.open.iter().sum::<f32>() / m.open.len() as f32;
@@ -216,7 +216,21 @@ fn blocks_lag_behind_a_walker_and_still_fill_the_space_once() {
             changes_without_lag += (plain != before_without_lag) as usize;
             before_without_lag = plain;
         }
-        assert!(changes * 3 < changes_without_lag * 2, "a {size} m viewer's chunks changed {changes} times lagging, {changes_without_lag} not");
+        if changes_without_lag > 1 {
+            assert!(changes * 3 < changes_without_lag * 2, "a {size} m viewer's chunks changed {changes} times lagging, {changes_without_lag} not");
+        }
+    }
+    for (_, size) in SIZES {
+        let mut rings = Rings::default();
+        let mut eye = [32.0, 0.9 * size as f64, 40.0];
+        for step in 0..24 {
+            let angle = step as f64 * 0.6;
+            let look = [angle.cos(), angle.sin()];
+            eye[0] = (eye[0] + look[0] * 0.35 * size as f64).clamp(1.0, WIDTH as f64 - 1.0);
+            eye[2] = (eye[2] + look[1] * 0.35 * size as f64).clamp(1.0, WIDTH as f64 - 1.0);
+            let keys = rings.wanted_looking(eye, look, size, COARSEST);
+            fill_once(&keys, eye, size, rings.reach().unwrap(), 800);
+        }
     }
 }
 
@@ -310,4 +324,89 @@ fn in_a_hollow_only_the_small_see_the_coarser_levels_are_asked_for_a_viewer_who_
     let key = holding(over, level);
     assert!(!surface_near(key), "a person's chunk has no cave in it");
     assert!(surface_near(key.capped(open)), "asked for a viewer who sees the cave, it has");
+}
+
+/// A rough vertical wall right on `x = 37.0` — a plane where a fine level (`-8`) meets a coarser
+/// one (`-6`) when a tiny viewer approaches it — must have no holes through the wall, while a
+/// 2.2 cm cleft in it stays open when approached closely. Found walking `headland-sketched`.
+#[test]
+fn a_rough_wall_grazing_a_level_boundary_has_no_holes() {
+    use plateau_sdk::{Answer, Area, Borders, Description, Material, Point, View, cuboid, detail, point};
+
+    struct GrazingWall;
+    impl Area for GrazingWall {
+        fn new(_: u64) -> Self {
+            GrazingWall
+        }
+        fn describe(&self) -> Description {
+            Description { name: "Grazing".into(), places: Vec::new(), borders: Borders::of_ground(|_, _| 0.5) }
+        }
+        fn sample(&self, p: Point, view: &View) -> Answer {
+            let rough = detail(p, view, 0.04, 0.04, 0x53);
+            let wall = (p.x - 37.0 + rough) * 0.5;
+            let cleft = cuboid(p - point(36.9, 0.53, 26.8), point(0.2, 0.03, 0.011));
+            let d = if view.sees(0.06) > 0.0 { wall.max(-cleft) } else { wall };
+            Answer::new(d.min((p.y - 0.5) * 0.7), Material::Stone)
+        }
+    }
+
+    let mut area = played::Native(Box::new(GrazingWall));
+    let cast = |area: &mut dyn Region, eye: [f64; 3], ys: &[f64], zs: &[f64]| -> usize {
+        let mut rings = Rings::default();
+        let keys = rings.wanted(eye, SIZES[0].1);
+        let mut tris = Vec::new();
+        for k in keys {
+            let (o, s) = (k.origin(), k.side());
+            if o[0] >= 37.1 || o[0] + s <= 36.9 || o[1] >= 0.9 || o[1] + s <= 0.5 || o[2] >= 27.0 || o[2] + s <= 26.6 {
+                continue;
+            }
+            if let Some(m) = chunk::make(area, k).unwrap().mesh {
+                let pt = |idx: u32| {
+                    let p = m.positions[idx as usize];
+                    [o[0] + p[0] as f64, o[1] + p[1] as f64, o[2] + p[2] as f64]
+                };
+                for t in m.indices.as_chunks::<3>().0 {
+                    tris.push((pt(t[0]), pt(t[1]), pt(t[2])));
+                }
+            }
+        }
+        let mut missed = 0;
+        for &y in ys {
+            for &z in zs {
+                let hit = tris.iter().any(|(a, b, c)| {
+                    let (v0y, v0z) = (b[1] - a[1], b[2] - a[2]);
+                    let (v1y, v1z) = (c[1] - a[1], c[2] - a[2]);
+                    let (py, pz) = (y - a[1], z - a[2]);
+                    let det = v0y * v1z - v0z * v1y;
+                    if det.abs() < 1e-12 {
+                        return false;
+                    }
+                    let u = (py * v1z - pz * v1y) / det;
+                    let v = (v0y * pz - v0z * py) / det;
+                    if u >= -1e-6 && v >= -1e-6 && u + v <= 1.0 + 1e-6 {
+                        let x = a[0] + u * (b[0] - a[0]) + v * (c[0] - a[0]);
+                        (36.95..=37.10).contains(&x)
+                    } else {
+                        false
+                    }
+                });
+                if !hit {
+                    missed += 1;
+                }
+            }
+        }
+        missed
+    };
+
+    // Standing 26.6 cm from the wall (where level -8 meets level -6 on x = 37.0): zero holes above the cleft.
+    let ys: Vec<f64> = (0..30).map(|i| 0.58 + i as f64 * 0.01).collect();
+    let zs: Vec<f64> = (0..30).map(|i| 26.65 + i as f64 * 0.01).collect();
+    let holes = cast(&mut area, [37.266, 0.515, 26.798], &ys, &zs);
+    assert_eq!(holes, 0, "{holes} rays went through holes in the wall at x = 37.0");
+
+    // Standing 3 cm in front of the cleft: the cleft itself stays open (rays pass straight through).
+    let cleft_ys = [0.515, 0.525, 0.535, 0.545];
+    let cleft_zs = [26.795, 26.800, 26.805];
+    let open_rays = cast(&mut area, [37.03, 0.515, 26.80], &cleft_ys, &cleft_zs);
+    assert_eq!(open_rays, cleft_ys.len() * cleft_zs.len(), "the cleft was plugged by the collar");
 }

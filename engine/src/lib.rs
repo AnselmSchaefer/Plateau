@@ -6,8 +6,8 @@
 //!
 //! What the engine makes of an area, without a window: the surface in chunks at the detail each
 //! size needs (`chunk`, `rings`), a player's body walking it at their size (`body`), where each
-//! size can go (`reach`), pictures (`picture`), and the laws an area must keep (`laws`). The window
-//! is `play/`.
+//! size can go (`reach`), pictures (`picture`), sketched maps (`sketch`), and the laws an area
+//! must keep (`laws`). The window is `play/`.
 
 pub mod body;
 pub mod check;
@@ -16,17 +16,23 @@ pub mod laws;
 pub mod picture;
 pub mod reach;
 pub mod rings;
+pub mod sketch;
 pub mod wasm;
 
 pub use wasm::{Compiled, Limits, Wasm};
 pub use wasmtime::{Error, Result};
 
-/// An area, to the engine: an answer for each point, at a size, and what it says it is.
+/// An area, to the engine: an answer for each point, at a size, what it says it is, and any smooth
+/// GPU-rendered props it emits.
 pub trait Region {
     /// Fills `out` with an answer for each of `points`, in order, for a viewer `size` metres tall.
     fn sample(&mut self, points: &[[f32; 3]], size: f32, out: &mut Vec<Answer>) -> Result<()>;
     /// What the area says it is.
     fn describe(&mut self) -> Result<Description>;
+    /// Smooth GPU-rendered props emitted once by the area (reeds, flowers, tussocks, sticks, etc.).
+    fn props(&mut self) -> Result<Vec<Prop>> {
+        Ok(Vec::new())
+    }
 }
 
 /// How wide an area is, along x and along z, in metres (the world's `region.wit`).
@@ -36,7 +42,7 @@ pub const WIDTH: f32 = 64.0;
 pub const SIZES: [(Size, f32); 3] = [(Size::Tiny, 0.017), (Size::Person, 1.7), (Size::Giant, 17.0)];
 
 /// Where a player comes into an area, across the ground (x, z): the middle of its south edge, a
-/// little way in, facing north. Areas say nothing of it yet; borders will (step 8).
+/// little way in, facing north. Areas say nothing of it yet; borders will (step 9).
 pub const START: [f64; 2] = [32.0, 60.0];
 
 /// The smallest and largest a viewer may be, so an area is asked only at sizes it was made for:
@@ -135,6 +141,39 @@ pub struct Description {
     pub name: String,
     pub places: Vec<Place>,
     pub borders: Borders,
+}
+
+/// The shape of a smooth GPU-rendered prop emitted by an area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PropKind {
+    Capsule = 0,
+    Ellipsoid = 1,
+    Cylinder = 2,
+    Cone = 3,
+}
+
+impl PropKind {
+    pub fn from_number(n: u8) -> Option<PropKind> {
+        match n {
+            0 => Some(PropKind::Capsule),
+            1 => Some(PropKind::Ellipsoid),
+            2 => Some(PropKind::Cylinder),
+            3 => Some(PropKind::Cone),
+            _ => None,
+        }
+    }
+}
+
+/// A smooth prop emitted once by an area and rendered natively on the GPU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Prop {
+    pub kind: PropKind,
+    pub material: Material,
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub r: f32,
+    pub yaw: f32,
 }
 
 /// FNV-1a over answers' bits: the same answers give the same hash on every machine.

@@ -12,10 +12,10 @@ publish.workspace = true
 wasmtime = { version = "51.0.0", default-features = false, features = ["cranelift", "runtime", "std"] }
 # The check on load: wasmtime's own parser, with the features named.
 wasmparser = { version = "0.263.0", default-features = false, features = ["std", "validate", "features"] }
+# Reading sketched maps (step 6) and writing pictures.
+png = "0.18.1"
 
 [dev-dependencies]
-# Only for `examples/look.rs`, which writes pictures.
-png = "0.18.1"
 # The areas of `areas/` played natively: what their modules must answer as.
 areas-played = { path = "../areas/played" }
 plateau-sdk = { path = "../sdk" }

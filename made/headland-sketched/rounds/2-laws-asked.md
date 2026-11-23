@@ -1,0 +1,6 @@
+It builds, but it breaks these laws:
+
+- **surfaces have an inside**: a surface has no inside: at (36.8, 8.2, 23.4), for a 5.40 m viewer, the distance comes to nought, but nothing within 1.6 cm of it is inside anything (5 of 2800 rays stopped at such a place; seed 1). A ray stops there and a body stands on it or walks into it, though nothing is there. It is where a shape cut out ends exactly at the surface of what it is cut from: make what is cut out reach a little beyond it (a pit from above the ground, a door through more than the wall's thickness), and answer a bound only well away from what it bounds.
+- **no traps**: a trap: a person who comes to (38.38, -0.59, 31.75) cannot get back to the start, at any size (12 places like it). They come there by: as a giant (32.2, 0.7, 60.2), (25.0, 0.6, 53.0), (24.2, 1.7, 45.8), (31.4, 4.5, 38.6), (37.8, 1.6, 32.2), as a person (37.87, 1.39, 32.26), (38.38, -0.59, 31.75). Every place a body can get to, it must be able to leave: a way out it can climb (a step of a quarter of its height, a jump of a third), or room to grow.
+
+Answer with the whole of `area.rs` again, fixed, in one ```rust block. Keep what is right; change what the laws found.

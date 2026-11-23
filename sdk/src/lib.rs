@@ -35,7 +35,7 @@ pub mod rt;
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-pub use bindings::plateau::region::types::{Answer, Borders, Description, Edge, Material, Place, Point, Size};
+pub use bindings::plateau::region::types::{Answer, Borders, Description, Edge, Material, Place, Point, Prop, PropKind, Size};
 
 /// How wide an area is, along x and along z, in metres.
 pub const WIDTH: f32 = 64.0;
@@ -53,6 +53,37 @@ pub trait Area: 'static {
     /// What is at `at` for `view`: the distance to the nearest surface (negative inside) and its
     /// material.
     fn sample(&self, at: Point, view: &View) -> Answer;
+    /// Smooth GPU-rendered props (reeds, cattails, flowers, tussocks, sticks, mushrooms) that stay
+    /// razor-sharp at every distance without voxel aliasing. Asked once on load.
+    fn props(&self) -> Vec<Prop> {
+        Vec::new()
+    }
+}
+
+impl Prop {
+    /// A smooth capsule from `a` to `b` of radius `r`.
+    pub const fn capsule(a: Point, b: Point, r: f32, material: Material) -> Prop {
+        Prop { kind: PropKind::Capsule, material, a, b, r, yaw: 0.0 }
+    }
+
+    /// A smooth ellipsoid centred at `center` with half-sizes `radii`, turned by `yaw` radians.
+    pub const fn ellipsoid(center: Point, radii: Point, yaw: f32, material: Material) -> Prop {
+        Prop { kind: PropKind::Ellipsoid, material, a: center, b: radii, r: 0.0, yaw }
+    }
+
+    /// A smooth upright cylinder centred at `center` of radius `r` and half-height `half_h`, with
+    /// an optional V-notch facing `notch` radians (for lily pads).
+    pub const fn cylinder(center: Point, r: f32, half_h: f32, notch: Option<f32>, material: Material) -> Prop {
+        match notch {
+            Some(yaw) => Prop { kind: PropKind::Cylinder, material, a: center, b: point(r, half_h, 0.0), r: 1.0, yaw },
+            None => Prop { kind: PropKind::Cylinder, material, a: center, b: point(r, half_h, 0.0), r: 0.0, yaw: 0.0 },
+        }
+    }
+
+    /// A smooth cone with base centred at `foot`, base radius `r`, and `height` (negative points down).
+    pub const fn cone(foot: Point, height: f32, r: f32, material: Material) -> Prop {
+        Prop { kind: PropKind::Cone, material, a: foot, b: point(0.0, height, 0.0), r, yaw: 0.0 }
+    }
 }
 
 /// Makes the type an area: `area!(Garden);` once, in the area's file. Built for WebAssembly it
@@ -92,6 +123,10 @@ macro_rules! area {
                 fn describe() -> $crate::Description {
                     with(|a| $crate::Area::describe(a))
                 }
+
+                fn props() -> ::std::vec::Vec<$crate::Prop> {
+                    with(|a| $crate::Area::props(a))
+                }
             }
 
             $crate::__export_region_impl!(Exports with_types_in $crate::bindings);
@@ -112,12 +147,15 @@ pub fn sample_all<A: Area>(area: &A, points: &[Point], size: f32) -> Vec<Answer>
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod native {
-    use crate::{Answer, Area, Description, Point};
+    use crate::{Answer, Area, Description, Point, Prop};
 
     /// An area as the engine's tests play it, as the world's exports are called.
     pub trait Played {
         fn sample(&self, points: &[Point], size: f32, out: &mut Vec<Answer>);
         fn describe(&self) -> Description;
+        fn props(&self) -> Vec<Prop> {
+            Vec::new()
+        }
     }
 
     impl<T: Area> Played for T {
@@ -126,6 +164,9 @@ pub mod native {
         }
         fn describe(&self) -> Description {
             Area::describe(self)
+        }
+        fn props(&self) -> Vec<Prop> {
+            Area::props(self)
         }
     }
 }

@@ -5,6 +5,7 @@
 pub type Point = plateau::region::types::Point;
 pub type Answer = plateau::region::types::Answer;
 pub type Description = plateau::region::types::Description;
+pub type Prop = plateau::region::types::Prop;
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
 pub unsafe fn _export_sample_cabi<T_: Guest>(
@@ -266,6 +267,61 @@ pub unsafe fn __post_return_describe<T_: Guest>(arg0: *mut u8) {
         _rt::cabi_dealloc(base18, len18 * 4, 4);
     }
 }
+#[doc(hidden)]
+#[allow(non_snake_case, unused_unsafe)]
+pub unsafe fn _export_props_cabi<T_: Guest>() -> *mut u8 {
+    unsafe {
+        #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+        let result0 = { T_::props() };
+        let ptr1 = (&raw mut _RET_AREA.0).cast::<u8>();
+        let vec5 = result0;
+        let len5 = vec5.len();
+        let layout5 = _rt::alloc::Layout::from_size_align(vec5.len() * 36, 4).unwrap();
+        let (result5, _cleanup5) = crate::rt::Cleanup::new(layout5);
+        if let Some(cleanup) = _cleanup5 {
+            cleanup.forget();
+        }
+        for (i, e) in vec5.into_iter().enumerate() {
+            let base = result5.add(i * 36);
+            {
+                let plateau::region::types::Prop {
+                    kind: kind2,
+                    material: material2,
+                    a: a2,
+                    b: b2,
+                    r: r2,
+                    yaw: yaw2,
+                } = e;
+                *base.add(0).cast::<u8>() = (kind2.clone() as i32) as u8;
+                *base.add(1).cast::<u8>() = (material2.clone() as i32) as u8;
+                let plateau::region::types::Point { x: x3, y: y3, z: z3 } = a2;
+                *base.add(4).cast::<f32>() = _rt::as_f32(x3);
+                *base.add(8).cast::<f32>() = _rt::as_f32(y3);
+                *base.add(12).cast::<f32>() = _rt::as_f32(z3);
+                let plateau::region::types::Point { x: x4, y: y4, z: z4 } = b2;
+                *base.add(16).cast::<f32>() = _rt::as_f32(x4);
+                *base.add(20).cast::<f32>() = _rt::as_f32(y4);
+                *base.add(24).cast::<f32>() = _rt::as_f32(z4);
+                *base.add(28).cast::<f32>() = _rt::as_f32(r2);
+                *base.add(32).cast::<f32>() = _rt::as_f32(yaw2);
+            }
+        }
+        *ptr1.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len5;
+        *ptr1.add(0).cast::<*mut u8>() = result5;
+        ptr1
+    }
+}
+#[doc(hidden)]
+#[allow(non_snake_case)]
+pub unsafe fn __post_return_props<T_: Guest>(arg0: *mut u8) {
+    unsafe {
+        let l0 = *arg0.add(0).cast::<*mut u8>();
+        let l1 = *arg0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+        let base2 = l0;
+        let len2 = l1;
+        _rt::cabi_dealloc(base2, len2 * 36, 4);
+    }
+}
 pub trait Guest {
     /// What is at each point, in order, for a viewer `size` metres tall: one answer a point. The
     /// detail a viewer sees grows as they shrink; what a smaller viewer sees is the larger one's
@@ -275,6 +331,10 @@ pub trait Guest {
     /// What the area is: its name, its places, its borders. Asked once.
     #[allow(async_fn_in_trait)]
     fn describe() -> Description;
+    /// Smooth GPU-rendered props (reeds, flowers, tussocks, sticks, mushrooms) that stay sharp at
+    /// every distance without voxel aliasing. Asked once.
+    #[allow(async_fn_in_trait)]
+    fn props() -> _rt::Vec<Prop>;
 }
 #[doc(hidden)]
 #[macro_export]
@@ -289,7 +349,11 @@ macro_rules! __export_world_region_cabi {
         -> * mut u8 { unsafe { $($path_to_types)*:: _export_describe_cabi::<$ty > () } }
         #[unsafe (export_name = "cabi_post_describe")] unsafe extern "C" fn
         _post_return_describe(arg0 : * mut u8,) { unsafe { $($path_to_types)*::
-        __post_return_describe::<$ty > (arg0) } } };
+        __post_return_describe::<$ty > (arg0) } } #[unsafe (export_name = "props")]
+        unsafe extern "C" fn export_props() -> * mut u8 { unsafe { $($path_to_types)*::
+        _export_props_cabi::<$ty > () } } #[unsafe (export_name = "cabi_post_props")]
+        unsafe extern "C" fn _post_return_props(arg0 : * mut u8,) { unsafe {
+        $($path_to_types)*:: __post_return_props::<$ty > (arg0) } } };
     };
 }
 #[doc(hidden)]
@@ -541,6 +605,78 @@ pub mod plateau {
                         .finish()
                 }
             }
+            /// The shape of a smooth GPU-rendered prop (thin plants, flowers, sticks, pebbles, limbs).
+            #[repr(u8)]
+            #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+            pub enum PropKind {
+                Capsule,
+                Ellipsoid,
+                Cylinder,
+                Cone,
+            }
+            impl ::core::fmt::Debug for PropKind {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    match self {
+                        PropKind::Capsule => f.debug_tuple("PropKind::Capsule").finish(),
+                        PropKind::Ellipsoid => {
+                            f.debug_tuple("PropKind::Ellipsoid").finish()
+                        }
+                        PropKind::Cylinder => {
+                            f.debug_tuple("PropKind::Cylinder").finish()
+                        }
+                        PropKind::Cone => f.debug_tuple("PropKind::Cone").finish(),
+                    }
+                }
+            }
+            impl PropKind {
+                #[doc(hidden)]
+                pub unsafe fn _lift(val: u8) -> PropKind {
+                    if !cfg!(debug_assertions) {
+                        return unsafe { ::core::mem::transmute(val) };
+                    }
+                    match val {
+                        0 => PropKind::Capsule,
+                        1 => PropKind::Ellipsoid,
+                        2 => PropKind::Cylinder,
+                        3 => PropKind::Cone,
+                        _ => panic!("invalid enum discriminant"),
+                    }
+                }
+            }
+            /// A smooth prop emitted once by the area and rendered natively on the GPU without voxel
+            /// aliasing or LOD morphing:
+            /// - capsule: segment from `a` to `b`, radius `r`
+            /// - ellipsoid: centre `a`, half-sizes `b`, turned by `yaw` (radians)
+            /// - cylinder: centre `a`, radius `b.x`, half-height `b.y`, optional notch angle `yaw` when `r > 0`
+            /// - cone: foot `a`, height `b.y` (negative points down), base radius `r`
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct Prop {
+                pub kind: PropKind,
+                pub material: Material,
+                pub a: Point,
+                pub b: Point,
+                pub r: f32,
+                pub yaw: f32,
+            }
+            impl ::core::fmt::Debug for Prop {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Prop")
+                        .field("kind", &self.kind)
+                        .field("material", &self.material)
+                        .field("a", &self.a)
+                        .field("b", &self.b)
+                        .field("r", &self.r)
+                        .field("yaw", &self.yaw)
+                        .finish()
+                }
+            }
         }
     }
 }
@@ -611,24 +747,27 @@ macro_rules! __export_region_impl {
         "wasm32")] #[unsafe (link_section =
         "component-type:wit-bindgen:0.63.0:plateau:region@0.1.0:region:imports and exports")]
         #[doc(hidden)] #[allow(clippy::octal_escapes)] pub static
-        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 680] = *
+        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 810] = *
         b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xab\x04\x01A\x02\x01\
-A\x10\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B\x13\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xad\x05\x01A\x02\x01\
+A\x15\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
+\0\x01B\x17\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05\
 grass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\
 \x03\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\
 \x04tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\
 \x02at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\
 \x04\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\
 \x04\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\
-\x04\0\x0bdescription\x03\0\x11\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\
-\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\
-\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\x01p\x03\x01\
-p\x05\x01@\x02\x06points\x08\x04sizev\0\x09\x04\0\x06sample\x01\x0a\x01@\0\0\x07\
-\x04\0\x08describe\x01\x0b\x04\0\x1bplateau:region/region@0.1.0\x04\0\x0b\x0c\x01\
-\0\x06region\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x07\
-0.262.0\x10wit-bindgen-rust\x060.63.0";
+\x04\0\x0bdescription\x03\0\x11\x01m\x04\x07capsule\x09ellipsoid\x08cylinder\x04\
+cone\x04\0\x09prop-kind\x03\0\x13\x01r\x06\x04kind\x14\x08material\x03\x01a\x01\x01\
+b\x01\x01rv\x03yawv\x04\0\x04prop\x03\0\x15\x03\0\x1aplateau:region/types@0.1.0\x05\
+\x01\x02\x03\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\
+\0\x06answer\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\
+\x02\x03\0\x01\x04prop\x03\0\x04prop\x03\0\x08\x01p\x03\x01p\x05\x01@\x02\x06poi\
+nts\x0a\x04sizev\0\x0b\x04\0\x06sample\x01\x0c\x01@\0\0\x07\x04\0\x08describe\x01\
+\x0d\x01p\x09\x01@\0\0\x0e\x04\0\x05props\x01\x0f\x04\0\x1bplateau:region/region\
+@0.1.0\x04\0\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09producers\x01\x0cprocessed-by\
+\x02\x0dwit-component\x070.262.0\x10wit-bindgen-rust\x060.63.0";
         };
     };
 }
@@ -641,22 +780,25 @@ pub use __export_region_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 690] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x95\x04\x01A\x02\x01\
-A\x0a\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B\x13\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 802] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x85\x05\x01A\x02\x01\
+A\x0c\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
+\0\x01B\x17\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05\
 grass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\
 \x03\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\
 \x04tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\
 \x02at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\
 \x04\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\
 \x04\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\
-\x04\0\x0bdescription\x03\0\x11\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\
-\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\
-\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\x04\0;pla\
-teau:region/region-with-all-of-its-exports-removed@0.1.0\x04\0\x0b,\x01\0&region\
--with-all-of-its-exports-removed\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\
-\x0dwit-component\x070.262.0\x10wit-bindgen-rust\x060.63.0";
+\x04\0\x0bdescription\x03\0\x11\x01m\x04\x07capsule\x09ellipsoid\x08cylinder\x04\
+cone\x04\0\x09prop-kind\x03\0\x13\x01r\x06\x04kind\x14\x08material\x03\x01a\x01\x01\
+b\x01\x01rv\x03yawv\x04\0\x04prop\x03\0\x15\x03\0\x1aplateau:region/types@0.1.0\x05\
+\x01\x02\x03\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\
+\0\x06answer\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\
+\x02\x03\0\x01\x04prop\x03\0\x04prop\x03\0\x08\x04\0;plateau:region/region-with-\
+all-of-its-exports-removed@0.1.0\x04\0\x0b,\x01\0&region-with-all-of-its-exports\
+-removed\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.2\
+62.0\x10wit-bindgen-rust\x060.63.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

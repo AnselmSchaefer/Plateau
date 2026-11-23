@@ -26,6 +26,8 @@ const EXPORTS: [Signature; 5] = [
     ("cabi_post_describe", &[I32], &[]),
     ("cabi_realloc", &[I32, I32, I32, I32], &[I32]),
 ];
+/// Optional exports accepted when present (for backward compatibility with earlier modules).
+const OPTIONAL_EXPORTS: [Signature; 2] = [("props", &[], &[I32]), ("cabi_post_props", &[I32], &[])];
 
 /// The WebAssembly an area may use, for good: WebAssembly 2.0 without SIMD, what every engine runs
 /// (a browser's too) and what `wasm32-unknown-unknown` turns on by default. No threads: an area
@@ -95,7 +97,7 @@ pub fn check(module: &[u8]) -> Result<(), Vec<String>> {
             Payload::ExportSection(r) => {
                 for export in r.into_iter().flatten() {
                     exported.push(export.name.to_string());
-                    let wanted = EXPORTS.iter().find(|e| e.0 == export.name);
+                    let wanted = EXPORTS.iter().chain(&OPTIONAL_EXPORTS).find(|e| e.0 == export.name);
                     match (export.kind, wanted) {
                         (ExternalKind::Func, Some((name, params, results))) => {
                             let t = funcs.get(export.index as usize).and_then(|&t| signature(&types, t));

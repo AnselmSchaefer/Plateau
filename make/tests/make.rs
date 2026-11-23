@@ -88,10 +88,14 @@ const QUICK: Settings = Settings { rays: 80, view_width: 64, plan_width: 64 };
 
 /// The stand-in's answers made into an area, in a folder of the test's own.
 fn made(test: &str, answers: &[String]) -> (Made, StandIn, PathBuf) {
+    made_with_sketch(test, None, answers)
+}
+
+fn made_with_sketch(test: &str, sketch: Option<&Path>, answers: &[String]) -> (Made, StandIn, PathBuf) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/plateau-make-tests").join(test);
     std::fs::remove_dir_all(&dir).ok();
     let mut writer = StandIn { answers: answers.iter().cloned().collect(), asked: Vec::new() };
-    let made = make(&mut writer, builder(), "two blocks", &dir, QUICK, &mut |_| {}).unwrap();
+    let made = make(&mut writer, builder(), "two blocks", sketch, &dir, QUICK, &mut |_| {}).unwrap();
     (made, writer, dir)
 }
 
@@ -155,4 +159,59 @@ fn a_better_version_that_breaks_a_law_is_fixed_or_the_last_good_one_kept() {
     let came: Vec<_> = made.rounds.iter().map(|r| (r.asked, r.came.as_str())).collect();
     assert_eq!(came, [("write", "keeps every law"), ("look", "breaks: gates are real"), ("laws", "keeps every law")]);
     assert!(made.kept.is_some() && made.looked);
+}
+
+fn write_test_sketch(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let (w, h) = (128usize, 128usize);
+    let mut rgba = vec![[140u8, 90, 43, 255]; w * h]; // all brown land
+    // Orange dot at (40, 30) and purple dot at (20, 20), matching AREA.
+    let paint = |rgba: &mut [[u8; 4]], cx: f32, cz: f32, r: f32, c: [u8; 4]| {
+        for j in 0..h {
+            for i in 0..w {
+                let x = (i as f32 + 0.5) / w as f32 * 64.0;
+                let z = (j as f32 + 0.5) / h as f32 * 64.0;
+                if (x - cx).powi(2) + (z - cz).powi(2) <= r * r {
+                    rgba[j * w + i] = c;
+                }
+            }
+        }
+    };
+    paint(&mut rgba, 40.0, 30.0, 2.0, [245, 140, 20, 255]);
+    paint(&mut rgba, 20.0, 20.0, 2.5, [160, 70, 215, 255]);
+    let mut f = std::fs::File::create(path).unwrap();
+    let mut enc = png::Encoder::new(&mut f, w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().unwrap().write_image_data(rgba.as_flattened()).unwrap();
+}
+
+#[test]
+fn with_a_sketch_claude_gets_its_picture_and_shapes_and_is_held_to_its_laws() {
+    let sketch_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/plateau-make-tests/test-sketch.png");
+    write_test_sketch(&sketch_path);
+    // First answer moves the pillar away from the purple mark (20, 20) -> breaks sketch places.
+    let moved_pillar = right().replace("point(20.0, PILLAR, 20.0)", "point(50.0, PILLAR, 20.0)").replace("point(20.0, PILLAR * 0.5, 20.0)", "point(50.0, PILLAR * 0.5, 20.0)");
+    let (made, writer, dir) = made_with_sketch("sketched", Some(&sketch_path), &[moved_pillar, right(), right()]);
+    let came: Vec<_> = made.rounds.iter().map(|r| (r.asked, r.came.as_str())).collect();
+    assert_eq!(came, [("write", "breaks: sketch places"), ("laws", "keeps every law"), ("look", "keeps every law")]);
+    // Round 1 got the sketch path, shapes in metres, and Read permission on the folder.
+    assert!(writer.asked[0].0.contains("sketch.png") && writer.asked[0].0.contains("orange (tiny only)"), "{}", writer.asked[0].0);
+    assert_eq!(writer.asked[0].1.as_deref(), Some(dir.as_path()));
+    // Round 2 got the sketch places failure in its own words.
+    assert!(writer.asked[1].0.contains("**sketch places**") && writer.asked[1].0.contains("purple mark"), "{}", writer.asked[1].0);
+    // Round 3 (look) compares against the sketch.
+    assert!(writer.asked[2].0.contains("sketch.png"), "{}", writer.asked[2].0);
+    assert!(dir.join("sketch.png").exists() && dir.join("pictures/sketch.png").exists());
+}
+
+#[test]
+fn a_version_that_kept_every_law_is_kept_if_the_look_fails() {
+    // Only one answer scripted: the look round gets an error from the stand-in, and round 1's
+    // working version is still returned and kept on disk.
+    let (made, _, dir) = made("look-error", &[right()]);
+    assert_eq!(made.rounds.len(), 1);
+    assert!(!made.looked);
+    assert_eq!(made.kept.as_deref(), source_of(&right()).as_deref());
+    assert!(dir.join("area.rs").exists() && dir.join("area.wasm").exists());
 }

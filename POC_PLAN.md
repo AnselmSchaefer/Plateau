@@ -476,7 +476,7 @@ Found:
   holes as the tiny or at 30 cm, at 200 to 300 frames a second. The garden's tour is as fast as
   before, with no frame with a hole.
 - **Left:** walking each area by hand at each size, to judge whether it is worth walking. That is
-  the other half of "done when", and the first look at question 2 for step 9.
+  the other half of "done when", and the first look at question 2 for step 10.
 
 ### 6. The sketch (two or three days)
 
@@ -489,7 +489,143 @@ Found:
 **Done when** requests 2 and 3, sketched, keep their sketch's laws, and come out closer to what was
 meant than without one.
 
-### 7. Building (three days)
+Done 2026-11-23. The palette file is `sketches/plateau.gpl` (the seven pens of `CONCEPT.md`,
+orange and purple matching `picture::COLOURS`). `engine/src/sketch.rs` reads any PNG drawn with
+them: classifying each pixel into its pen (handling anti-aliased edges against white and coloured
+grounds), tracing simplified outer polygon outlines in area metres for brown (land), grey
+(rock/cliff) and blue (water), extracting orange (tiny) and purple (giant) place marks, tracing red
+arrows from tail to arrowhead, and reading black labels via `tesseract` on the black-only mask
+(falling back cleanly to black marks if `tesseract` is absent).
+
+Two laws in `engine/src/laws.rs` (tested in `engine/tests/sketch.rs`):
+
+- **Sketch materials** (`sketch_materials`): samples the area's top surface on a 1 m grid as a
+  person sees it (plus cliff-face probes where a column drops sharply) and checks each brown, grey
+  and blue region within 3.0 m (`SKETCH_TOLERANCE`): blue is water (allowing small lily pads on it),
+  grey is stone rock or cliff face, brown is dry land (not water).
+- **Sketch places** (`sketch_places`): every orange mark has a `Size::Tiny` place within 3.0 m
+  reached by the tiny and by nobody who is never tiny; every purple mark has a `Size::Giant` place
+  within 3.0 m reached by giants and by nobody who is never a giant.
+
+`plateau make "<words>" [--sketch MAP.png] [--name NAME]` copies the sketch to `made/NAME/sketch.png`,
+lets Claude read the PNG on round 1 alongside `Sketch::describe()` (outlines, places, arrows and
+words in metres), holds every answer to both sketch laws, and shows the sketch beside `plan.png`
+and `reach.png` on the look round (`make/GUIDE.md`, `make/tests/make.rs`). `plateau check NAME`
+automatically checks against `made/NAME/sketch.png` when present.
+
+Requests 2 and 3, sketched (`sketches/headland.png` and `sketches/pond.png`) and made into
+`made/headland-sketched/` and `made/pond-sketched/`:
+
+| Area | Kept every law | Rounds | Fixes | Look | Took | Reckoned | What broke, and when |
+|---|---|---|---|---|---|---|---|
+| headland-sketched | yes | 3 | 2 | no (rate limit) | 28 min | $3.43 | surfaces have an inside + no traps (round 1), no traps (round 2) |
+| pond-sketched | yes | 3 | 1 | yes | 27 min | $3.26 | no traps (round 1) |
+
+Both kept **sketch materials** and **sketch places** on their very first answer, and came out
+visibly closer to what was meant than the unsketched runs of step 5:
+
+- **headland-sketched** vs `headland`: instead of a blunt symmetrical trapezoid with a boxy rock
+  sitting on the grass, the curving headland narrows organically into a rocky grey cliff rim
+  wrapping around the northern and eastern point, with the striped lighthouse placed on the point
+  where the black ring was drawn, a wooden rowboat pulled up in the eastern cove, a multi-chamber
+  smugglers' tunnel network (hall, casks, hidden pool) carved right into the eastern cliff at the
+  orange mark, and a sculpted giant's seat atop the northeast sea stack at the purple mark (plus
+  the northwest skerry).
+- **pond-sketched** vs `pond`: instead of a small round puddle in a flat square, the pond fills
+  the organic basin drawn in blue, with a sandy south landing, a stepping-stone trail of lily pads
+  leading across the water straight to the mossy rock outcrop at the northwest orange mark (with a
+  tiny grotto and mushroom inside), a wading heron, and the heron's nest high in a tree at the
+  northeast purple mark.
+
+Found:
+
+- **Anti-aliased black text on brown/blue ground thins out if the black cutoff is too low.** Black
+  text rendered over brown (`v = 0.55`) lost thin strokes below `v < 0.20`, making `tesseract`
+  miss "mossy" in "mossy rock". Raising the black threshold to `v < 0.28` (still well below every
+  other pen, the darkest being grey at `0.51`) restored full strokes and read every label cleanly.
+- **A working version should survive a failed `look` round.** `headland-sketched` kept every law
+  on round 3 and then hit Claude Code's 5-hour usage limit on round 4 (`look`). `make()` now keeps
+  and returns the last version that kept every law if a later round fails to reach Claude, rather
+  than failing before writing `log.md`.
+- **A rough wall grazing a level boundary opened holes.** Walking up to `headland-sketched`'s
+  smugglers' cleft at `x = 37.266` as the tiny, the back wall (`x = 37.0`) lay right on the plane
+  where level `-8` (`[37.0, 37.125]`) met level `-6` (`[36.5, 37.0]`). Where the finer surface
+  dipped a millimetre west of `37.0` while the coarser grid saw solid at `37.0`, neither chunk
+  owned a crossing, and a skirt hanging straight along `-normal` ran parallel to the viewing ray
+  instead of across the gap. Each chunk now adds a 1-cell border collar past every face recessed
+  `0.35` voxels into the solid (`engine/src/chunk.rs`), invisible behind same-level neighbours and
+  sealing grazing level seams completely (`a_rough_wall_grazing_a_level_boundary_has_no_holes`).
+
+### 7. Medium-distance detail and smooth LOD (three or four days)
+
+Added 2026-11-23 after walking `pond-sketched`: with 4-chunk rings, a person's finest level
+(`6.25 cm` voxels) can end `1.4 m` ahead and jump straight 4× to `25 cm` voxels (`5 m` viewer),
+turning nearby reeds into chunky blocks until you step right up to them.
+
+Quick spikes tested on `pond-sketched` (GTX 1650, `1600×900`, 2026-11-23) before starting step 7:
+
+- **1A — View-directed `6×4×6` rings + frustum-prioritized streaming + GPU 4×4 Bayer dithered
+  cross-fade (`0.22 s`) + GPU micro-grain & glossy rippled water**: ran at **185–287 FPS**
+  (`305k–1.03M` triangles, 0 frames with holes) and made water, rock/grass texture, and chunk
+  transitions much cleaner. However, at ~10 m away the grid still drops to `12.5 cm` voxels
+  (~8–10 screen pixels/voxel), so thin `3–4 cm` reeds scaled with `view.finest` still visibly
+  fattened and split when stepping closer.
+- **1A+ — `8×6×8` rings + 1 extra detail octave (`3.1 cm` voxels to ~6 m, `6.25 cm` to ~13 m)**:
+  ran at **98–177 FPS** standing (`80–96 FPS` sprinting, 0 holes; ~3.1 s CPU warmup when shrinking
+  straight to tiny). Resolved the heron and reeds from 40 m away, yet thin reed stalks at ~13 m
+  still visibly shifted when crossing the `12.5 cm → 6.25 cm` boundary. Proved that pushing
+  2–4 cm stalks through coarse voxel rings has a fundamental Nyquist ceiling on CPU.
+- **Option 1 spike — Validated SDF Scene IR (`642` primitives, `146` clusters, `163` BVH nodes,
+  `52 KB` GPU data) + fixed WGSL BVH sphere-tracer + pre-baked `256×256` terrain texture**:
+  completely eliminated reed/lily-pad/flower morphing at every distance and gave instant continuous
+  scaling, **but** ran at only **31–55 FPS** across the pond and **20 FPS** inside the tiny grotto
+  (where grazing rays near a flat floor need ~150+ steps to avoid clipping walls, pushing caves
+  closer to 10–15 FPS on a GTX 1650), while restricting areas to a fixed GPU primitive IR instead
+  of arbitrary sandboxed Rust.
+
+**Chosen direction for step 7** (preserving `"Claude writes Rust → single .wasm → Wasmtime
+sandbox"` with best quality at 200+ FPS):
+
+- **Keep sandboxed WASM SDF + Bevy rasterization for solid landforms** (terrain, cliffs, caves,
+  arches, boulders, water, tree trunks), upgraded with the proven **1A** pieces: view-directed
+  rings, frustum-prioritized streaming, complementary Bayer dithered LOD cross-fades, and GPU
+  world-locked micro-grain + glossy rippled water.
+- **Add a validated, capped GPU prop / instance layer exported from `.wasm`** for thin and
+  repeating features (reeds, cattails, meadow tussocks, flowers, twigs, pebbles, sticks, mushrooms,
+  thin limbs) so they render as smooth, crisp 3D meshes at any distance with zero voxel morphing,
+  native shadows, and 200+ FPS (with shared `plateau_sdk` helpers where collision is needed so
+  physics and visuals stay in sync).
+
+**Done when** walking `pond-sketched` and `headland-sketched` at each size shows nearby and
+mid-distance features (reeds, tussocks, rocks, entrances) clearly without distracting pop-in or
+morphing, at 60 frames a second on this machine.
+
+*Done (2026-11-23).* Implemented across `sdk`, `engine`, `play`, and `make`:
+
+- **WASM `props()` export** (`sdk/wit/region.wit`, `sdk/src/lib.rs`, `engine/src/wasm.rs`,
+  `engine/src/check.rs`): optional export (`Capsule`, `Ellipsoid`, `Cylinder`, `Cone`, up to
+  `16,384` props validated for finite bounds and radii under Wasmtime fuel/memory limits; checked
+  for determinism in `laws::nans_unseen` and tested in `engine/tests/region.rs`). Earlier `.wasm`
+  modules without `props` continue to load unchanged.
+- **1-draw-call merged GPU prop mesh** (`play/src/props.rs`): tessellates all emitted props once
+  on load into a single Bevy `Mesh` sharing `SurfaceMaterial` and directional shadows, keeping
+  reeds, cattails, meadow tussocks, flowers, nest sticks, heron legs/beak, and grotto
+  stalagmites/mushrooms completely crisp from 1 cm to 64 m with zero LOD morphing.
+- **1A landform upgrades** (`engine/src/rings.rs`, `play/src/chunks.rs`, `play/src/surface.rs`,
+  `play/src/surface.wesl`): view-directed `6×4×6` rings (~4 chunks ahead per level),
+  frustum-prioritized chunk streaming, complementary 4×4 Bayer dithered LOD cross-fades (`0.22 s`),
+  and world-locked 3D procedural micro-grain + glossy rippled water.
+- **Guide updated** (`make/GUIDE.md`) so Claude puts thin/repeating details in `props()` and solid
+  landforms/walkable surfaces in `sample()`.
+
+Measured on `made/pond-sketched/area.wasm` (`--tour --behind`, GTX 1650, `1600×900`, `96k` prop
+triangles in 1 draw call):
+
+- **Person**: **98–104 FPS** standing (`398k–504k` tris), **85 FPS** sprinting (**0 of 341 frames with holes**).
+- **Tiny**: **69–80 FPS** standing (`898k–1.08M` tris), **66 FPS** sprinting (**0 of 263 frames with holes**).
+- **Giant**: **155–159 FPS** (`182k` tris, **0 of 469 frames with holes**).
+
+### 8. Building (three days)
 
 - Placing and taking away material at the player's size (a block as big as the size's detail),
   kept as edits laid over the area's world, saved to a file.
@@ -499,7 +635,7 @@ meant than without one.
 
 **Done when** a tiny person can build a room inside the cave and a giant can see it as a speck.
 
-### 8. Two areas side by side (three or four days, if there is time)
+### 9. Two areas side by side (three or four days, if there is time)
 
 - Two areas made one after the other, the second told the first's border.
 - **Borders match**: ground, water and material continuous along the shared edge, within a tolerance.
@@ -508,7 +644,7 @@ meant than without one.
 **Done when** two of the test set's areas lie side by side with no seam a giant or a tiny person
 notices.
 
-### 9. What the PoC found (two days)
+### 10. What the PoC found (two days)
 
 - An hour's play at each size in the best areas; what was worth finding, what was not.
 - The two questions answered, with the numbers of step 5.
@@ -523,7 +659,7 @@ notices.
 | Frames a second, at each size, on this machine | 60 |
 | A chunk made, near the player | under 20 ms |
 | Hashes the same on two runs and two optimization levels | always |
-| Moving between sizes worth it | judged in step 9 |
+| Moving between sizes worth it | judged in step 10 |
 
 ## Risks
 
@@ -536,7 +672,7 @@ notices.
 - **Seams between levels of detail** are a known hard problem for surface nets: skirts or
   stitching, decided in step 2.
 - **Bevy changes often.** The PoC pins its version and does not chase new ones.
-- **Scope.** Everything under "Out" stays out until step 9.
+- **Scope.** Everything under "Out" stays out until step 10.
 
 ## Open questions
 

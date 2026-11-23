@@ -119,3 +119,57 @@ fn an_area_that_looks_at_a_nans_bits_breaks_the_law() {
     assert!(message.contains("looks at a NaN's bits") && message.contains("tiny"), "{message}");
     assert_eq!(laws::nans_unseen(&module(GROUND), 7, &plateau_engine::points(64, 4.0, 1)).unwrap(), Ok(()));
 }
+
+#[test]
+fn props_are_read_validated_and_capped() {
+    use plateau_engine::{Prop, PropKind};
+    // Old modules without `props` still load cleanly and yield no props.
+    let mut old = Wasm::new(&module(GROUND), 7, Limits::default()).unwrap();
+    assert_eq!(old.props().unwrap(), Vec::new());
+
+    // Build a minimal WAT module with `props` returning one 36-byte Prop at 4096, ret-area at 32.
+    let with_props = |prop_bytes: &[u8; 36], count: u32| -> Vec<u8> {
+        let hex: String = prop_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+        let ret: String = [4096u32, count].into_iter().flat_map(u32::to_le_bytes).map(|b| format!("\\{b:02x}")).collect();
+        let extra = format!(
+            r#"  (data (i32.const 32) "{ret}")
+  (data (i32.const 4096) "{hex}")
+  (func (export "props") (result i32) (i32.const 32))
+  (func (export "cabi_post_props") (param i32)))"#
+        );
+        let wat = area(GROUND).replace(r#"(func (export "cabi_post_describe") (param i32)))"#, &format!("(func (export \"cabi_post_describe\") (param i32))\n{extra}"));
+        wat::parse_str(wat).unwrap()
+    };
+    let encode = |kind: u8, mat: u8, a: [f32; 3], b: [f32; 3], r: f32, yaw: f32| -> [u8; 36] {
+        let mut buf = [0u8; 36];
+        buf[0] = kind;
+        buf[1] = mat;
+        for (i, v) in [a[0], a[1], a[2], b[0], b[1], b[2], r, yaw].into_iter().enumerate() {
+            buf[4 + i * 4..8 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        buf
+    };
+
+    let good = encode(0, Material::Leaf as u8, [1.0, 2.0, 3.0], [1.0, 4.0, 3.0], 0.015, 0.0);
+    let mut wasm = Wasm::new(&with_props(&good, 1), 7, Limits::default()).unwrap();
+    assert_eq!(
+        wasm.props().unwrap(),
+        vec![Prop { kind: PropKind::Capsule, material: Material::Leaf, a: [1.0, 2.0, 3.0], b: [1.0, 4.0, 3.0], r: 0.015, yaw: 0.0 }]
+    );
+
+    // Too many props, bad kind, bad material, negative/NaN radius are all rejected.
+    let mut too_many = Wasm::new(&with_props(&good, (plateau_engine::wasm::MOST_PROPS + 1) as u32), 7, Limits::default()).unwrap();
+    assert!(too_many.props().is_err());
+
+    let bad_kind = encode(99, 0, [0.0; 3], [0.0; 3], 0.1, 0.0);
+    let mut wasm = Wasm::new(&with_props(&bad_kind, 1), 7, Limits::default()).unwrap();
+    assert!(wasm.props().is_err());
+
+    let bad_nan = encode(0, 0, [f32::NAN, 0.0, 0.0], [0.0; 3], 0.1, 0.0);
+    let mut wasm = Wasm::new(&with_props(&bad_nan, 1), 7, Limits::default()).unwrap();
+    assert!(wasm.props().is_err());
+
+    let neg_r = encode(0, 0, [0.0; 3], [0.0; 3], -0.1, 0.0);
+    let mut wasm = Wasm::new(&with_props(&neg_r, 1), 7, Limits::default()).unwrap();
+    assert!(wasm.props().is_err());
+}

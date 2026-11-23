@@ -8,7 +8,7 @@ use wasmtime::error::Context;
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc, format_err};
 
 use crate::check::{self, HOST, MOST_MEMORY};
-use crate::{Answer, Borders, Description, Edge, LARGEST, Material, Place, Region, Result, SMALLEST, Size};
+use crate::{Answer, Borders, Description, Edge, LARGEST, Material, Place, Prop, PropKind, Region, Result, SMALLEST, Size};
 
 /// How a module is run.
 #[derive(Clone, Copy, Debug)]
@@ -22,9 +22,11 @@ pub struct Limits {
     pub canonical_nans: bool,
 }
 
-/// Fuel for a batch besides its points', and for `describe`.
+/// Fuel for a batch besides its points', and for `describe` / `props`.
 pub const FUEL_PER_CALL: u64 = 1_000_000;
 pub const FUEL_TO_DESCRIBE: u64 = 100_000_000;
+/// The most smooth GPU props an area may emit.
+pub const MOST_PROPS: usize = 16_384;
 /// The most points in a batch: what a chunk's corner asks at once is well within it.
 pub const MOST_POINTS: usize = 1 << 16;
 /// The most places an area may name, and the longest name.
@@ -80,12 +82,17 @@ impl Compiled {
         linker.func_wrap(HOST, "seed", |caller: Caller<'_, Ctx>| caller.data().seed as i64)?;
         let instance = linker.instantiate(&mut store, &self.module)?;
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| format_err!("the area has no memory"))?;
+        let props = match (instance.get_typed_func(&mut store, "props"), instance.get_typed_func(&mut store, "cabi_post_props")) {
+            (Ok(f), Ok(p)) => Some((f, p)),
+            _ => None,
+        };
         Ok(Wasm {
             realloc: instance.get_typed_func(&mut store, "cabi_realloc").context("the area's cabi_realloc")?,
             sample: instance.get_typed_func(&mut store, "sample").context("the area's sample")?,
             post_sample: instance.get_typed_func(&mut store, "cabi_post_sample").context("the area's cabi_post_sample")?,
             describe: instance.get_typed_func(&mut store, "describe").context("the area's describe")?,
             post_describe: instance.get_typed_func(&mut store, "cabi_post_describe").context("the area's cabi_post_describe")?,
+            props,
             store,
             memory,
             fuel_per_sample: self.limits.fuel_per_sample,
@@ -108,6 +115,7 @@ pub struct Wasm {
     post_sample: TypedFunc<u32, ()>,
     describe: TypedFunc<(), u32>,
     post_describe: TypedFunc<u32, ()>,
+    props: Option<(TypedFunc<(), u32>, TypedFunc<u32, ()>)>,
     fuel_per_sample: Option<u64>,
 }
 
@@ -211,6 +219,37 @@ impl Region for Wasm {
         let description = Description { name, places: read, borders };
         self.post_describe.call(&mut self.store, ret)?;
         Ok(description)
+    }
+
+    fn props(&mut self) -> Result<Vec<Prop>> {
+        let Some((call_props, post_props)) = self.props.clone() else {
+            return Ok(Vec::new());
+        };
+        self.fuel(|_| FUEL_TO_DESCRIBE)?;
+        let ret = call_props.call(&mut self.store, ())?;
+        let d = Bytes(self.memory.data(&self.store));
+        let (list, len) = (d.u32(ret)?, d.u32(ret + 4)? as usize);
+        if len > MOST_PROPS {
+            return Err(format_err!("the area gave {len} props, more than the {MOST_PROPS} it may"));
+        }
+        // `prop`: kind (u8, 0), material (u8, 1), pad (2), a (12, 4..16), b (12, 16..28), r (4, 28..32), yaw (4, 32..36).
+        let raw = d.slice(list, len, 36)?;
+        let mut out = Vec::with_capacity(len);
+        for chunk in raw.as_chunks::<36>().0 {
+            let kind = PropKind::from_number(chunk[0]).ok_or_else(|| format_err!("prop kind {} is not one of the engine's", chunk[0]))?;
+            let material = Material::from_number(chunk[1]).ok_or_else(|| format_err!("prop material {} is not one of the engine's", chunk[1]))?;
+            let f = |off: usize| f32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+            let a = [f(4), f(8), f(12)];
+            let b = [f(16), f(20), f(24)];
+            let r = f(28);
+            let yaw = f(32);
+            if !a.iter().chain(&b).chain(&[r, yaw]).all(|v| v.is_finite()) || r < 0.0 || r > 32.0 {
+                return Err(format_err!("a prop has an out-of-range or non-finite value"));
+            }
+            out.push(Prop { kind, material, a, b, r, yaw });
+        }
+        post_props.call(&mut self.store, ret)?;
+        Ok(out)
     }
 }
 

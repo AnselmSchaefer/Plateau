@@ -34,6 +34,24 @@ interface types {
     record borders { north: edge, east: edge, south: edge, west: edge }
 
     record description { name: string, places: list<place>, borders: borders }
+
+    /// The shape of a smooth GPU-rendered prop (thin plants, flowers, sticks, pebbles, limbs).
+    enum prop-kind { capsule, ellipsoid, cylinder, cone }
+
+    /// A smooth prop emitted once by the area and rendered natively on the GPU without voxel
+    /// aliasing or LOD morphing:
+    /// - capsule: segment from `a` to `b`, radius `r`
+    /// - ellipsoid: centre `a`, half-sizes `b`, turned by `yaw` (radians)
+    /// - cylinder: centre `a`, radius `b.x`, half-height `b.y`, optional notch angle `yaw` when `r > 0`
+    /// - cone: foot `a`, height `b.y` (negative points down), base radius `r`
+    record prop {
+        kind: prop-kind,
+        material: material,
+        a: point,
+        b: point,
+        r: f32,
+        yaw: f32,
+    }
 }
 
 /// What an area may ask of the engine. Each import is a capability given on purpose.
@@ -43,7 +61,7 @@ interface host {
 }
 
 world region {
-    use types.{point, answer, description};
+    use types.{point, answer, description, prop};
 
     import host;
 
@@ -54,4 +72,8 @@ world region {
 
     /// What the area is: its name, its places, its borders. Asked once.
     export describe: func() -> description;
+
+    /// Smooth GPU-rendered props (reeds, flowers, tussocks, sticks, mushrooms) that stay sharp at
+    /// every distance without voxel aliasing. Asked once.
+    export props: func() -> list<prop>;
 }

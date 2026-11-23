@@ -1,0 +1,12 @@
+GIMP Palette
+Name: Plateau Sketch
+Columns: 7
+# Pens for sketching an area of Plateau (CONCEPT.md, "The sketch"; POC_PLAN.md, step 6).
+# Draw on a white background (north at the top, 64 m square).
+140  90  43	Brown — land, ground
+130 130 130	Grey — rock, cliff
+ 45 125 225	Blue — water
+  0   0   0	Black — a thing, with a word
+220  35  35	Red — an arrow (path of motion)
+245 140  20	Orange — a place for the tiny only
+160  70 215	Purple — a place for giants only

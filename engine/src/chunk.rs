@@ -11,9 +11,10 @@
 //! - **No seams within a level.** Each chunk asks one cell beyond its own on every side, makes the
 //!   vertices of the cells along its edges as its neighbours make them, and makes the quads only of
 //!   the grid edges it owns (those whose first corner is its own): neighbours meet exactly.
-//! - **Seams between levels hidden by skirts**: every edge the mesh ends at is hung with a strip
-//!   two voxels deep, into the solid, so where a finer chunk meets a coarser one the gap is closed
-//!   from outside.
+//! - **Seams between levels hidden by skirts and a recessed collar**: every edge the mesh ends at
+//!   is hung with a strip two voxels deep into the solid (closing step seams), and a 1-cell border
+//!   collar extends past every face recessed slightly into the solid (invisible behind same-level
+//!   neighbours, while sealing holes where a rough surface grazes a level boundary plane).
 //! - **Only near the surface.** A distance says nothing is nearer than it (it is never too long),
 //!   so a block of corners whose middle is further from any surface than its corners are from the
 //!   middle is all inside or all outside, and is not asked: first the chunk, then its eighths, down
@@ -24,11 +25,16 @@ use crate::{LARGEST, Material, Region, Result, SMALLEST};
 
 /// Cells along each side of a chunk.
 pub const CELLS: usize = 32;
-/// Corners along each side asked: the chunk's own, and one cell's beyond it on each side (grid
-/// coordinates -1 to `CELLS`).
-const CORNERS: usize = CELLS + 2;
-/// Cells along each side that get a vertex: the chunk's own and the one before it on each axis.
-const NET: usize = CELLS + 1;
+/// Corners along each side asked: the chunk's own, one beyond its low faces, and two beyond its
+/// high faces (grid coordinates -1 to `CELLS + 1`), so a 1-cell recessed collar can extend past
+/// every face to close grazing seams between levels.
+const CORNERS: usize = CELLS + 3;
+/// Cells along each side that may get a vertex: -1 to `CELLS` (the chunk's own plus one on each
+/// side).
+const NET: usize = CELLS + 2;
+/// How deep into the solid the 1-cell overlap collar sits, in voxels: deep enough never to fight
+/// a same-level neighbour's surface, shallow enough not to poke through thin walls.
+const COLLAR_RECESS: f32 = 0.35;
 /// The smallest block of corners the coarse pass proves empty or full before asking every corner.
 const SMALLEST_BLOCK: usize = 4;
 /// A voxel is a twentieth of the height of the viewer the chunk is asked for (POC_PLAN.md,
@@ -216,8 +222,8 @@ pub fn make_with(area: &mut dyn Region, key: Key, making: Making) -> Result<Made
         material[index(i)] = out[k].material;
     }
 
-    let (mut mesh, slopes) = net(&distance, &material, voxel as f32);
-    if mesh.indices.is_empty() {
+    let (mut mesh, slopes, collar) = net(&distance, &material, voxel as f32, making.skirts);
+    if mesh.indices.is_empty() && collar.is_empty() {
         return Ok(Made { mesh: None, samples });
     }
     if making.shading {
@@ -225,6 +231,7 @@ pub fn make_with(area: &mut dyn Region, key: Key, making: Making) -> Result<Made
     }
     if making.skirts {
         skirt(&mut mesh, 2.0 * voxel as f32);
+        add_collar(&mut mesh, &collar, COLLAR_RECESS * voxel as f32);
     }
     Ok(Made { mesh: Some(mesh), samples })
 }
@@ -234,18 +241,21 @@ const CUBE_EDGES: [(usize, usize); 12] = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2)
 
 /// Surface nets through the corners' answers: a vertex in each cell the surface crosses, at the
 /// mean of where it crosses the cell's edges; a quad across each owned grid edge it crosses. With
-/// the mesh, how steeply the distance grows at each vertex (1 for a true distance, less for one
-/// the area made shorter).
-fn net(distance: &[f32], material: &[Material], voxel: f32) -> (Mesh, Vec<f32>) {
+/// `with_collar`, also collects the quads of a 1-cell border beyond every face (returned as index
+/// triples into `mesh`'s vertices, to be duplicated and recessed after shading). With the mesh,
+/// how steeply the distance grows at each vertex (1 for a true distance, less for one the area
+/// made shorter).
+fn net(distance: &[f32], material: &[Material], voxel: f32, with_collar: bool) -> (Mesh, Vec<f32>, Vec<u32>) {
     let index = |i: [usize; 3]| (i[0] * CORNERS + i[1]) * CORNERS + i[2];
     let inside = |i: [usize; 3]| distance[index(i)] < 0.0;
     let cell_index = |c: [usize; 3]| (c[0] * NET + c[1]) * NET + c[2];
     let mut vertex_of = vec![u32::MAX; NET * NET * NET];
     let mut mesh = Mesh::default();
     let mut slopes = Vec::new();
-    for x in 0..NET {
-        for y in 0..NET {
-            for z in 0..NET {
+    let limit = if with_collar { NET } else { CELLS + 1 };
+    for x in 0..limit {
+        for y in 0..limit {
+            for z in 0..limit {
                 let c = [x, y, z];
                 let d: [f32; 8] = CUBE.map(|o| distance[index([x + o[0], y + o[1], z + o[2]])]);
                 let solid = d.iter().filter(|v| **v < 0.0).count();
@@ -288,20 +298,27 @@ fn net(distance: &[f32], material: &[Material], voxel: f32) -> (Mesh, Vec<f32>) 
             }
         }
     }
-    // The grid edges this chunk owns: from each of its own corners (grid 0 to CELLS - 1, corner
-    // index 1 to CELLS) along each axis.
-    for x in 1..=CELLS {
-        for y in 1..=CELLS {
-            for z in 1..=CELLS {
+    let mut collar = Vec::new();
+    // Emit owned quads (grid 0..CELLS, corner index 1..=CELLS), plus when `with_collar` is set,
+    // the 1-cell border quads extending past every face (`i[axis]` in `0..=CELLS+1`, `i[u,v]` in
+    // `1..=CELLS+1`) so a surface grazing a level boundary cannot slip between fine and coarse.
+    let lo = if with_collar { 0 } else { 1 };
+    let hi = if with_collar { CELLS + 1 } else { CELLS };
+    for x in lo..=hi {
+        for y in lo..=hi {
+            for z in lo..=hi {
                 let i = [x, y, z];
                 let here = inside(i);
                 for axis in 0..3 {
+                    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+                    if i[u] == 0 || i[v] == 0 {
+                        continue;
+                    }
                     let mut next = i;
                     next[axis] += 1;
                     if here == inside(next) {
                         continue;
                     }
-                    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
                     // The four cells about the edge; cell `c` spans corners `c` to `c + 1`.
                     let cell = |du: usize, dv: usize| {
                         let mut c = i;
@@ -313,12 +330,14 @@ fn net(distance: &[f32], material: &[Material], voxel: f32) -> (Mesh, Vec<f32>) 
                     debug_assert!(!quad.contains(&u32::MAX), "a crossed edge's cells all have vertices");
                     // Counter-clockwise seen from outside.
                     let [a, b, c, d] = if here { quad } else { [quad[0], quad[3], quad[2], quad[1]] };
-                    mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+                    let owned = (1..=CELLS).contains(&x) && (1..=CELLS).contains(&y) && (1..=CELLS).contains(&z);
+                    let target = if owned { &mut mesh.indices } else { &mut collar };
+                    target.extend_from_slice(&[a, b, c, a, c, d]);
                 }
             }
         }
     }
-    (mesh, slopes)
+    (mesh, slopes, collar)
 }
 
 /// Darkens each vertex as nearby surfaces close it in: the area asked a little way out along the
@@ -380,6 +399,34 @@ fn skirt(mesh: &mut Mesh, depth: f32) {
             mesh.indices.extend_from_slice(&[a, a2, b2, a, b2, b]);
         }
         k += n;
+    }
+}
+
+/// Appends the 1-cell border collar (`collar` indices into `mesh`'s shaded vertices) with every
+/// collar vertex duplicated and recessed `recess` metres into the solid along its normal, so it
+/// stays hidden behind same-level neighbours while sealing holes where a rough surface grazes a
+/// boundary between two levels of detail.
+fn add_collar(mesh: &mut Mesh, collar: &[u32], recess: f32) {
+    if collar.is_empty() {
+        return;
+    }
+    let mut map = vec![u32::MAX; mesh.positions.len()];
+    mesh.indices.reserve(collar.len());
+    for &v in collar {
+        let m = map[v as usize];
+        let nv = if m != u32::MAX {
+            m
+        } else {
+            let (p, n) = (mesh.positions[v as usize], mesh.normals[v as usize]);
+            let id = mesh.positions.len() as u32;
+            mesh.positions.push([0, 1, 2].map(|i| p[i] - n[i] * recess));
+            mesh.normals.push(n);
+            mesh.materials.push(mesh.materials[v as usize]);
+            mesh.open.push(mesh.open[v as usize]);
+            map[v as usize] = id;
+            id
+        };
+        mesh.indices.push(nv);
     }
 }
 

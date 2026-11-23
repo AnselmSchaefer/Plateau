@@ -11,10 +11,16 @@ places can only be reached when you are tiny, some only as a giant.
 - `sdk/`: what an area's program is written against: the WIT world `plateau:region@0.1.0`
   (`sdk/wit/region.wit`), its bindings made ahead, distances, noise and `area!`.
 - `engine/`: the engine, without a window: an area's module checked on load and run in wasmtime,
-  the law "NaNs unseen", pictures ray-marched on the CPU, the surface in chunks at each size's
-  detail (`chunk`, `rings`), and a player's body walking it at its size (`body`).
-- `play/`: the window (Bevy): one area walked first person at three sizes, its chunks made off
-  the frame; `--tour` visits fixed places, measures, and takes screenshots (`play/tour/`).
+  the laws (`laws`, including sketch laws), pictures ray-marched on the CPU, sketched maps read
+  into shapes/places/arrows/words (`sketch`), the surface in chunks at each size's detail (`chunk`,
+  `rings`), and a player's body walking it at its size (`body`).
+- `make/`: `plateau`, the command line that asks Claude to make an area from words and an optional
+  sketch map (`--sketch`), checks it against the laws, shows it its pictures, and keeps the last
+  version that kept every law (`make/GUIDE.md`).
+- `sketches/`: the sketch palette for paint programs (`plateau.gpl`) and example sketches
+  (`headland.png`, `pond.png`).
+- `play/`: the window (Bevy): one area walked at three sizes, its chunks made off the frame;
+  `--tour` visits fixed places, measures, and takes screenshots (`play/tour/`).
 - `areas/`: the areas, each one file (`areas/garden/area.rs`, the walled garden); `areas/build.sh`
   builds them into `areas/modules/`; `areas/played/` builds them for the machine, so the tests can
   play them natively.
@@ -26,4 +32,5 @@ cargo test --workspace --exclude view-bevy --exclude view-wgpu --exclude plateau
 cargo run --release -p plateau-engine --example look        # pictures of the garden, into target/pictures
 cargo run --release -p plateau-play                         # walk the garden; 1 2 3 for the sizes
 cargo run --release -p plateau-play -- --tour target/tour   # the tour: numbers and screenshots
+cargo run --release -p plateau-make --bin plateau -- make "<words>" [--sketch sketches/pond.png]
 ```

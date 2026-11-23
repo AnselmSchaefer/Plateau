@@ -80,7 +80,8 @@ pub fn open(area: &mut dyn Region, eye: [f64; 3], size: f32) -> Result<i32> {
 /// The blocks about a viewer, remembered from one moment to the next so they can lag.
 #[derive(Clone, Debug, Default)]
 pub struct Rings {
-    /// Each level's block, as its middle on the next level's grid.
+    /// Each level's block on the next level's grid: low corner for horizontal axes (`x`, `z`, 6
+    /// chunks wide = 3 parent chunks), middle for vertical (`y`, 4 chunks tall = 2 parent chunks).
     middles: HashMap<i32, [i32; 3]>,
 }
 
@@ -89,40 +90,58 @@ impl Rings {
     /// block about the middle of their body: only chunks over the area (x and z from 0 to
     /// `WIDTH`).
     pub fn wanted(&mut self, eye: [f64; 3], size: f32) -> Vec<Key> {
-        self.wanted_open(eye, size, COARSEST)
+        self.wanted_looking(eye, [0.0, 0.0], size, COARSEST)
     }
 
     /// The same, every level coarser than `open` asked for its viewer (`open`, `Key::capped`).
     pub fn wanted_open(&mut self, eye: [f64; 3], size: f32, open: i32) -> Vec<Key> {
+        self.wanted_looking(eye, [0.0, 0.0], size, open)
+    }
+
+    /// The same, shifted forward along the horizontal view direction `look` (unit `[x, z]` or
+    /// `[0, 0]` for symmetric): each level is 6 chunks wide horizontally (3 parent chunks) and 4
+    /// chunks tall vertically, placing fine detail ~4 chunks ahead of the camera.
+    pub fn wanted_looking(&mut self, eye: [f64; 3], look: [f64; 2], size: f32, open: i32) -> Vec<Key> {
         let finest = finest(size);
         let middle_of_body = [eye[0], eye[1] - MIDDLE * size as f64, eye[2]];
-        // From the coarsest down, each block lagging, and kept within the one about it.
-        let mut middles = Vec::new();
+        let look_len = (look[0] * look[0] + look[1] * look[1]).sqrt();
+        let dir = if look_len > 1e-6 { [look[0] / look_len, look[1] / look_len] } else { [0.0, 0.0] };
+        let mut blocks = Vec::new();
         let mut outer: Option<[i32; 3]> = None;
         for level in (finest..=COARSEST).rev() {
             let between = 2.0 * 2f64.powi(level) * CELLS as f64;
-            let exact = middle_of_body.map(|c| c / between);
-            let mut middle = match self.middles.get(&level) {
-                Some(&m) => [0, 1, 2].map(|a| if (exact[a] - m[a] as f64).abs() > 0.5 + LAG { exact[a].round() as i32 } else { m[a] }),
-                None => exact.map(|c| c.round() as i32),
+            let ideal = [
+                (middle_of_body[0] + dir[0] * 0.45 * between) / between - 1.5,
+                middle_of_body[1] / between,
+                (middle_of_body[2] + dir[1] * 0.45 * between) / between - 1.5,
+            ];
+            let mut at = match self.middles.get(&level) {
+                Some(&m) => [0, 1, 2].map(|a| if (ideal[a] - m[a] as f64).abs() > 0.5 + LAG { ideal[a].round() as i32 } else { m[a] }),
+                None => ideal.map(|c| c.round() as i32),
             };
             if let Some(o) = outer {
-                middle = [0, 1, 2].map(|a| middle[a].clamp(2 * o[a] - 1, 2 * o[a] + 1));
+                at[0] = at[0].clamp(2 * o[0], 2 * o[0] + 3);
+                at[2] = at[2].clamp(2 * o[2], 2 * o[2] + 3);
+                at[1] = at[1].clamp(2 * o[1] - 1, 2 * o[1] + 1);
             }
-            self.middles.insert(level, middle);
-            middles.push((level, middle));
-            outer = Some(middle);
+            self.middles.insert(level, at);
+            blocks.push((level, at));
+            outer = Some(at);
         }
         let mut keys = Vec::new();
-        // The block of the level below, as the middle of its two chunks a side on this level's grid.
         let mut inner: Option<[i32; 3]> = None;
-        for &(level, middle) in middles.iter().rev() {
-            for x in 2 * middle[0] - 2..2 * middle[0] + 2 {
-                for y in 2 * middle[1] - 2..2 * middle[1] + 2 {
-                    for z in 2 * middle[2] - 2..2 * middle[2] + 2 {
+        for &(level, b) in blocks.iter().rev() {
+            for x in 2 * b[0]..2 * b[0] + 6 {
+                for y in 2 * b[1] - 2..2 * b[1] + 2 {
+                    for z in 2 * b[2]..2 * b[2] + 6 {
                         let at = [x, y, z];
                         if let Some(m) = inner
-                            && (0..3).all(|a| at[a] >= m[a] - 1 && at[a] < m[a] + 1)
+                            && at[0] >= m[0]
+                            && at[0] < m[0] + 3
+                            && at[1] >= m[1] - 1
+                            && at[1] < m[1] + 1
+                            && at[2] >= m[2]
+                            && at[2] < m[2] + 3
                         {
                             continue;
                         }
@@ -133,7 +152,7 @@ impl Rings {
                     }
                 }
             }
-            inner = Some(middle);
+            inner = Some(b);
         }
         keys
     }
@@ -143,7 +162,8 @@ impl Rings {
     pub fn reach(&self) -> Option<([f64; 3], [f64; 3])> {
         let m = self.middles.get(&COARSEST)?;
         let side = 2f64.powi(COARSEST) * CELLS as f64;
-        let (mut lo, mut hi) = (m.map(|c| (2 * c - 2) as f64 * side), m.map(|c| (2 * c + 2) as f64 * side));
+        let mut lo = [(2 * m[0]) as f64 * side, (2 * m[1] - 2) as f64 * side, (2 * m[2]) as f64 * side];
+        let mut hi = [(2 * m[0] + 6) as f64 * side, (2 * m[1] + 2) as f64 * side, (2 * m[2] + 6) as f64 * side];
         for a in [0, 2] {
             lo[a] = lo[a].max(0.0);
             hi[a] = hi[a].min(WIDTH as f64);

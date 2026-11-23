@@ -67,6 +67,37 @@ every place to this:
 Two to four places is right for most requests: what the words promise each size, made real. Give
 each a name that says what it is ("the cave behind the crack", "the giant's seat").
 
+**Mark a tiny entrance for larger sizes.** An opening 2 cm wide is invisible to a person (hidden
+by `sees`), so without a cue they cannot find where to shrink. Paint a visible mark where the
+entrance lies (a dark stone cleft, a mossy patch, or a shadowed arch in the material) so a person
+walking past can spot it and shrink to enter.
+
+## The sketch (when given)
+
+Sometimes you are given a sketch map from above alongside the words: both as a PNG picture (read
+it with your Read tool) and as shapes in area metres (`x` west→east 0..64, `z` north→south 0..64).
+The pens mean:
+
+| Pen | Means |
+|---|---|
+| Brown (area) | land, ground (not water) |
+| Grey (area) | rock, cliff (`Material::Stone`) |
+| Blue (area) | water (`Material::Water`) |
+| Black (with a word) | a thing, named ("lighthouse", "heron's nest") |
+| Red (arrow) | a path or direction of movement |
+| Orange | a place for the tiny only |
+| Purple | a place for giants only |
+
+The sketch fixes **where** things lie, never how they look: keep the area rich, natural and
+finished at every size, with organic shorelines and detail rather than literal painted blobs.
+When a sketch is given, two extra laws hold:
+
+- **Sketch materials**: where the sketch is blue, the surface seen from above must be water;
+  where grey, stone (rock or cliff face); where brown, dry land (not water), each within 3 m.
+- **Sketch places**: every orange mark must have a `Size::Tiny` place (in `describe().places`)
+  within 3 m, reached by the tiny and by nobody who is never tiny; every purple mark must have a
+  `Size::Giant` place within 3 m, reached by giants and by nobody who is never a giant.
+
 ## What each size sees
 
 A viewer `view.size` tall sees detail down to `view.finest`, a tenth of their height.
@@ -84,6 +115,24 @@ Anything a size should see and stand on must be **at least a tenth of that size'
 (a giant's bench plank 50 cm or more), or it breaks up when drawn. Pieces that are one thing must
 **overlap**, not just touch: two planks that only touch have a surface inside the seat where the
 distance is nought.
+
+## Smooth props (`props()`) for thin and repeating details
+
+Solid landforms, caves, arches, water, boulders, buildings, and anything a player walks or stands on
+belong in `sample()`. **Thin or repeating decorative details** — reeds, cattails, meadow tussocks,
+flower stems and buds, sticks, fallen twigs, tiny mushrooms, stalagmites, or thin limbs (anything
+thinner than ~10 cm that would alias or swell across voxel LOD rings) — belong in
+`fn props(&self) -> Vec<Prop>` instead:
+
+- `Prop::capsule(a, b, r, material)` — stalks, cattail heads, flower stems, sticks, thin legs/beaks
+- `Prop::ellipsoid(center, radii, yaw, material)` — tussock mounds, flower buds, mushroom caps, pebbles
+- `Prop::cylinder(center, r, half_h, notch, material)` — discs, shelves, notched lily pads
+- `Prop::cone(foot, height, r, material)` — stalagmites (`height > 0`), stalactites (`height < 0`), spires
+
+Props are emitted once on load (up to 16,384, deterministic from `self.seed`) and rendered directly
+as smooth GPU geometry with zero voxel morphing at any distance. Do **not** put floors, bridges,
+walls, or stepping stones that a player needs to walk on *only* in `props()` — physics and `reach`
+read `sample()` alone.
 
 ## Distances
 

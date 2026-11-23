@@ -13,11 +13,14 @@
 //! | `nans_unseen` | The same answers with every NaN made one and with the machine's own |
 //! | `never_too_long` | No distance is longer than the way to the surface |
 //! | `surfaces_have_an_inside` | Wherever the distance comes to nought, something is solid right by it |
+//! | `sketch_materials` | Blue is water, grey is stone rock/cliff, brown is land (not water), within a tolerance |
+//! | `sketch_places` | Every orange mark is reached by the tiny alone, and every purple mark by giants alone |
 
 use crate::chunk::{CELLS, Key};
-use crate::reach::{Reach, Stand, World};
+use crate::reach::{HIGHEST, LOWEST, Reach, Stand, World};
+use crate::sketch::{Pen, Sketch};
 use crate::wasm::{Compiled, Limits};
-use crate::{Answer, Description, Region, Result, SIZES, START, Size, WIDTH, chunk, hash, numbers, rings};
+use crate::{Answer, Description, Material, Region, Result, SIZES, START, Size, WIDTH, chunk, hash, numbers, rings};
 
 /// A law kept, or broken and why.
 pub type Verdict = std::result::Result<(), String>;
@@ -651,10 +654,366 @@ pub fn nans_unseen(module: &[u8], seed: u64, points: &[[f32; 3]]) -> Result<Verd
             }
         }
     }
+    if one.props()? != own.props()? {
+        return Ok(Err("the area's props differ between canonical NaNs and this machine's own".into()));
+    }
     Ok(Ok(()))
 }
 
 /// The same answer, bit for bit.
 pub fn same(a: Answer, b: Answer) -> bool {
     a.distance.to_bits() == b.distance.to_bits() && a.material == b.material
+}
+
+/// How far in metres a feature or place in an area may lie from where the sketch drew it.
+pub const SKETCH_TOLERANCE: f32 = 3.0;
+
+/// **Sketch materials** (POC_PLAN.md, step 6): where the sketch draws blue (water), grey (rock,
+/// cliff) or brown (land, ground), the area's surface seen from above matches within
+/// `SKETCH_TOLERANCE` metres (so coastlines may curve naturally and small details like lily pads
+/// on water are allowed, while missing ponds, misplaced seas or grassy cliffs are caught).
+pub fn sketch_materials(area: &mut dyn Region, sketch: &Sketch) -> Result<Verdict> {
+    if sketch.regions.is_empty() {
+        return Ok(Ok(()));
+    }
+    const N: usize = 64;
+    let size = Size::Person.height();
+    let close = 0.05f32;
+    let least = 0.05f32;
+
+    // March 64 × 64 columns straight down from above (as `picture::plan`), stopping at the first
+    // surface (including water).
+    let mut y = vec![HIGHEST; N * N];
+    let mut hit: Vec<Option<(f32, Material)>> = vec![None; N * N];
+    let mut active: Vec<usize> = (0..N * N).collect();
+    for _ in 0..300 {
+        if active.is_empty() {
+            break;
+        }
+        let pts: Vec<[f32; 3]> = active.iter().map(|&k| [(k % N) as f32 + 0.5, y[k], (k / N) as f32 + 0.5]).collect();
+        let out = answers(area, &pts, size)?;
+        let mut still = Vec::with_capacity(active.len());
+        for (j, &k) in active.iter().enumerate() {
+            let a = out[j];
+            if a.distance < close {
+                hit[k] = Some((y[k], a.material));
+            } else {
+                y[k] -= a.distance.max(least);
+                if y[k] >= LOWEST {
+                    still.push(k);
+                }
+            }
+        }
+        active = still;
+    }
+
+    // For grey (rock, cliff): a column counts as stone if its top surface is Stone, OR if it sits
+    // on a cliff drop (>= 1.5 m steeper than a neighbour) whose solid face halfway down is Stone.
+    let mut is_stone: Vec<bool> = hit.iter().map(|h| matches!(h, Some((_, Material::Stone)))).collect();
+    let mut cliff_probes: Vec<(usize, [f32; 3])> = Vec::new();
+    for j in 0..N {
+        for i in 0..N {
+            let k = j * N + i;
+            if is_stone[k] {
+                continue;
+            }
+            let Some((h_here, _)) = hit[k] else { continue };
+            let mut min_nb = h_here;
+            for (di, dj) in [(-1isize, 0), (1, 0), (0, -1), (0, 1)] {
+                let (ni, nj) = (i as isize + di, j as isize + dj);
+                if ni >= 0
+                    && nj >= 0
+                    && ni < N as isize
+                    && nj < N as isize
+                    && let Some((h_nb, _)) = hit[nj as usize * N + ni as usize]
+                {
+                    min_nb = min_nb.min(h_nb);
+                }
+            }
+            if h_here - min_nb >= 1.5 {
+                cliff_probes.push((k, [i as f32 + 0.5, (h_here + min_nb) * 0.5, j as f32 + 0.5]));
+            }
+        }
+    }
+    if !cliff_probes.is_empty() {
+        let pts: Vec<[f32; 3]> = cliff_probes.iter().map(|p| p.1).collect();
+        let out = answers(area, &pts, size)?;
+        for (&(k, _), a) in cliff_probes.iter().zip(&out) {
+            if a.distance <= 0.5 && a.material == Material::Stone {
+                is_stone[k] = true;
+            }
+        }
+    }
+
+    // For brown checks, precompute which grid cells are within SKETCH_TOLERANCE of any Blue cell.
+    let r = SKETCH_TOLERANCE.ceil() as isize;
+    let r2 = SKETCH_TOLERANCE * SKETCH_TOLERANCE;
+    let grid_pen: Vec<Pen> = (0..N * N).map(|k| sketch.pen_at((k % N) as f32 + 0.5, (k / N) as f32 + 0.5)).collect();
+    let near_blue = |i: usize, j: usize| -> bool {
+        for dj in -r..=r {
+            for di in -r..=r {
+                if (di * di + dj * dj) as f32 > r2 {
+                    continue;
+                }
+                let (ni, nj) = (i as isize + di, j as isize + dj);
+                if ni >= 0 && nj >= 0 && ni < N as isize && nj < N as isize && grid_pen[nj as usize * N + ni as usize] == Pen::Blue {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    let has_nearby = |i: usize, j: usize, pred: &dyn Fn(usize) -> bool| -> bool {
+        for dj in -r..=r {
+            for di in -r..=r {
+                if (di * di + dj * dj) as f32 > r2 {
+                    continue;
+                }
+                let (ni, nj) = (i as isize + di, j as isize + dj);
+                if ni >= 0 && nj >= 0 && ni < N as isize && nj < N as isize && pred(nj as usize * N + ni as usize) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    let nearest_matching = |i: usize, j: usize, pred: &dyn Fn(usize) -> bool| -> Option<f32> {
+        let mut best = f32::INFINITY;
+        for nj in 0..N {
+            for ni in 0..N {
+                if pred(nj * N + ni) {
+                    let d = ((ni as f32 - i as f32).powi(2) + (nj as f32 - j as f32).powi(2)).sqrt();
+                    if d < best {
+                        best = d;
+                    }
+                }
+            }
+        }
+        best.is_finite().then_some(best)
+    };
+
+    for (ridx, region) in sketch.regions.iter().enumerate() {
+        let mut cells: Vec<(usize, usize)> = Vec::new();
+        for j in 0..N {
+            for i in 0..N {
+                if sketch.region_at(i as f32 + 0.5, j as f32 + 0.5) == Some(ridx) {
+                    cells.push((i, j));
+                }
+            }
+        }
+        if cells.is_empty() {
+            let ci = region.centre[0].floor().clamp(0.0, (N - 1) as f32) as usize;
+            let cj = region.centre[1].floor().clamp(0.0, (N - 1) as f32) as usize;
+            cells.push((ci, cj));
+        }
+
+        let mut misses: Vec<(usize, usize)> = Vec::new();
+        match region.pen {
+            Pen::Blue => {
+                let is_water = |k: usize| matches!(hit[k], Some((_, Material::Water)));
+                for &(i, j) in &cells {
+                    if !has_nearby(i, j, &is_water) {
+                        misses.push((i, j));
+                    }
+                }
+                let allowed = (cells.len() / 20).max(1);
+                if misses.len() > allowed && misses.len() * 100 >= cells.len() * 5 {
+                    let &(wi, wj) = misses
+                        .iter()
+                        .max_by(|&&(a, b), &&(c, d)| {
+                            nearest_matching(a, b, &is_water)
+                                .unwrap_or(999.0)
+                                .total_cmp(&nearest_matching(c, d, &is_water).unwrap_or(999.0))
+                        })
+                        .unwrap();
+                    let found = hit[wj * N + wi].map_or("empty air", |(_, m)| m.name());
+                    let far = match nearest_matching(wi, wj, &is_water) {
+                        Some(d) => format!("{:.1} m from the nearest water", d),
+                        None => "there is no water anywhere in the area".into(),
+                    };
+                    let pct = (misses.len() * 100) / cells.len().max(1);
+                    return Ok(Err(format!(
+                        "the sketch's materials do not match: where the sketch has water (blue) around ({:.1}, {:.1}), {pct}% of it has \
+                         no water within {SKETCH_TOLERANCE:.1} m (at ({:.1}, {:.1}) the surface is {found}; {far}). Put water where the \
+                         sketch is blue, within {SKETCH_TOLERANCE:.1} m.",
+                        region.centre[0],
+                        region.centre[1],
+                        wi as f32 + 0.5,
+                        wj as f32 + 0.5
+                    )));
+                }
+            }
+            Pen::Grey => {
+                let is_rock = |k: usize| is_stone[k];
+                for &(i, j) in &cells {
+                    if !has_nearby(i, j, &is_rock) {
+                        misses.push((i, j));
+                    }
+                }
+                let allowed = (cells.len() / 20).max(1);
+                if misses.len() > allowed && misses.len() * 100 >= cells.len() * 5 {
+                    let &(wi, wj) = misses
+                        .iter()
+                        .max_by(|&&(a, b), &&(c, d)| {
+                            nearest_matching(a, b, &is_rock)
+                                .unwrap_or(999.0)
+                                .total_cmp(&nearest_matching(c, d, &is_rock).unwrap_or(999.0))
+                        })
+                        .unwrap();
+                    let found = hit[wj * N + wi].map_or("empty air", |(_, m)| m.name());
+                    let far = match nearest_matching(wi, wj, &is_rock) {
+                        Some(d) => format!("{:.1} m from the nearest stone", d),
+                        None => "there is no stone anywhere in the area".into(),
+                    };
+                    let pct = (misses.len() * 100) / cells.len().max(1);
+                    return Ok(Err(format!(
+                        "the sketch's materials do not match: where the sketch has rock or cliff (grey) around ({:.1}, {:.1}), {pct}% \
+                         of it has no stone within {SKETCH_TOLERANCE:.1} m (at ({:.1}, {:.1}) the surface is {found}; {far}). Make the \
+                         surface (or cliff face) stone where the sketch is grey, within {SKETCH_TOLERANCE:.1} m.",
+                        region.centre[0],
+                        region.centre[1],
+                        wi as f32 + 0.5,
+                        wj as f32 + 0.5
+                    )));
+                }
+            }
+            Pen::Brown => {
+                let is_land = |k: usize| matches!(hit[k], Some((_, m)) if m != Material::Water);
+                // A brown cell fails if it has no land within tolerance, OR if it is water well
+                // away from any blue water drawn on the sketch.
+                let mut flooded: Vec<(usize, usize)> = Vec::new();
+                for &(i, j) in &cells {
+                    if !has_nearby(i, j, &is_land) {
+                        misses.push((i, j));
+                    } else if matches!(hit[j * N + i], Some((_, Material::Water))) && !near_blue(i, j) {
+                        flooded.push((i, j));
+                    }
+                }
+                let allowed = (cells.len() / 20).max(1);
+                if misses.len() > allowed || (flooded.len() > 20 && flooded.len() * 100 >= cells.len() * 3) {
+                    let bad = if !misses.is_empty() { &misses } else { &flooded };
+                    let &(wi, wj) = bad
+                        .iter()
+                        .max_by(|&&(a, b), &&(c, d)| {
+                            nearest_matching(a, b, &is_land)
+                                .unwrap_or(999.0)
+                                .total_cmp(&nearest_matching(c, d, &is_land).unwrap_or(999.0))
+                        })
+                        .unwrap();
+                    let found = hit[wj * N + wi].map_or("empty air", |(_, m)| m.name());
+                    let pct = (bad.len() * 100) / cells.len().max(1);
+                    return Ok(Err(format!(
+                        "the sketch's materials do not match: where the sketch has land (brown) around ({:.1}, {:.1}), {pct}% of it is \
+                         not land (at ({:.1}, {:.1}) the surface is {found}). Keep dry land (not water) where the sketch is brown, \
+                         within {SKETCH_TOLERANCE:.1} m.",
+                        region.centre[0],
+                        region.centre[1],
+                        wi as f32 + 0.5,
+                        wj as f32 + 0.5
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// **Sketch places** (POC_PLAN.md, step 6): every orange mark on the sketch has a place for the
+/// tiny within `SKETCH_TOLERANCE` metres reached by the tiny and by nobody who is never tiny;
+/// every purple mark has a place for giants within `SKETCH_TOLERANCE` metres reached by giants and
+/// by nobody who is never a giant.
+pub fn sketch_places(world: &mut World, all: &Reach, description: &Description, sketch: &Sketch) -> Result<Verdict> {
+    if sketch.places.is_empty() {
+        return Ok(Ok(()));
+    }
+    let mut without = std::collections::HashMap::new();
+    for mark in &sketch.places {
+        let size = mark.size;
+        let pen = if size == Size::Tiny { "orange" } else { "purple" };
+        let matching: Vec<_> = description
+            .places
+            .iter()
+            .filter(|p| p.size == size && mark.distance_to(sketch, p.at[0], p.at[2]) <= SKETCH_TOLERANCE)
+            .collect();
+        if matching.is_empty() {
+            let nearest = description
+                .places
+                .iter()
+                .filter(|p| p.size == size)
+                .map(|p| (p, mark.distance_to(sketch, p.at[0], p.at[2])))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(p, d)| format!(" (the nearest place for {} is \"{}\" at {}, {:.1} m away)", a_size(size), p.name, at(p.at, size.height()), d))
+                .unwrap_or_default();
+            return Ok(Err(format!(
+                "the sketch's places do not match: the sketch has an {pen} mark (for {} alone) at ({:.1}, {:.1}), but the area \
+                 describes no place for {} within {SKETCH_TOLERANCE:.1} m of it{nearest}. Describe a place for {} there (in \
+                 `describe().places`), reached by {} and by {}.",
+                a_size(size),
+                mark.centre[0],
+                mark.centre[1],
+                a_size(size),
+                a_size(size),
+                a_size(size),
+                nobody_who_is_never(size)
+            )));
+        }
+        if let std::collections::hash_map::Entry::Vacant(e) = without.entry(size) {
+            let others: Vec<Size> = Size::ALL.into_iter().filter(|&s| s != size).collect();
+            e.insert(world.reach(&others)?);
+        }
+        let reach_without = &without[&size];
+        let mut last_why = String::new();
+        let mut ok = false;
+        for place in matching {
+            let Some(own) = world.at_place(place, size)? else {
+                last_why = format!(
+                    "\"{}\" at {} has no floor with room for {}",
+                    place.name,
+                    at(place.at, size.height()),
+                    a_size(size)
+                );
+                continue;
+            };
+            if !all.has(own) {
+                last_why = format!("\"{}\" at {} is not reached by {} from the start", place.name, at(place.at, size.height()), a_size(size));
+                continue;
+            }
+            let mut intruded = None;
+            for other in Size::ALL.into_iter().filter(|&s| s != size) {
+                if let Some(s) = world.at_place(place, other)?
+                    && reach_without.has(s)
+                {
+                    intruded = Some((other, s));
+                    break;
+                }
+            }
+            if let Some((other, s)) = intruded {
+                last_why = format!(
+                    "\"{}\" is reached by {} who is {}: {}",
+                    place.name,
+                    a_size(other),
+                    never(size),
+                    way(world, &reach_without.way(s))
+                );
+                continue;
+            }
+            ok = true;
+            break;
+        }
+        if !ok {
+            return Ok(Err(format!(
+                "the sketch's places do not match: the sketch's {pen} mark (for {} alone) at ({:.1}, {:.1}) is not kept: {last_why}. \
+                 Make it reached by {} and by {}.",
+                a_size(size),
+                mark.centre[0],
+                mark.centre[1],
+                a_size(size),
+                nobody_who_is_never(size)
+            )));
+        }
+    }
+    Ok(Ok(()))
 }

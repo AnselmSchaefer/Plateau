@@ -21,21 +21,25 @@
 mod chunks;
 mod figure;
 mod flags;
+mod props;
+mod surface;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bevy::asset::embedded_asset;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::light::{CascadeShadowConfigBuilder, GlobalAmbientLight};
-use bevy::pbr::{DistanceFog, FogFalloff};
+use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 use chunks::Chunks;
 use plateau_engine::body::{self, Body, Intent};
-use plateau_engine::{Compiled, Limits, Region, SIZES, START, Wasm, rings};
+use plateau_engine::{Compiled, Limits, Prop, Region, SIZES, START, Wasm, rings};
+use surface::{Materials, SurfaceMaterial};
 
 /// The physics' steps a second.
 const HZ: f32 = 120.0;
@@ -68,6 +72,7 @@ fn main() {
     let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", module.display())));
     let mut physics = compiled.instantiate(seed).expect("the area made");
     let described = physics.describe().expect("the area described");
+    let props = physics.props().expect("the area's props");
     let flags: Vec<_> = described
         .places
         .iter()
@@ -79,11 +84,20 @@ fn main() {
     let present_mode = if tour.is_some() || std::env::var_os("PLATEAU_NO_VSYNC").is_some() { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync };
     let window = Window { title: format!("Plateau: {}", described.name), present_mode, resolution: (1600, 900).into(), ..default() };
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin { primary_window: Some(window), ..default() }))
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
+    app.add_plugins(DefaultPlugins.set(WindowPlugin { primary_window: Some(window), ..default() }));
+    embedded_asset!(app, "play/src", "surface.wesl");
+    app.add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(MaterialPlugin::<SurfaceMaterial>::default())
         .insert_resource(ClearColor(SKY))
         .insert_resource(GlobalAmbientLight { brightness: 500.0, ..default() })
-        .insert_resource(Area { compiled, seed, places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect(), flags })
+        .insert_resource(Area {
+            compiled,
+            seed,
+            places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect(),
+            flags,
+            props,
+            prop_triangles: 0,
+        })
         .insert_resource(Player {
             body,
             pitch: -0.15,
@@ -118,6 +132,8 @@ struct Area {
     places: Vec<(String, plateau_engine::Size, [f64; 3])>,
     /// Where each flagged place's flag stands (`flags::flagged`), in the places' order.
     flags: Vec<(plateau_engine::Size, [f64; 3])>,
+    props: Vec<Prop>,
+    prop_triangles: usize,
 }
 
 /// The instance the player's body is moved through.
@@ -169,12 +185,16 @@ fn look(yaw: f32, pitch: f32) -> Quat {
     Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0)
 }
 
-fn setup(mut commands: Commands, area: Res<Area>, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
-    // Both sides of every triangle drawn: a skirt hangs from the edge of a chunk into the solid and
-    // faces away from it, so where the finer surface stands out of the coarser one at a seam, the
-    // skirt that closes the gap faces away from whoever looks (slits of sky along the bowl's roof).
-    let material = materials.add(StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 0.92, reflectance: 0.3, cull_mode: None, ..default() });
-    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, material));
+fn setup(
+    mut commands: Commands,
+    mut area: ResMut<Area>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
+) {
+    let surface = Materials::new(&mut surface_materials);
+    area.prop_triangles = props::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &area.props);
+    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, surface));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
     flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
     let sun = Vec3::new(0.48, 0.70, 0.53).normalize();
@@ -356,23 +376,31 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Ph
     player.back = if target < player.back { target } else { player.back + (target - player.back) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
 }
 
-/// Where the chunks are drawn, and whether: everything but the camera and the sun.
-type Placed<'w, 's> = Query<'w, 's, (&'static mut Transform, &'static mut Visibility), (Without<Camera3d>, Without<Sun>)>;
+/// Where the chunks are drawn, and whether: everything but the camera, the sun, and the merged props.
+type Placed<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static mut Visibility, Option<&'static mut MeshMaterial3d<SurfaceMaterial>>),
+    (Without<Camera3d>, Without<Sun>, Without<props::PropsMesh>),
+>;
 
 /// The chunks asked for and placed about the eye, the camera turned as the player looks.
 fn draw(
     mut commands: Commands,
+    time: Res<Time>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
     mut chunks: ResMut<Chunks>,
     player: Res<Player>,
     mut physics: NonSendMut<Physics>,
     mut transforms: Placed,
+    mut props_q: Query<&mut Transform, (With<props::PropsMesh>, Without<Camera3d>, Without<Sun>)>,
     mut camera: Query<(&mut Transform, &mut DistanceFog), With<Camera3d>>,
 ) {
     let size = player.body.size;
     let eye = player.eye.unwrap_or(player.body.eye());
-    // Ahead: where the player will be in a little under a second, and the size they are growing or
-    // shrinking to, here and there.
+    let look_vec = player.looking();
+    let look_dir = [look_vec.x as f64, look_vec.y as f64, look_vec.z as f64];
     let v = player.body.velocity;
     let there = [0, 1, 2].map(|a| eye[a] + (v[a] * AHEAD) as f64);
     let mut ahead = vec![(there, size)];
@@ -380,13 +408,17 @@ fn draw(
         ahead.extend([(eye, change.to), (there, change.to)]);
     }
     let started = Instant::now();
-    // In a hollow only the smaller see, the coarser levels asked for a viewer who sees it too;
-    // likewise ahead, so the chunks inside are made before the player walks in.
     let mut open = |e: [f64; 3], s: f32| rings::open(&mut physics.0, e, s).expect("the area asked");
     let here = open(eye, size);
     let ahead: Vec<_> = ahead.into_iter().map(|(e, s)| (e, s, open(e, s))).collect();
-    chunks.update(eye, size, here, &ahead, &mut commands, &mut meshes);
-    chunks.place(eye, (DRAWN_AS / size) as f64, &mut transforms);
+    let scale = (DRAWN_AS / size) as f64;
+    chunks.materials.sync_eye(&mut surface_materials, eye, scale);
+    chunks.update(eye, look_dir, size, here, &ahead, time.delta_secs(), &mut commands, &mut meshes);
+    chunks.place(eye, scale, &mut transforms);
+    for mut pt in &mut props_q {
+        pt.translation = Vec3::new((-eye[0] * scale) as f32, (-eye[1] * scale) as f32, (-eye[2] * scale) as f32);
+        pt.scale = Vec3::splat(scale as f32);
+    }
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
         camera.rotation = look(player.body.yaw, player.pitch);
@@ -424,12 +456,13 @@ fn hud(mut text: Query<&mut Text, With<Hud>>, player: Res<Player>, chunks: Res<C
     let feet = b.seat.map_or(b.feet, |s| s.at);
     let holes = if c.holes > 0 { format!(", {} not yet stood in for", c.holes) } else { String::new() };
     let mut s = format!(
-        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k props)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         c.shown,
         c.waiting,
         c.ahead,
-        c.triangles / 1000,
+        (c.triangles + area.prop_triangles) / 1000,
+        area.prop_triangles / 1000,
         feet[0],
         feet[1],
         feet[2]
