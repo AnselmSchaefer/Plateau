@@ -821,7 +821,7 @@ fn look_and_ask(
                             let b = ctx.place.sdf_bounds_of(pl)?;
                             let (lo, hi) = pl.transform().world_bounds(b);
                             let h32 = [h[0] as f32, h[1] as f32, h[2] as f32];
-                            let pad = ctx.sculpt.radius(psize) + 0.15 * pl.scale;
+                            let pad = ctx.sculpt.radius(psize) * 1.2 + psize * 0.25;
                             let inside = (0..3).all(|a| h32[a] >= lo[a] - pad && h32[a] <= hi[a] + pad);
                             inside.then_some(owner)
                         });

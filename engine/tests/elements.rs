@@ -1012,3 +1012,182 @@ fn giant_tree_carved_by_person_has_no_coarse_pass_or_winding_distortions() {
     assert_eq!(ntl, Ok(()));
     assert_eq!(shai, Ok(()));
 }
+
+#[test]
+fn tiny_carving_person_scale_tree_at_grass_level_has_no_chunk_holes() {
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let tree = catalog.get_or_load("elements/modules/tree.wasm").unwrap();
+
+    // Person-scale OakTree (scale = 1.0) at (32, 0, 48), carved by a TINY player (0.017 m) right at grass level!
+    let tf = PlacementTransform::new([32.0, 0.0, 48.0], 0.0, 1.0);
+    // Find exact grass height right outside trunk at (32.0, ?, 48.35).
+    let mut base = garden(7);
+    let mut ans = Vec::new();
+    base.sample(&[[32.0, 0.0, 48.35]], SIZES[0].1, &mut ans).unwrap();
+    let grass_y = -ans[0].distance;
+
+    let r = 0.75 * SIZES[0].1; // default brush radius for tiny = 0.01275 m
+    let carve1 = Edit::carve(Shape::Sphere { radius: r }, [32.0, grass_y + 0.01, 48.33], r * 0.35, None, SIZES[0].1);
+    let carve2 = Edit::carve(Shape::Sphere { radius: r }, [32.0, grass_y + 0.01, 48.315], r * 0.35, None, SIZES[0].1);
+    let local_edits = vec![world_edit_to_local(&carve1, tf), world_edit_to_local(&carve2, tf)];
+
+    let pl = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 0.0, 48.0],
+        yaw: 0.0,
+        rot: None,
+        scale: 1.0,
+        stamp_size: SIZES[1].1,
+        after_edits: 0,
+        promoted: Some(0),
+        clips: Vec::new(),
+        local_edits,
+    };
+    let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &[]).unwrap().unwrap();
+    let mut composed = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::from_promoted_mesh(pl, mesh_sdf.clone())], 1)),
+    );
+
+    // 1. Check coarse=true vs coarse=false across tiny/fine levels (-11, -10, -9) around the carved
+    // tree-grass seam `(32.0, grass_y, 48.33)`.
+    let mut diffs = 0usize;
+    for level in [-11, -10, -9] {
+        let s = chunk::Key::new(level, [0, 0, 0]).side();
+        let cx = (32.0 / s).floor() as i32;
+        let cy = (grass_y as f64 / s).floor() as i32;
+        let cz = (48.33 / s).floor() as i32;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let key = chunk::Key { level, at: [cx + dx, cy + dy, cz + dz], asked: level };
+                    let a = chunk::make_with(&mut composed, key, chunk::Making { coarse: true, ..Default::default() }).unwrap();
+                    let b = chunk::make_with(&mut composed, key, chunk::Making { coarse: false, ..Default::default() }).unwrap();
+                    if a.mesh != b.mesh {
+                        diffs += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Verify zero Lipschitz / sign-flip spikes on MeshSdf across the entire grass-to-trunk zone.
+    let mut max_mesh_grad = 0.0f32;
+    let eps = 0.002f32;
+    for ix in -10..=10 {
+        for iy in -2..=12 {
+            for iz in 0..=12 {
+                let p0 = [32.0 + ix as f32 * 0.015, grass_y + iy as f32 * 0.01, 48.28 + iz as f32 * 0.015];
+                let l0 = tf.world_to_local_point(p0);
+                let d0 = mesh_sdf.sample(l0, f32::INFINITY).unwrap().distance;
+                for axis in 0..3 {
+                    let mut l1 = l0;
+                    l1[axis] += eps;
+                    let d1 = mesh_sdf.sample(l1, f32::INFINITY).unwrap().distance;
+                    max_mesh_grad = max_mesh_grad.max((d1 - d0).abs() / eps);
+                }
+            }
+        }
+    }
+
+    // 3. Cast camera rays from a tiny player standing outside the trunk (`open == 0`) looking at the
+    // carved tree-grass seam against all multi-LOD `rings::wanted_looking` chunks to verify zero
+    // sky-blue holes leak through!
+    let mut sky_leaks = 0usize;
+    let eye = [32.0, grass_y as f64 + SIZES[0].1 as f64 * 0.9, 48.72];
+    let cam = [eye[0], eye[1] + SIZES[0].1 as f64 * 0.6, eye[2] + SIZES[0].1 as f64 * 3.5];
+    let open = plateau_engine::rings::open(&mut composed, eye, SIZES[0].1).unwrap();
+    assert_eq!(open, 0, "tiny player standing outside roots should have open == COARSEST");
+    let mut rings = plateau_engine::rings::Rings::default();
+    let wanted = rings.wanted_looking(eye, [0.0, -1.0], SIZES[0].1, open);
+    let mut chunk_meshes: Vec<(chunk::Key, [f64; 3], chunk::Mesh)> = Vec::new();
+    for &k in &wanted {
+        let o = k.origin();
+        let s = k.side();
+        if o[0] + s < 31.4 || o[0] > 32.6 || o[2] + s < 47.5 || o[2] > 48.9 || o[1] + s < -0.4 || o[1] > 0.4 {
+            continue;
+        }
+        if let Some(m) = chunk::make(&mut composed, k).unwrap().mesh {
+            chunk_meshes.push((k, o, m));
+        }
+    }
+    let ray_tri = |ro: [f64; 3], rd: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]| -> Option<f64> {
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let h = [rd[1] * e2[2] - rd[2] * e2[1], rd[2] * e2[0] - rd[0] * e2[2], rd[0] * e2[1] - rd[1] * e2[0]];
+        let det = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = 1.0 / det;
+        let s = [ro[0] - a[0], ro[1] - a[1], ro[2] - a[2]];
+        let u = (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            return None;
+        }
+        let q = [s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]];
+        let v = (rd[0] * q[0] + rd[1] * q[1] + rd[2] * q[2]) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            return None;
+        }
+        let t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+        (t > 1e-5).then_some(t)
+    };
+    for iy in 0..24 {
+        let ty = grass_y as f64 - 0.015 + (iy as f64 / 23.0) * 0.065;
+        for ix in 0..32 {
+            let tx = 31.82 + (ix as f64 / 31.0) * 0.36;
+            let d = [tx - cam[0], ty - cam[1], 48.33 - cam[2]];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let rd = [d[0] / len, d[1] / len, d[2] / len];
+            let mut hit_t = f64::INFINITY;
+            for (k, o, m) in &chunk_meshes {
+                let s = k.side() + 4.0 * k.voxel();
+                let lo = [o[0] - 2.0 * k.voxel(), o[1] - 2.0 * k.voxel(), o[2] - 2.0 * k.voxel()];
+                let hi = [lo[0] + s, lo[1] + s, lo[2] + s];
+                let mut tmin = 0.0f64;
+                let mut tmax = hit_t;
+                let mut aabb_hit = true;
+                for a in 0..3 {
+                    if rd[a].abs() < 1e-12 {
+                        if cam[a] < lo[a] || cam[a] > hi[a] {
+                            aabb_hit = false;
+                            break;
+                        }
+                    } else {
+                        let t0 = (lo[a] - cam[a]) / rd[a];
+                        let t1 = (hi[a] - cam[a]) / rd[a];
+                        tmin = tmin.max(t0.min(t1));
+                        tmax = tmax.min(t0.max(t1));
+                        if tmin > tmax {
+                            aabb_hit = false;
+                            break;
+                        }
+                    }
+                }
+                if !aabb_hit {
+                    continue;
+                }
+                for tri in m.indices.as_chunks::<3>().0 {
+                    let p = |idx: u32| {
+                        let q = m.positions[idx as usize];
+                        [o[0] + q[0] as f64, o[1] + q[1] as f64, o[2] + q[2] as f64]
+                    };
+                    if let Some(t) = ray_tri(cam, rd, p(tri[0]), p(tri[1]), p(tri[2]))
+                        && t < hit_t
+                    {
+                        hit_t = t;
+                    }
+                }
+            }
+            if !hit_t.is_finite() {
+                sky_leaks += 1;
+            }
+        }
+    }
+    assert_eq!(diffs, 0, "coarse pass diverged from exact meshing at tiny tree-grass seam");
+    assert!(max_mesh_grad <= 1.05, "MeshSdf gradient spike: {max_mesh_grad:.3}");
+    assert_eq!(sky_leaks, 0, "multi-LOD chunks leaked sky blue through grass-tree seam!");
+}
