@@ -8,6 +8,7 @@ pub type Description = plateau::region::types::Description;
 pub type Scene = plateau::region::types::Scene;
 pub type PlayerState = plateau::region::types::PlayerState;
 pub type Command = plateau::region::types::Command;
+pub type ElementBounds = plateau::region::types::ElementBounds;
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
 pub unsafe fn _export_sample_cabi<T_: Guest>(
@@ -990,6 +991,38 @@ pub unsafe fn __post_return_interact<T_: Guest>(arg0: *mut u8) {
         );
     }
 }
+#[doc(hidden)]
+#[allow(non_snake_case, unused_unsafe)]
+pub unsafe fn _export_element_bounds_cabi<T_: Guest>() -> *mut u8 {
+    unsafe {
+        #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+        let result0 = { T_::element_bounds() };
+        let ptr1 = (&raw mut _RET_AREA.0).cast::<u8>();
+        match result0 {
+            Some(e) => {
+                *ptr1.add(0).cast::<u8>() = (1i32) as u8;
+                let plateau::region::types::ElementBounds {
+                    lo: lo2,
+                    hi: hi2,
+                    blend: blend2,
+                } = e;
+                let plateau::region::types::Point { x: x3, y: y3, z: z3 } = lo2;
+                *ptr1.add(4).cast::<f32>() = _rt::as_f32(x3);
+                *ptr1.add(8).cast::<f32>() = _rt::as_f32(y3);
+                *ptr1.add(12).cast::<f32>() = _rt::as_f32(z3);
+                let plateau::region::types::Point { x: x4, y: y4, z: z4 } = hi2;
+                *ptr1.add(16).cast::<f32>() = _rt::as_f32(x4);
+                *ptr1.add(20).cast::<f32>() = _rt::as_f32(y4);
+                *ptr1.add(24).cast::<f32>() = _rt::as_f32(z4);
+                *ptr1.add(28).cast::<f32>() = _rt::as_f32(blend2);
+            }
+            None => {
+                *ptr1.add(0).cast::<u8>() = (0i32) as u8;
+            }
+        };
+        ptr1
+    }
+}
 pub trait Guest {
     /// What is at each point, in order, for a viewer `size` metres tall: one answer a point. The
     /// detail a viewer sees grows as they shrink; what a smaller viewer sees is the larger one's
@@ -1008,6 +1041,9 @@ pub trait Guest {
     /// Sandboxed runtime interaction called when the player uses/interacts (`F` / right-click).
     #[allow(async_fn_in_trait)]
     fn interact(player: PlayerState) -> _rt::Vec<Command>;
+    /// Local SDF bounds if this module is a standalone carvable landform element, or none.
+    #[allow(async_fn_in_trait)]
+    fn element_bounds() -> ::core::option::Option<ElementBounds>;
 }
 #[doc(hidden)]
 #[macro_export]
@@ -1035,7 +1071,10 @@ macro_rules! __export_world_region_cabi {
         * mut u8,) -> * mut u8 { unsafe { $($path_to_types)*::
         _export_interact_cabi::<$ty > (arg0) } } #[unsafe (export_name =
         "cabi_post_interact")] unsafe extern "C" fn _post_return_interact(arg0 : * mut
-        u8,) { unsafe { $($path_to_types)*:: __post_return_interact::<$ty > (arg0) } } };
+        u8,) { unsafe { $($path_to_types)*:: __post_return_interact::<$ty > (arg0) } }
+        #[unsafe (export_name = "element-bounds")] unsafe extern "C" fn
+        export_element_bounds() -> * mut u8 { unsafe { $($path_to_types)*::
+        _export_element_bounds_cabi::<$ty > () } } };
     };
 }
 #[doc(hidden)]
@@ -1491,6 +1530,27 @@ pub mod plateau {
                     }
                 }
             }
+            /// Local SDF bounding box and smooth blend width for a standalone composable element.
+            /// `None` means the element is purely procedural `Scene` geometry (zero SDF sampling cost).
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct ElementBounds {
+                pub lo: Point,
+                pub hi: Point,
+                pub blend: f32,
+            }
+            impl ::core::fmt::Debug for ElementBounds {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("ElementBounds")
+                        .field("lo", &self.lo)
+                        .field("hi", &self.hi)
+                        .field("blend", &self.blend)
+                        .finish()
+                }
+            }
         }
     }
 }
@@ -1631,11 +1691,11 @@ macro_rules! __export_region_impl {
         "wasm32")] #[unsafe (link_section =
         "component-type:wit-bindgen:0.63.0:plateau:region@0.1.0:region:imports and exports")]
         #[doc(hidden)] #[allow(clippy::octal_escapes)] pub static
-        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 1310] = *
+        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 1414] = *
         b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xa1\x09\x01A\x02\x01\
-A\x1d\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B'\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x89\x0a\x01A\x02\x01\
+A\"\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
+\0\x01B)\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
 rass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\x03\
 \0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04\
 tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\x02\
@@ -1653,17 +1713,19 @@ et\x01\x03eye\x01\x04look\x01\x08velocity\x01\x04sizev\x08grounded\x7f\x0bholdin
 g-use\x7f\x06targety\x03aim\x01\x04timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\
 \x7f\x01q\x06\x0dset-transform\x01\x1a\0\x0bset-visible\x01$\0\x09set-solid\x01$\
 \0\x0dapply-impulse\x01\x01\0\x09set-light\x01\x1c\0\x03say\x01s\0\x04\0\x07comm\
-and\x03\0%\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\
-\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\
-\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05\
-scene\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\
-\x03\0\x01\x07command\x03\0\x07command\x03\0\x0c\x01p\x03\x01p\x05\x01@\x02\x06p\
-oints\x0e\x04sizev\0\x0f\x04\0\x06sample\x01\x10\x01@\0\0\x07\x04\0\x08describe\x01\
-\x11\x01@\0\0\x09\x04\0\x05scene\x01\x12\x01p\x0d\x01@\x02\x02dtv\x06player\x0b\0\
-\x13\x04\0\x04tick\x01\x14\x01@\x01\x06player\x0b\0\x13\x04\0\x08interact\x01\x15\
-\x04\0\x1bplateau:region/region@0.1.0\x04\0\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09\
-producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.262.0\x10wit-bindgen-rus\
-t\x060.63.0";
+and\x03\0%\x01r\x03\x02lo\x01\x02hi\x01\x05blendv\x04\0\x0eelement-bounds\x03\0'\
+\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\0\x05poi\
+nt\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\x01\x0b\
+description\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05scene\
+\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\x03\
+\0\x01\x07command\x03\0\x07command\x03\0\x0c\x02\x03\0\x01\x0eelement-bounds\x03\
+\0\x0eelement-bounds\x03\0\x0e\x01p\x03\x01p\x05\x01@\x02\x06points\x10\x04sizev\
+\0\x11\x04\0\x06sample\x01\x12\x01@\0\0\x07\x04\0\x08describe\x01\x13\x01@\0\0\x09\
+\x04\0\x05scene\x01\x14\x01p\x0d\x01@\x02\x02dtv\x06player\x0b\0\x15\x04\0\x04ti\
+ck\x01\x16\x01@\x01\x06player\x0b\0\x15\x04\0\x08interact\x01\x17\x01k\x0f\x01@\0\
+\0\x18\x04\0\x0eelement-bounds\x01\x19\x04\0\x1bplateau:region/region@0.1.0\x04\0\
+\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-\
+component\x070.262.0\x10wit-bindgen-rust\x060.63.0";
         };
     };
 }
@@ -1676,10 +1738,10 @@ pub use __export_region_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1250] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xc5\x08\x01A\x02\x01\
-A\x10\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B'\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1327] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x92\x09\x01A\x02\x01\
+A\x12\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
+\0\x01B)\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
 rass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\x03\
 \0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04\
 tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\x02\
@@ -1697,14 +1759,16 @@ et\x01\x03eye\x01\x04look\x01\x08velocity\x01\x04sizev\x08grounded\x7f\x0bholdin
 g-use\x7f\x06targety\x03aim\x01\x04timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\
 \x7f\x01q\x06\x0dset-transform\x01\x1a\0\x0bset-visible\x01$\0\x09set-solid\x01$\
 \0\x0dapply-impulse\x01\x01\0\x09set-light\x01\x1c\0\x03say\x01s\0\x04\0\x07comm\
-and\x03\0%\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\
-\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\
-\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05\
-scene\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\
-\x03\0\x01\x07command\x03\0\x07command\x03\0\x0c\x04\0;plateau:region/region-wit\
-h-all-of-its-exports-removed@0.1.0\x04\0\x0b,\x01\0&region-with-all-of-its-expor\
-ts-removed\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070\
-.262.0\x10wit-bindgen-rust\x060.63.0";
+and\x03\0%\x01r\x03\x02lo\x01\x02hi\x01\x05blendv\x04\0\x0eelement-bounds\x03\0'\
+\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\0\x05poi\
+nt\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\x01\x0b\
+description\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05scene\
+\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\x03\
+\0\x01\x07command\x03\0\x07command\x03\0\x0c\x02\x03\0\x01\x0eelement-bounds\x03\
+\0\x0eelement-bounds\x03\0\x0e\x04\0;plateau:region/region-with-all-of-its-expor\
+ts-removed@0.1.0\x04\0\x0b,\x01\0&region-with-all-of-its-exports-removed\x03\0\0\
+\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.262.0\x10wit-bind\
+gen-rust\x060.63.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

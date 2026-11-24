@@ -8,7 +8,7 @@ use wasmtime::error::Context;
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc, format_err};
 
 use crate::check::{self, HOST, MOST_MEMORY};
-use crate::{Answer, Borders, Command, Description, Edge, Instance, LARGEST, Light, Material, MeshData, Place, PlayerState, Region, Result, SMALLEST, Scene, Size, Vertex};
+use crate::{Answer, Borders, Command, Description, Edge, ElementBounds, Instance, LARGEST, Light, Material, MeshData, Place, PlayerState, Region, Result, SMALLEST, Scene, Size, Vertex};
 
 /// How a module is run.
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +102,7 @@ impl Compiled {
             (Ok(f), Ok(p)) => Some((f, p)),
             _ => None,
         };
+        let element_bounds = instance.get_typed_func(&mut store, "element-bounds").ok();
         Ok(Wasm {
             realloc: instance.get_typed_func(&mut store, "cabi_realloc").context("the area's cabi_realloc")?,
             sample: instance.get_typed_func(&mut store, "sample").context("the area's sample")?,
@@ -111,6 +112,7 @@ impl Compiled {
             scene,
             tick,
             interact,
+            element_bounds,
             store,
             memory,
             fuel_per_sample: self.limits.fuel_per_sample,
@@ -136,6 +138,7 @@ pub struct Wasm {
     scene: Option<(TypedFunc<(), u32>, TypedFunc<u32, ()>)>,
     tick: Option<(TypedFunc<u32, u32>, TypedFunc<u32, ()>)>,
     interact: Option<(TypedFunc<u32, u32>, TypedFunc<u32, ()>)>,
+    element_bounds: Option<TypedFunc<(), u32>>,
     fuel_per_sample: Option<u64>,
 }
 
@@ -350,6 +353,33 @@ impl Region for Wasm {
         let cmds = read_commands(Bytes(self.memory.data(&self.store)), ret)?;
         post_interact.call(&mut self.store, ret)?;
         Ok(cmds)
+    }
+
+    fn element_bounds(&mut self) -> Result<Option<ElementBounds>> {
+        let Some(call_bounds) = self.element_bounds.clone() else {
+            return Ok(None);
+        };
+        self.fuel(|_| FUEL_PER_CALL)?;
+        let ret = call_bounds.call(&mut self.store, ())?;
+        let d = Bytes(self.memory.data(&self.store));
+        match d.slice(ret, 1, 1)?[0] {
+            0 => Ok(None),
+            1 => {
+                let lo = [d.f32(ret + 4)?, d.f32(ret + 8)?, d.f32(ret + 12)?];
+                let hi = [d.f32(ret + 16)?, d.f32(ret + 20)?, d.f32(ret + 24)?];
+                let blend = d.f32(ret + 28)?;
+                for a in 0..3 {
+                    if !lo[a].is_finite() || !hi[a].is_finite() || lo[a] >= hi[a] || lo[a] < -64.0 || hi[a] > 64.0 {
+                        return Err(format_err!("element bounds are invalid or out of range: lo={lo:?}, hi={hi:?}"));
+                    }
+                }
+                if !blend.is_finite() || !(0.0..=32.0).contains(&blend) {
+                    return Err(format_err!("element blend is invalid or out of range: {blend}"));
+                }
+                Ok(Some(ElementBounds { lo, hi, blend }))
+            }
+            n => Err(format_err!("element-bounds option tag was {n}")),
+        }
     }
 }
 

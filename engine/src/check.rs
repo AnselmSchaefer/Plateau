@@ -27,13 +27,14 @@ const EXPORTS: [Signature; 5] = [
     ("cabi_realloc", &[I32, I32, I32, I32], &[I32]),
 ];
 /// Optional exports accepted when present (for backward compatibility with earlier modules).
-const OPTIONAL_EXPORTS: [Signature; 6] = [
+const OPTIONAL_EXPORTS: [Signature; 7] = [
     ("scene", &[], &[I32]),
     ("cabi_post_scene", &[I32], &[]),
     ("tick", &[I32], &[I32]),
     ("cabi_post_tick", &[I32], &[]),
     ("interact", &[I32], &[I32]),
     ("cabi_post_interact", &[I32], &[]),
+    ("element-bounds", &[], &[I32]),
 ];
 
 /// The WebAssembly an area may use, for good: WebAssembly 2.0 without SIMD, what every engine runs

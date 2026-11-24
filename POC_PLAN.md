@@ -669,11 +669,46 @@ triangles in 1 draw call):
   mode with a translucent 3D brush ghost sized to the player's current scale (`LMB` add, `RMB`/`X`
   carve — click or hold to stroke, `Tab` shape, `R` material, scroll/`[`/`]` size, `Z`/`Y` undo/redo,
   `Ctrl+S`/`F5` save, `Ctrl+L`/`F9` reload, `--save <path>` CLI).
-- **Verified** (`engine/tests/edits.rs`): 6 tests passing — BVH bit-exactness vs brute force across
+- **Verified** (`engine/tests/edits.rs`): 7 tests passing — BVH bit-exactness vs brute force across
   60 mixed multi-scale edits, raising a person-scale hill + digging a tiny cave + walking inside it
   while blocking growth + coarse/full chunk agreement, save/reload bit-exact chunk determinism
   ("made again equals played"), targeted chunk invalidation soundness, `never_too_long` and
-  `surfaces_have_an_inside` laws on edited terrain, and undo/validation.
+  `surfaces_have_an_inside` laws on edited terrain, undo/validation, and hill-on-player lift.
+
+*Step 8b done (2026-11-24): composable standalone `.wasm` elements placed onto any area at any scale, persisted in `WorldSave`, with Claude authoring CLI.*
+
+- **Standalone element contract & SDK (`sdk/wit/region.wit`, `sdk/src/lib.rs`, `engine/src/check.rs`, `engine/src/wasm.rs`)**:
+  optional `element-bounds` export on `plateau:region@0.1.0` (`None` for pure procedural `Scene`
+  elements with zero SDF cost; `Some(ElementBounds { lo, hi, blend })` for carvable SDF landforms),
+  plus `Element` trait and `element!` macro authoring in local coordinates around `(0, 0, 0)` with
+  the same Wasmtime sandbox, fuel/memory caps, and native `played(seed)` testing.
+- **Chronological SDF composition & isolated multi-layer `SceneWorld` (`engine/src/compose.rs`, `engine/src/scene.rs`, `engine/src/edit.rs`)**:
+  `Composed<R>` evaluates base terrain, `EditLog` range slices (`apply_batch_range`), and placed SDF
+  elements in chronological order (`after_edits`) with exact Lipschitz-preserving local↔world
+  transforms; `SceneWorld` namespaces meshes, solid/dynamic instances, and physically scaled lights
+  (`intensity * scale²`, `radius * scale`) per owner `(owner, id)` with `ElementRuntime` transforming
+  `PlayerState` and runtime `Command`s per placement. `WorldSave` persists `element ...` records
+  alongside `sdf ...` edits (backward-compatible with Step 8a saves).
+- **Carried showcase elements & interactive placement (`elements/`, `play/src/place.rs`, `play/src/chunks.rs`, `play/src/scene.rs`, `play/src/main.rs`)**:
+  four showcase `.wasm` elements built by `elements/build.sh` (`tree`, `bridge`, `lantern`, `hill`).
+  `P` toggles Place Element mode with translucent 3D preview ghost (`LMB` place at current player
+  scale, `RMB`/`X` remove aimed element, `Tab` cycle palette, `R`/`T` rotate yaw, scroll/`[`/`]`
+  scale, `Ctrl+R` live disk rescan, unified `Z`/`Y` undo/redo across sculpt + elements, `Ctrl+S`/`Ctrl+L`
+  save/reload, repeatable `--element <path.wasm>` CLI).
+- **Claude element authoring CLI (`make/ELEMENT_GUIDE.md`, `make/src/lib.rs`, `make/src/main.rs`)**:
+  `plateau make-element "<words>" [--name NAME]` and `plateau check-element <NAME>` compile and
+  verify standalone elements via `judge_element` (sandbox check, `scene`/`tick`/`interact` smoke test,
+  and for SDF elements: 6-face bounds containment, non-empty interior, local Lipschitz check, and
+  `nans_unseen`).
+- **Verified** (`engine/tests/elements.rs`, `make/tests/make.rs`): 10 new engine tests + 1 new make
+  stand-in test passing (carving a tiny cave into a placed SDF hill + chronological ordering,
+  walking across a placed solid bridge at tiny/person/giant scales, isolated multi-placement lantern
+  `tick`/`interact`/light scaling, `WorldSave` bit-exact chunk round-trip, targeted SDF chunk
+  invalidation, SDF laws + `nans_unseen`, sandbox bounds rejection, and **lazy Scene → SDF
+  promotion** on first sculpt: `engine/src/mesh_sdf.rs` converts solid `Scene` meshes like `Oak Tree`
+  trunk or `Timber Bridge` deck into a deterministic BVH exact triangle SDF with signed ray-winding
+  while keeping non-solid swaying canopies/handrails in `Scene`, persisted as `promoted <idx>` in
+  `WorldSave` and cleanly demoted on `Z` undo).
 
 ### 9. Two areas side by side (three or four days, if there is time)
 

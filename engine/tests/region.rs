@@ -211,12 +211,12 @@ fn scene_tick_interact_and_solid_collision_work_and_are_capped() {
     let applied = world.apply(&icmds);
     assert!((applied.impulse[1] - plateau_engine::wasm::MAX_IMPULSE).abs() < 1e-4, "impulse was not clamped: {:?}", applied.impulse);
     assert_eq!(applied.said.as_deref(), Some("lamp on"));
-    assert_eq!(world.lights.get(&1).map(|l| l.intensity), Some(200.0));
+    assert_eq!(world.lights.get(&(0, 1)).map(|l| l.intensity), Some(200.0));
     // Interact again turns the light off (mutable WASM state persisted!).
     let icmds2 = wasm.interact(&ps).unwrap();
     let applied2 = world.apply(&icmds2);
     assert_eq!(applied2.said.as_deref(), Some("lamp off"));
-    assert!(!world.lights.contains_key(&1));
+    assert!(!world.lights.contains_key(&(0, 1)));
 
     // Suppress unused imports check on Vertex/MeshData/Instance/Light types.
     let _ = (Vertex { pos: [0.0; 3], normal: [0.0, 1.0, 0.0], material: Material::Stone, tint: [255; 3] }, MeshData::default(), Instance { id: 0, mesh: 0, pos: [0.0; 3], rot: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 3], solid: false }, Light { id: 0, pos: [0.0; 3], color: [1.0; 3], intensity: 0.0, radius: 1.0 });

@@ -23,7 +23,7 @@ use std::time::Instant;
 use plateau_engine::picture::{Camera, map, picture, plan, plans, tint, views};
 use plateau_engine::reach::World;
 use plateau_engine::sketch::Sketch;
-use plateau_engine::{Compiled, Description, Limits, Region, Size, Wasm, check, laws, points};
+use plateau_engine::{Compiled, Description, Limits, PlayerState, Region, Size, Wasm, check, laws, points};
 
 /// The seed every area is made and judged with.
 pub const SEED: u64 = 7;
@@ -75,6 +75,22 @@ pub fn guide(repo: &Path) -> Result<String, String> {
         read("sdk/src/mesh.rs")?,
         read("sdk/wit/region.wit")?,
         read("areas/garden/area.rs")?
+    ))
+}
+
+/// The guide Claude is given when authoring a standalone composable `.wasm` element.
+pub fn element_guide(repo: &Path) -> Result<String, String> {
+    let read = |p: &str| std::fs::read_to_string(repo.join(p)).map_err(|e| format!("{p}: {e}"));
+    Ok(format!(
+        "{}\n\n# The SDK: `sdk/src/lib.rs`\n\n```rust\n{}```\n\n# The procedural mesh & scene workshop: `sdk/src/mesh.rs`\n\n```rust\n{}```\n\n# The world's interface: `sdk/wit/region.wit`\n\n```wit\n{}```\n\n\
+         # Example interactive Scene element: `elements/lantern/element.rs`\n\n```rust\n{}```\n\n\
+         # Example carvable SDF element: `elements/hill/element.rs`\n\n```rust\n{}```\n",
+        read("make/ELEMENT_GUIDE.md")?,
+        read("sdk/src/lib.rs")?,
+        read("sdk/src/mesh.rs")?,
+        read("sdk/wit/region.wit")?,
+        read("elements/lantern/element.rs")?,
+        read("elements/hill/element.rs")?
     ))
 }
 
@@ -144,6 +160,36 @@ impl Builder {
             return Err(words);
         }
         std::fs::read(dir.join("build/area.wasm")).map_err(|e| e.to_string())
+    }
+
+    /// Builds a standalone element (`dir/element.rs`) to `dir/build/element.wasm`, returning the bytes
+    /// or the compiler's words.
+    pub fn build_element(&self, source: &str, dir: &Path) -> Result<Vec<u8>, String> {
+        std::fs::create_dir_all(dir.join("build")).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("element.rs"), source).map_err(|e| e.to_string())?;
+        let out = Command::new("rustc")
+            .current_dir(&self.repo)
+            .args(["--crate-name", "area"])
+            .args(FIXED)
+            .args(["--crate-type", "cdylib", "-C", "link-arg=--max-memory=67108864", "-A", "warnings", "--remap-path-prefix"])
+            .arg(format!("{}=/element", dir.display()))
+            .arg("--extern")
+            .arg(format!("plateau_sdk={}", self.sdk.display()))
+            .arg(dir.join("element.rs"))
+            .arg("-o")
+            .arg(dir.join("build/element.wasm"))
+            .output()
+            .map_err(|e| format!("rustc: {e}"))?;
+        if !out.status.success() {
+            let mut words = String::from_utf8_lossy(&out.stderr).into_owned();
+            if words.len() > MOST_WORDS {
+                let cut = (0..=MOST_WORDS).rev().find(|&i| words.is_char_boundary(i)).unwrap_or(0);
+                words.truncate(cut);
+                words += "\n[... the rest left out]";
+            }
+            return Err(words);
+        }
+        std::fs::read(dir.join("build/element.wasm")).map_err(|e| e.to_string())
     }
 }
 
@@ -219,6 +265,190 @@ pub fn judge(module: &[u8], sketch: Option<&Sketch>, settings: Settings) -> Judg
         Err(e) => judged.broken.push(("gates are real".into(), format!("working out where each size can go failed: {e:#}"))),
     }
     ran("NaNs unseen", laws::nans_unseen(module, SEED, &points(20_000, 30.0, 1)), &mut judged.broken);
+    judged.seconds = started.elapsed().as_secs_f64();
+    judged
+}
+
+/// Checks and judges a standalone composable `.wasm` element module:
+/// - Wasmtime sandbox & export check (`check::check`), `describe()`, `element_bounds()`, `scene()`
+/// - Runtime `tick()` and `interact()` smoke test
+/// - Pure-Scene elements must emit at least one mesh+instance or light
+/// - SDF landform elements (`element_bounds() == Some(bounds)`) are verified for bounds containment
+///   (surface stays strictly inside `lo..hi`), non-empty interior, local Lipschitz safety
+///   (`|d(p) - d(q)| <= 1.05 * |p - q|`), and `nans_unseen`.
+pub fn judge_element(module: &[u8], _settings: Settings) -> Judged {
+    let started = Instant::now();
+    let mut judged = Judged::default();
+    if let Err(why) = check::check(module) {
+        judged.broken.push(("the engine's check".into(), why.join("; ")));
+        return judged;
+    }
+    let mut elem = match Wasm::new(module, SEED, Limits::default()) {
+        Ok(w) => w,
+        Err(e) => {
+            judged.broken.push(("loading element".into(), format!("{e:#}")));
+            return judged;
+        }
+    };
+    match elem.describe() {
+        Ok(d) => judged.description = Some(d),
+        Err(e) => {
+            judged.broken.push(("describing itself".into(), format!("{e:#}")));
+            return judged;
+        }
+    }
+    let bounds = match elem.element_bounds() {
+        Ok(b) => b,
+        Err(e) => {
+            judged.broken.push(("element bounds".into(), format!("{e:#}")));
+            return judged;
+        }
+    };
+    let scene = match elem.scene() {
+        Ok(s) => s,
+        Err(e) => {
+            judged.broken.push(("procedural scene".into(), format!("{e:#}")));
+            return judged;
+        }
+    };
+    // Smoke-test runtime hooks in local coordinates.
+    let ps = PlayerState {
+        feet: [0.0, 0.0, 2.0],
+        eye: [0.0, 1.5, 2.0],
+        look: [0.0, 0.0, -1.0],
+        velocity: [0.0; 3],
+        size: 1.7,
+        grounded: true,
+        holding_use: false,
+        target: scene.instances.iter().find(|i| i.id > 0).map_or(0, |i| i.id),
+        aim: [0.0, 1.0, 0.0],
+        time: 1.0,
+    };
+    if let Err(e) = elem.tick(0.016, &ps) {
+        judged.broken.push(("runtime tick".into(), format!("{e:#}")));
+    }
+    if let Err(e) = elem.interact(&ps) {
+        judged.broken.push(("runtime interact".into(), format!("{e:#}")));
+    }
+
+    if let Some(b) = bounds {
+        // 1. Bounds containment: all 6 faces of lo..hi must be outside solid (d >= -1e-4).
+        let mut face_pts = Vec::new();
+        let steps = 8usize;
+        for a in 0..3 {
+            let b1 = (a + 1) % 3;
+            let b2 = (a + 2) % 3;
+            for side in [b.lo[a], b.hi[a]] {
+                for i in 0..=steps {
+                    for j in 0..=steps {
+                        let u = i as f32 / steps as f32;
+                        let v = j as f32 / steps as f32;
+                        let mut p = [0.0f32; 3];
+                        p[a] = side;
+                        p[b1] = b.lo[b1] + (b.hi[b1] - b.lo[b1]) * u;
+                        p[b2] = b.lo[b2] + (b.hi[b2] - b.lo[b2]) * v;
+                        face_pts.push(p);
+                    }
+                }
+            }
+        }
+        // 2. Interior sampling for non-empty solid + local Lipschitz check.
+        let mut grid_pts = Vec::new();
+        let gn = 8usize;
+        for iz in 0..=gn {
+            for iy in 0..=gn {
+                for ix in 0..=gn {
+                    grid_pts.push([
+                        b.lo[0] + (b.hi[0] - b.lo[0]) * (ix as f32 / gn as f32),
+                        b.lo[1] + (b.hi[1] - b.lo[1]) * (iy as f32 / gn as f32),
+                        b.lo[2] + (b.hi[2] - b.lo[2]) * (iz as f32 / gn as f32),
+                    ]);
+                }
+            }
+        }
+        if let Ok(mut sdf_wasm) = Wasm::new(module, SEED, Limits::default()) {
+            let mut out = Vec::new();
+            let mut clip_err = None;
+            let mut has_solid = false;
+            let mut lip_err = None;
+            for size in [Size::Tiny.height(), Size::Person.height(), Size::Giant.height()] {
+                if let Err(e) = sdf_wasm.sample(&face_pts, size, &mut out) {
+                    judged.broken.push(("sampling SDF bounds".into(), format!("{e:#}")));
+                    break;
+                }
+                for (&p, ans) in face_pts.iter().zip(&out) {
+                    if !ans.distance.is_finite() {
+                        clip_err = Some(format!("non-finite distance {} at {p:?}", ans.distance));
+                        break;
+                    }
+                    if ans.distance < -1e-3 && clip_err.is_none() {
+                        clip_err = Some(format!(
+                            "solid extends past declared bounds lo={:?} hi={:?} at {p:?} (d={:.4} for size={size})",
+                            b.lo, b.hi, ans.distance
+                        ));
+                    }
+                }
+                if let Err(e) = sdf_wasm.sample(&grid_pts, size, &mut out) {
+                    judged.broken.push(("sampling SDF interior".into(), format!("{e:#}")));
+                    break;
+                }
+                let mut pairs_a = Vec::new();
+                let mut pairs_b = Vec::new();
+                let eps = (size * 0.05).clamp(0.005, 0.15);
+                for (&p, ans) in grid_pts.iter().zip(&out) {
+                    if ans.distance < 0.0 {
+                        has_solid = true;
+                    }
+                    if ans.distance.abs() < 0.5 {
+                        pairs_a.push((p, ans.distance));
+                        pairs_b.push([p[0] + eps, p[1], p[2]]);
+                        pairs_b.push([p[0], p[1] + eps, p[2]]);
+                        pairs_b.push([p[0], p[1], p[2] + eps]);
+                    }
+                }
+                if !pairs_b.is_empty() && lip_err.is_none() {
+                    let mut out_b = Vec::new();
+                    if sdf_wasm.sample(&pairs_b, size, &mut out_b).is_ok() {
+                        for (i, &(p, da)) in pairs_a.iter().enumerate() {
+                            for k in 0..3 {
+                                let db = out_b[i * 3 + k].distance;
+                                let slope = (db - da).abs() / eps;
+                                if slope > 1.08 {
+                                    lip_err = Some(format!(
+                                        "distances grow {slope:.2}x too fast near {p:?} (size={size}): scale distances down so |grad d| <= 1"
+                                    ));
+                                    break;
+                                }
+                            }
+                            if lip_err.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(why) = clip_err {
+                judged.broken.push(("element bounds containment".into(), why));
+            }
+            if !has_solid {
+                judged.broken.push(("element has solid".into(), "SDF element has no solid volume inside its declared bounds".into()));
+            }
+            if let Some(why) = lip_err {
+                judged.broken.push(("distances never too long".into(), why));
+            }
+        }
+        match laws::nans_unseen(module, SEED, &grid_pts) {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => judged.broken.push(("NaNs unseen".into(), why)),
+            Err(e) => judged.broken.push(("NaNs unseen".into(), format!("{e:#}"))),
+        }
+    } else if scene.instances.is_empty() && scene.lights.is_empty() {
+        judged.broken.push((
+            "non-empty element".into(),
+            "element has sdf_bounds() == None and an empty scene() (no instances or lights)".into(),
+        ));
+    }
+
     judged.seconds = started.elapsed().as_secs_f64();
     judged
 }
@@ -472,6 +702,92 @@ pub fn make(
     if let Some(source) = &made.kept {
         let module = builder.build(source, &dir.join("build"))?;
         pictures(&module, &dir.join("pictures"), settings)?;
+    }
+    made.seconds = started.elapsed().as_secs_f64();
+    Ok(made)
+}
+
+/// Makes a standalone composable `.wasm` element from `words` into `dir` (`dir/element.rs`,
+/// `dir/element.wasm`, `dir/rounds/...`), verifying it with `judge_element` and retrying up to
+/// `MOST_FIXES` rounds.
+pub fn make_element(
+    writer: &mut dyn Writer,
+    builder: &Builder,
+    words: &str,
+    dir: &Path,
+    settings: Settings,
+    say: &mut dyn FnMut(&str),
+) -> Result<Made, String> {
+    let started = Instant::now();
+    let rounds_dir = dir.join("rounds");
+    std::fs::create_dir_all(&rounds_dir).map_err(|e| e.to_string())?;
+    let mut made = Made { kept: None, rounds: Vec::new(), fixes: 0, looked: false, seconds: 0.0 };
+    let mut prompt = format!(
+        "Make this standalone composable Plateau element: {words}\n\n\
+         Answer with the whole of `element.rs` in one ```rust block."
+    );
+    let mut asked = "write";
+    loop {
+        say(&format!("round {}: asking Claude ({asked})", made.rounds.len() + 1));
+        let reply = match writer.write(&prompt, None) {
+            Ok(reply) => reply,
+            Err(e) if made.kept.is_some() => {
+                say(&format!("round {}: stopped ({e}); keeping the last valid version", made.rounds.len() + 1));
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let n = made.rounds.len() + 1;
+        std::fs::write(rounds_dir.join(format!("{n}-{asked}-asked.md")), &prompt).ok();
+        std::fs::write(rounds_dir.join(format!("{n}-{asked}-answer.md")), &reply.text).ok();
+        say(&format!("round {n}: answered in {:.0} s, reckoned at ${:.2}", reply.seconds, reply.cost));
+
+        let (came, next): (String, Option<(&'static str, String)>) = match source_of(&reply.text) {
+            None => (
+                "no source".into(),
+                Some(("compile", "There is no ```rust block in your answer. Answer with the whole of `element.rs` in one ```rust block.".into())),
+            ),
+            Some(source) => {
+                std::fs::write(rounds_dir.join(format!("{n}.rs")), &source).ok();
+                match builder.build_element(&source, &dir.join("build")) {
+                    Err(words) => (
+                        "does not build".into(),
+                        Some((
+                            "compile",
+                            format!("It does not build. The compiler says:\n\n```\n{words}\n```\n\nAnswer with the whole of `element.rs` again, fixed, in one ```rust block."),
+                        )),
+                    ),
+                    Ok(module) => {
+                        let judged = judge_element(&module, settings);
+                        if judged.kept() {
+                            std::fs::write(dir.join("element.rs"), &source).map_err(|e| e.to_string())?;
+                            std::fs::write(dir.join("element.wasm"), &module).map_err(|e| e.to_string())?;
+                            made.kept = Some(source);
+                            ("keeps every law".into(), None)
+                        } else {
+                            let names: Vec<_> = judged.broken.iter().map(|b| b.0.clone()).collect();
+                            let list: String = judged.broken.iter().map(|(law, why)| format!("- **{law}**: {why}\n")).collect();
+                            (
+                                format!("breaks: {}", names.join(", ")),
+                                Some((
+                                    "laws",
+                                    format!("It builds, but it breaks:\n\n{list}\nAnswer with the whole of `element.rs` again, fixed, in one ```rust block."),
+                                )),
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        say(&format!("round {n}: {came}"));
+        made.rounds.push(Round { asked, reply, came });
+        let Some((kind, words)) = next else { break };
+        if made.fixes >= MOST_FIXES {
+            break;
+        }
+        made.fixes += 1;
+        asked = kind;
+        prompt = words;
     }
     made.seconds = started.elapsed().as_secs_f64();
     Ok(made)

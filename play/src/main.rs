@@ -1,26 +1,14 @@
-//! Plateau, played (POC_PLAN.md, step 2): one area, walked at three sizes, the player seen from
-//! behind (`figure`) or through their own eyes.
+//! Plateau, played (POC_PLAN.md, steps 2, 7, and 8): one area, walked at three sizes, the player
+//! seen from behind (`figure`) or through their own eyes, with live multi-scale SDF sculpting (`B`)
+//! and composable standalone `.wasm` element placement (`P`).
 //!
-//! `cargo run --release -p plateau-play [-- area.wasm] [--seed N] [--tour folder [--behind]]`; the walled
-//! garden (`areas/modules/garden.wasm`) unless another module is given. W A S D to walk, Shift to
-//! run, Space to jump, the mouse to look (click to take it, Esc to let it go); 1, 2 and 3 to become
-//! tiny, a person or a giant, Q and E to shrink and grow a size; C to sit or stand; V to see from
-//! behind or through the eyes; M to hide or show the flags over the tiny's places (`flags`); F12
-//! for a screenshot (into `target/shots/`).
-//!
-//! `--tour folder` goes instead to fixed places at each size, waits for the chunks there, measures
-//! the frames a second, takes a screenshot of each into the folder, writes what it measured to
-//! `tour.txt` there, and exits (vsync off, to see how many frames it could). It sees through the
-//! eyes, as it did when its numbers were first written, unless `--behind` is given too.
-//!
-//! The engine does the rest (`plateau_engine`): the body walks at its size (`body`), the surface is
-//! made in chunks off the frame (`chunks`). The world is drawn about the player's eye and scaled so
-//! the player is always the same height on the screen's side of things: shadows, the near plane and
-//! the haze are made for a person, and hold at every size.
+//! `cargo run --release -p plateau-play [-- area.wasm] [--seed N] [--save file.plateau] [--element elem.wasm ...] [--tour folder [--behind]]`;
+//! the walled garden (`areas/modules/garden.wasm`) unless another module is given.
 
 mod chunks;
 mod figure;
 mod flags;
+mod place;
 mod scene;
 mod sculpt;
 mod surface;
@@ -31,17 +19,20 @@ use std::time::{Duration, Instant};
 
 use bevy::asset::embedded_asset;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::{CascadeShadowConfigBuilder, GlobalAmbientLight};
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
-use chunks::Chunks;
+use chunks::{Chunks, Invalidate};
+use place::{ElementGhost, PlaceMode, PreviewAssets, WorldAction};
 use plateau_engine::body::{self, Body, Intent};
-use plateau_engine::edit::{EditLog, Edited, Op, WorldSave, surface_normal};
-use plateau_engine::scene::{Combined, SceneWorld};
-use plateau_engine::{Command, Compiled, Limits, PlayerState, Region, SIZES, START, Scene, Wasm, rings};
+use plateau_engine::compose::{Composed, ComposedLog, ElementRuntime, PlacedElement, PlacementTransform};
+use plateau_engine::edit::{Edit, EditLog, Op, WorldSave, surface_normal};
+use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld};
+use plateau_engine::{Command, Compiled, ElementBounds, Limits, PlayerState, Region, SIZES, START, Scene, Wasm, rings};
 use scene::SceneVisuals;
 use sculpt::{BrushGhost, Sculpt};
 use surface::{Materials, SurfaceMaterial};
@@ -52,10 +43,7 @@ const HZ: f32 = 120.0;
 const DRAWN_AS: f32 = 1.7;
 /// How far ahead, in seconds, the chunks where the player is going are made.
 const AHEAD: f32 = 0.75;
-/// Seen from behind: the camera turns about a point this far above the eye (over the head, so the
-/// figure is below the middle of the view; lower where the area is just over the head), this far
-/// behind it at most, and no nearer to what is in the way than `MARGIN`; in the renderer's units,
-/// a person's metres.
+/// Seen from behind: camera pivot & arm length in person-scaled renderer units.
 const PIVOT: f32 = 0.35;
 const BEHIND: f32 = 3.4;
 const MARGIN: f32 = 0.25;
@@ -65,27 +53,30 @@ fn main() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut args = std::env::args().skip(1);
     let (mut module, mut seed, mut tour, mut behind, mut save_arg) = (here.join("areas/modules/garden.wasm"), 7u64, None, false, None);
+    let mut extra_elements: Vec<PathBuf> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
             "--tour" => tour = Some(PathBuf::from(args.next().expect("--tour takes a folder"))),
             "--behind" => behind = true,
             "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
+            "--element" => extra_elements.push(PathBuf::from(args.next().expect("--element takes a .wasm path"))),
             _ => module = PathBuf::from(arg),
         }
     }
     let bytes = std::fs::read(&module).unwrap_or_else(|e| panic!("{}: {e} (areas/build.sh builds the areas)", module.display()));
     let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", module.display())));
-    let initial_edits = match &save_arg {
+    let (initial_edits, initial_elements) = match &save_arg {
         Some(path) if path.exists() => {
             let loaded = WorldSave::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             if loaded.seed != seed {
                 eprintln!("note: save {} uses seed {} (overriding --seed {seed})", path.display(), loaded.seed);
                 seed = loaded.seed;
             }
-            Arc::new(EditLog::from_edits(loaded.edits).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+            let log = Arc::new(EditLog::from_edits(loaded.edits).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
+            (log, loaded.elements)
         }
-        _ => Arc::new(EditLog::new()),
+        _ => (Arc::new(EditLog::new()), Vec::new()),
     };
     let stem = module
         .parent()
@@ -96,10 +87,27 @@ fn main() {
         .unwrap_or("area");
     let save_path = save_arg.unwrap_or_else(|| here.join("target/saves").join(format!("{stem}-seed{seed}.plateau")));
 
-    let mut physics = Edited::new(compiled.instantiate(seed).expect("the area made"), initial_edits.clone());
+    let mut place_mode = PlaceMode::new(here.clone(), extra_elements, initial_elements);
+    let initial_composed = place_mode.build_composed(initial_edits.clone());
+    let mut physics = Composed::new(compiled.instantiate(seed).expect("the area made"), initial_composed.clone());
     let described = physics.describe().expect("the area described");
     let initial_scene = physics.scene().expect("the area's scene");
-    let world = SceneWorld::from_scene(&initial_scene);
+    let mut world = SceneWorld::from_scene(&initial_scene);
+
+    // Spawn any placed elements loaded from the save file into SceneWorld & ElementRuntime.
+    let mut element_runtime = ElementRuntime::new();
+    let mut initial_element_scenes: Vec<(u32, Scene, bool)> = Vec::new();
+    let loaded_list = place_mode.placed.clone();
+    for pl in &loaded_list {
+        match place_mode.catalog.get_or_load(&pl.module) {
+            Ok(el) => match element_runtime.spawn(pl.clone(), &el, &mut world) {
+                Ok(world_sc) => initial_element_scenes.push((pl.id, world_sc, pl.is_promoted())),
+                Err(e) => eprintln!("could not instantiate saved element {} ({}): {e}", pl.id, pl.module),
+            },
+            Err(e) => eprintln!("could not load saved element {} ({}): {e}", pl.id, pl.module),
+        }
+    }
+
     let flags: Vec<_> = {
         let mut combined = Combined { region: &mut physics, world: &world };
         described
@@ -129,8 +137,11 @@ fn main() {
             places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect(),
             flags,
             initial_scene: Some(initial_scene),
+            initial_element_scenes,
+            initial_composed: Some(initial_composed),
         })
         .insert_resource(Sculpt::new(initial_edits, save_path, described.name.clone(), seed))
+        .insert_resource(place_mode)
         .insert_resource(LiveScene { world, elapsed: 0.0, interact_pressed: false, holding_use: false })
         .insert_resource(Player {
             body,
@@ -147,8 +158,9 @@ fn main() {
         })
         .insert_resource(figure::Gait::default())
         .insert_non_send(Physics(physics))
+        .insert_non_send(Elements(element_runtime))
         .add_systems(Startup, setup)
-        .add_systems(Update, (look_and_ask, step, frame, draw, sculpt::place_ghost, figure::animate, flags::place, hud).chain());
+        .add_systems(Update, (look_and_ask, step, frame, draw, sculpt::place_ghost, place::place_ghost, figure::animate, flags::place, hud).chain());
     if let Some(folder) = tour {
         std::fs::create_dir_all(&folder).expect("the tour's folder");
         app.insert_resource(Tour::new(folder)).add_systems(Update, go_on_tour.before(step));
@@ -168,6 +180,10 @@ struct Area {
     flags: Vec<(plateau_engine::Size, [f64; 3])>,
     /// Initial procedural scene payload, taken once in `setup` to upload GPU meshes.
     initial_scene: Option<Scene>,
+    /// Initial placed element scenes loaded from `--save`, taken once in `setup` (`(id, scene, skip_solid)`).
+    initial_element_scenes: Vec<(u32, Scene, bool)>,
+    /// Initial composed SDF snapshot, taken once in `setup` to seed `Chunks`.
+    initial_composed: Option<Arc<ComposedLog>>,
 }
 
 /// Live procedural scene state, dynamic solid collision, lights, and interaction edge state.
@@ -179,31 +195,24 @@ struct LiveScene {
     holding_use: bool,
 }
 
-/// The instance the player's body is moved through (base WASM area wrapped with live SDF edits).
-struct Physics(Edited<Wasm, Arc<EditLog>>);
+/// The instance the player's body is moved through (base WASM area + live SDF edits + placed SDF elements).
+struct Physics(Composed<Wasm, Arc<ComposedLog>>);
+
+/// Live per-placement sandboxed Wasmtime instances for runtime `tick` / `interact`.
+struct Elements(ElementRuntime);
 
 #[derive(Resource)]
 struct Player {
     body: Body,
     pitch: f32,
-    /// Where the eye is drawn from: the body's, its height eased, so a step up is not a jump.
     eye: Option<[f64; 3]>,
-    /// The point kept in view while growing or shrinking.
     focus: Option<[f64; 3]>,
-    /// Something to tell the player, and until when.
     said: Option<(String, Instant)>,
     intent: Intent,
-    /// Time not yet stepped.
     owed: f32,
-    /// Seen from behind, not through the eyes.
     third: bool,
-    /// How far behind the camera is, in the renderer's units: `BEHIND`, or nearer where something
-    /// is in the way.
     back: f32,
-    /// How far above the eye the camera turns about, in the renderer's units: `PIVOT`, or lower
-    /// where a roof is just over the head, so the camera is never in it.
     lift: f32,
-    /// The flags over the places shown.
     flags: bool,
 }
 
@@ -232,19 +241,23 @@ fn setup(
     mut commands: Commands,
     mut area: ResMut<Area>,
     live: Res<LiveScene>,
-    sculpt: Res<Sculpt>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
 ) {
     let surface = Materials::new(&mut surface_materials);
     let initial = area.initial_scene.take().unwrap_or_default();
-    let visuals = scene::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &initial, &live.world);
+    let mut visuals = scene::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &initial, &live.world);
+    for (owner, elem_scene, skip_solid) in area.initial_element_scenes.drain(..) {
+        scene::spawn_layer_filtered(&mut commands, &mut meshes, &mut visuals, owner, &elem_scene, &live.world, skip_solid);
+    }
     commands.insert_resource(visuals);
-    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, sculpt.edits.clone(), surface));
+    let composed = area.initial_composed.take().unwrap_or_else(|| Arc::new(ComposedLog::empty()));
+    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, composed, surface));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
     flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
     sculpt::spawn_ghost(&mut commands, &mut meshes, &mut materials);
+    place::spawn_ghost(&mut commands, &mut meshes, &mut materials);
     let sun = Vec3::new(0.48, 0.70, 0.53).normalize();
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
@@ -261,7 +274,10 @@ fn setup(
     let text = |size: f32| TextFont { font_size: bevy::text::FontSize::Px(size), ..default() };
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
-        Text::new("W A S D walk  /  Shift run  /  Space jump  /  F interact  /  B sculpt (LMB add, RMB/X dig, Tab shape, R mat, Wheel size, Z/Y undo, Ctrl+S save)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit  /  V view  /  M flags  /  F12 shot  /  mouse look (click; Esc frees)"),
+        Text::new(
+            "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  B sculpt  /  P place element (LMB place, RMB/X remove, Tab next, R/T rotate, Wheel scale, Ctrl+R rescan)\n\
+             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  C sit  /  V view  /  M flags  /  F12 shot",
+        ),
         text(14.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         Node { position_type: PositionType::Absolute, bottom: px(10.0), left: px(12.0), ..default() },
@@ -287,7 +303,180 @@ fn sizes() -> [f32; 3] {
     SIZES.map(|(_, h)| h)
 }
 
-/// The mouse turns the view; the keys say where to go, and change size, sit, sculpt, or interact.
+/// Bundled resources for world editing (`B` sculpt & `P` place element) to keep Bevy's system
+/// parameter count compact.
+#[derive(SystemParam)]
+struct EditCtx<'w, 's> {
+    commands: Commands<'w, 's>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    visuals: ResMut<'w, SceneVisuals>,
+    preview: ResMut<'w, PreviewAssets>,
+    sculpt: ResMut<'w, Sculpt>,
+    place: ResMut<'w, PlaceMode>,
+    chunks: ResMut<'w, Chunks>,
+    live: ResMut<'w, LiveScene>,
+    physics: NonSendMut<'w, Physics>,
+    elements: NonSendMut<'w, Elements>,
+}
+
+impl EditCtx<'_, '_> {
+    fn commit_composed(&mut self, inv: Invalidate<'_>) {
+        let composed = self.place.build_composed(self.sculpt.edits.clone());
+        self.physics.0.log = composed.clone();
+        self.physics.0.prune_instances();
+        self.chunks.set_composed(composed, inv);
+    }
+
+    fn spawn_placed(&mut self, pl: PlacedElement, player: &mut Player) -> plateau_engine::Result<String> {
+        let compiled = self.place.catalog.get_or_load(&pl.module)?;
+        let name = compiled.name.clone();
+        let world_scene = self.elements.0.spawn(pl.clone(), &compiled, &mut self.live.world)?;
+        scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, pl.id, &world_scene, &self.live.world, pl.is_promoted());
+        self.place.placed.push(pl.clone());
+        self.sculpt.dirty = true;
+        let sdf_bounds = if let Some(bounds) = compiled.sdf_bounds {
+            Some(bounds)
+        } else if pl.is_promoted() {
+            self.place.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed)?.map(|m| m.bounds())
+        } else {
+            None
+        };
+        if let Some(bounds) = sdf_bounds {
+            self.commit_composed(Invalidate::SdfElement(pl.transform(), bounds));
+            let (_, hi) = pl.transform().world_influence_bounds(bounds);
+            let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
+            let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
+            let _ = player.body.surface_from_solid(&mut combined, max_lift);
+        } else {
+            let max_lift = (pl.scale * 3.0) as f64 + player.body.size as f64;
+            let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
+            let _ = player.body.surface_from_solid(&mut combined, max_lift);
+        }
+        Ok(name)
+    }
+
+    fn remove_placed(&mut self, id: u32) -> Option<PlacedElement> {
+        let idx = self.place.placed.iter().position(|e| e.id == id)?;
+        let removed = self.place.placed.remove(idx);
+        let sdf_bounds = self.place.sdf_bounds_of(&removed);
+        self.elements.0.remove(id, &mut self.live.world);
+        scene::despawn_layer(&mut self.commands, &mut self.visuals, id);
+        self.sculpt.dirty = true;
+        if let Some(bounds) = sdf_bounds {
+            self.commit_composed(Invalidate::SdfElement(removed.transform(), bounds));
+        }
+        Some(removed)
+    }
+
+    /// Lazily promotes any solid `Scene` placed elements overlapping `edit` (or `aimed_owner`)
+    /// into carvable `MeshSdf`s right before `edit` is applied at chronological index `edit_idx`.
+    /// Returns `(promoted_ids_with_idx, invalidated_bounds, promoted_names)`.
+    fn promote_overlapping_scene_elements(
+        &mut self,
+        edit: &Edit,
+        aimed_owner: Option<u32>,
+        edit_idx: usize,
+    ) -> (Vec<(u32, usize)>, Vec<(PlacementTransform, ElementBounds)>, Vec<String>) {
+        let (elo, ehi) = edit.influence_bounds();
+        let mut candidates = self.live.world.solid_placed_overlapping(elo, ehi);
+        if let Some(owner) = aimed_owner
+            && !candidates.contains(&owner)
+        {
+            candidates.push(owner);
+        }
+        let mut promoted = Vec::new();
+        let mut bounds_list = Vec::new();
+        let mut names = Vec::new();
+        for id in candidates {
+            let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else { continue };
+            if self.place.placed[pos].is_promoted() {
+                continue;
+            }
+            let module = self.place.placed[pos].module.clone();
+            let seed = self.place.placed[pos].seed;
+            let Ok(compiled) = self.place.catalog.get_or_load(&module) else { continue };
+            if compiled.is_sdf() {
+                continue;
+            }
+            let Ok(Some(mesh_sdf)) = self.place.catalog.get_or_build_mesh_sdf(&module, seed) else { continue };
+            self.place.placed[pos].promoted = Some(edit_idx);
+            let tf = self.place.placed[pos].transform();
+            if let Some(world_scene) = self.elements.0.set_promoted(id, Some(edit_idx), &mut self.live.world) {
+                scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, id, &world_scene, &self.live.world, true);
+            }
+            promoted.push((id, edit_idx));
+            bounds_list.push((tf, mesh_sdf.bounds()));
+            names.push(compiled.name.clone());
+        }
+        (promoted, bounds_list, names)
+    }
+
+    /// Sets promotion state on a list of placed elements (for undo/redo), returning their world
+    /// bounds for targeted chunk invalidation.
+    fn set_elements_promoted(&mut self, ids: &[(u32, Option<usize>)]) -> Vec<(PlacementTransform, ElementBounds)> {
+        let mut bounds_list = Vec::new();
+        for &(id, next_state) in ids {
+            let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else { continue };
+            let module = self.place.placed[pos].module.clone();
+            let seed = self.place.placed[pos].seed;
+            let tf = self.place.placed[pos].transform();
+            if let Ok(Some(mesh_sdf)) = self.place.catalog.get_or_build_mesh_sdf(&module, seed) {
+                bounds_list.push((tf, mesh_sdf.bounds()));
+            }
+            self.place.placed[pos].promoted = next_state;
+            if let Some(world_scene) = self.elements.0.set_promoted(id, next_state, &mut self.live.world) {
+                scene::spawn_layer_filtered(
+                    &mut self.commands,
+                    &mut self.meshes,
+                    &mut self.visuals,
+                    id,
+                    &world_scene,
+                    &self.live.world,
+                    next_state.is_some(),
+                );
+            }
+        }
+        bounds_list
+    }
+
+    fn reload_world(&mut self) -> plateau_engine::Result<(usize, usize)> {
+        let saved = self.sculpt.load_world()?;
+        let edit_count = saved.edits.len();
+        self.sculpt.replace_edits(saved.edits)?;
+        self.elements.0.clear(&mut self.live.world);
+        scene::despawn_placed_layers(&mut self.commands, &mut self.visuals);
+        self.place.placed.clear();
+        self.place.undo_stack.clear();
+        self.place.redo_stack.clear();
+        let mut elem_count = 0usize;
+        for pl in saved.elements {
+            match self.place.catalog.get_or_load(&pl.module) {
+                Ok(compiled) => match self.elements.0.spawn(pl.clone(), &compiled, &mut self.live.world) {
+                    Ok(world_scene) => {
+                        scene::spawn_layer_filtered(
+                            &mut self.commands,
+                            &mut self.meshes,
+                            &mut self.visuals,
+                            pl.id,
+                            &world_scene,
+                            &self.live.world,
+                            pl.is_promoted(),
+                        );
+                        self.place.next_id = self.place.next_id.max(pl.id + 1);
+                        self.place.placed.push(pl);
+                        elem_count += 1;
+                    }
+                    Err(e) => eprintln!("reload element {} error: {e}", pl.id),
+                },
+                Err(e) => eprintln!("reload element {} load error: {e}", pl.module),
+            }
+        }
+        self.commit_composed(Invalidate::All);
+        Ok((edit_count, elem_count))
+    }
+}
+
+/// The mouse turns the view; the keys say where to go, and change size, sit, sculpt, place, or interact.
 #[allow(clippy::too_many_arguments)]
 fn look_and_ask(
     time: Res<Time>,
@@ -298,10 +487,7 @@ fn look_and_ask(
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     tour: Option<Res<Tour>>,
     mut player: ResMut<Player>,
-    mut live: ResMut<LiveScene>,
-    mut sculpt: ResMut<Sculpt>,
-    mut chunks: ResMut<Chunks>,
-    mut physics: NonSendMut<Physics>,
+    mut ctx: EditCtx,
 ) {
     if tour.is_some() {
         return;
@@ -319,65 +505,95 @@ fn look_and_ask(
         run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
         jump: keys.pressed(KeyCode::Space),
     };
+
     if keys.just_pressed(KeyCode::KeyB) {
-        sculpt.active = !sculpt.active;
-        sculpt.hold_timer = 0.0;
-        sculpt.last_stamp = None;
-        if sculpt.active {
-            player.say(format!("sculpt mode: {} / {}", sculpt.preset.name(), sculpt.material().name()));
+        ctx.sculpt.active = !ctx.sculpt.active;
+        ctx.sculpt.hold_timer = 0.0;
+        ctx.sculpt.last_stamp = None;
+        if ctx.sculpt.active {
+            ctx.place.active = false;
+            ctx.place.aim = None;
+            player.say(format!("sculpt mode: {} / {}", ctx.sculpt.preset.name(), ctx.sculpt.material().name()));
         } else {
-            sculpt.aim = None;
+            ctx.sculpt.aim = None;
             player.say("sculpt mode off");
         }
     }
-    if keys.just_pressed(KeyCode::KeyF) || (!sculpt.active && buttons.just_pressed(MouseButton::Right)) {
-        live.interact_pressed = true;
-    }
-    live.holding_use = keys.pressed(KeyCode::KeyF) || (!sculpt.active && buttons.pressed(MouseButton::Right));
 
-    // Sculpting controls (scale-stamped SDF edits, undo/redo, save/reload).
-    if sculpt.active {
-        if keys.just_pressed(KeyCode::Tab) {
-            sculpt.preset = sculpt.preset.next();
-            player.say(format!("brush: {}", sculpt.preset.name()));
+    if keys.just_pressed(KeyCode::KeyP) {
+        ctx.place.active = !ctx.place.active;
+        if ctx.place.active {
+            ctx.sculpt.active = false;
+            ctx.sculpt.aim = None;
+            if let Some(el) = ctx.place.current() {
+                let kind = if el.is_sdf() { "SDF" } else { "Scene" };
+                player.say(format!("place mode: {} [{kind}]", el.name));
+            } else {
+                player.say("place mode: no .wasm elements found (run ./elements/build.sh)");
+            }
+        } else {
+            ctx.place.aim = None;
+            player.say("place mode off");
         }
-        if keys.just_pressed(KeyCode::KeyR) {
-            sculpt.next_material();
-            player.say(format!("material: {}", sculpt.material().name()));
+    }
+
+    if ctrl && keys.just_pressed(KeyCode::KeyR) {
+        let n = ctx.place.rescan();
+        place::clear_preview_cache(&mut ctx.preview);
+        player.say(format!("rescanned elements: {n} available"));
+    }
+
+    let tool_active = ctx.sculpt.active || ctx.place.active;
+    if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
+        ctx.live.interact_pressed = true;
+    }
+    ctx.live.holding_use = keys.pressed(KeyCode::KeyF) || (!tool_active && buttons.pressed(MouseButton::Right));
+
+    // Helper closure for camera-pivot raycast collinear with the `+` crosshair.
+    let eye = player.eye.unwrap_or(player.body.eye());
+    let dir = player.looking().to_array();
+    let psize = player.body.size;
+    let pivot = if player.third {
+        let per = (psize / DRAWN_AS) as f64;
+        [eye[0], eye[1] + player.lift as f64 * per, eye[2]]
+    } else {
+        eye
+    };
+
+    // Sculpting controls (Step 8a: scale-stamped SDF edits).
+    if ctx.sculpt.active {
+        if keys.just_pressed(KeyCode::Tab) {
+            ctx.sculpt.preset = ctx.sculpt.preset.next();
+            player.say(format!("brush: {}", ctx.sculpt.preset.name()));
+        }
+        if !ctrl && keys.just_pressed(KeyCode::KeyR) {
+            ctx.sculpt.next_material();
+            player.say(format!("material: {}", ctx.sculpt.material().name()));
         }
         if scroll.delta.y > 0.0 || keys.just_pressed(KeyCode::BracketRight) {
-            sculpt.adjust_radius(1.18);
+            ctx.sculpt.adjust_radius(1.18);
         } else if scroll.delta.y < 0.0 || keys.just_pressed(KeyCode::BracketLeft) {
-            sculpt.adjust_radius(1.0 / 1.18);
+            ctx.sculpt.adjust_radius(1.0 / 1.18);
         }
-        // Cast ray from the camera pivot along the look direction (collinear with the `+` crosshair
-        // in both first- and third-person views) against the edited SDF.
-        let eye = player.eye.unwrap_or(player.body.eye());
-        let dir = player.looking().to_array();
-        let psize = player.body.size;
-        let pivot = if player.third {
-            let per = (psize / DRAWN_AS) as f64;
-            [eye[0], eye[1] + player.lift as f64 * per, eye[2]]
-        } else {
-            eye
-        };
         let reach = psize * 40.0;
-        let hit = body::look(&mut physics.0, pivot, dir, psize, reach).ok().flatten();
-        sculpt.aim = hit.map(|h| {
-            let n = surface_normal(&mut physics.0, h, psize).unwrap_or([0.0, 1.0, 0.0]);
-            (h, n)
-        });
+        let (hit, normal) = {
+            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+            let hit = body::look(&mut combined, pivot, dir, psize, reach).ok().flatten();
+            let normal = hit.map(|h| surface_normal(&mut combined, h, psize).unwrap_or([0.0, 1.0, 0.0]));
+            (hit, normal)
+        };
+        ctx.sculpt.aim = hit.zip(normal);
         let add_just = buttons.just_pressed(MouseButton::Left);
         let carve_just = buttons.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::KeyX);
         let add_held = buttons.pressed(MouseButton::Left);
         let carve_held = buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::KeyX);
         if !add_held && !carve_held {
-            sculpt.hold_timer = 0.0;
-            sculpt.last_stamp = None;
+            ctx.sculpt.hold_timer = 0.0;
+            ctx.sculpt.last_stamp = None;
         } else {
-            sculpt.hold_timer = (sculpt.hold_timer - time.delta_secs()).max(0.0);
+            ctx.sculpt.hold_timer = (ctx.sculpt.hold_timer - time.delta_secs()).max(0.0);
         }
-        if grabbed && let Some((h, n)) = sculpt.aim {
+        if grabbed && let Some((h, n)) = ctx.sculpt.aim {
             let click_op = if add_just {
                 Some(Op::Add)
             } else if carve_just {
@@ -385,7 +601,7 @@ fn look_and_ask(
             } else {
                 None
             };
-            let hold_op = if click_op.is_none() && sculpt.hold_timer <= 0.0 {
+            let hold_op = if click_op.is_none() && ctx.sculpt.hold_timer <= 0.0 {
                 if add_held {
                     Some(Op::Add)
                 } else if carve_held {
@@ -397,25 +613,49 @@ fn look_and_ask(
                 None
             };
             if let Some(op) = click_op.or(hold_op) {
-                let edit = sculpt.make_edit(op, psize, h, n);
+                let edit = ctx.sculpt.make_edit(op, psize, h, n);
                 let spacing_ok = click_op.is_some()
-                    || sculpt.last_stamp.is_none_or(|prev| {
+                    || ctx.sculpt.last_stamp.is_none_or(|prev| {
                         let d2 = (0..3).map(|a| (edit.center[a] - prev[a]).powi(2)).sum::<f32>();
-                        let min_step = sculpt.radius(psize) * 0.45;
+                        let min_step = ctx.sculpt.radius(psize) * 0.45;
                         d2 >= min_step * min_step
                     });
                 if spacing_ok {
-                    match sculpt.push_edit(edit, &mut chunks) {
+                    // Lazy Scene → SDF conversion: if this sculpt touches any unpromoted solid
+                    // placed `Scene` element (tree, bridge, etc.), promote its solid mesh to SDF
+                    // right before this edit so carving/adding cuts into it seamlessly!
+                    let edit_idx = ctx.sculpt.edits.len();
+                    let aimed_solid = ctx
+                        .live
+                        .world
+                        .raycast_solid_placed(pivot.map(|c| c as f32), dir, reach)
+                        .and_then(|(owner, t)| {
+                            let hit_dist = ((h[0] - pivot[0]).powi(2) + (h[1] - pivot[1]).powi(2) + (h[2] - pivot[2]).powi(2)).sqrt() as f32;
+                            if (t - hit_dist).abs() <= ctx.sculpt.radius(psize) * 2.0 + psize * 0.5 {
+                                Some(owner)
+                            } else {
+                                None
+                            }
+                        });
+                    let (promoted_ids, promo_bounds, promo_names) = ctx.promote_overlapping_scene_elements(&edit, aimed_solid, edit_idx);
+                    match ctx.sculpt.push_edit(edit) {
                         Ok(()) => {
-                            physics.0.edits = sculpt.edits.clone();
+                            ctx.place.undo_stack.push(WorldAction::SdfEdit { edit, promoted_ids });
+                            ctx.place.redo_stack.clear();
+                            if promo_bounds.is_empty() {
+                                ctx.commit_composed(Invalidate::Edit(&edit));
+                            } else {
+                                ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
+                                player.say(format!("{} converted to carvable solid", promo_names.join(", ")));
+                            }
                             if edit.op == Op::Add {
                                 let (_, hi) = edit.influence_bounds();
                                 let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
-                                let mut combined = Combined { region: &mut physics.0, world: &live.world };
+                                let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
                                 let _ = player.body.surface_from_solid(&mut combined, max_lift);
                             }
-                            sculpt.last_stamp = Some(edit.center);
-                            sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
+                            ctx.sculpt.last_stamp = Some(edit.center);
+                            ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
                         }
                         Err(e) => player.say(format!("sculpt error: {e}")),
                     }
@@ -423,32 +663,170 @@ fn look_and_ask(
             }
         }
     }
-    if (sculpt.active && keys.just_pressed(KeyCode::KeyZ)) || (ctrl && keys.just_pressed(KeyCode::KeyZ)) {
-        if sculpt.undo(&mut chunks).is_some() {
-            physics.0.edits = sculpt.edits.clone();
-            player.say(format!("undo ({} edits)", sculpt.edits.len()));
+
+    // Place Element controls (Step 8b: standalone composable .wasm elements).
+    if ctx.place.active {
+        if keys.just_pressed(KeyCode::Tab) {
+            ctx.place.next_element();
+            if let Some(el) = ctx.place.current() {
+                let kind = if el.is_sdf() { "SDF" } else { "Scene" };
+                player.say(format!("element: {} [{kind}]", el.name));
+            }
+        }
+        if !ctrl && keys.just_pressed(KeyCode::KeyR) {
+            ctx.place.yaw -= std::f32::consts::FRAC_PI_6 * 0.5; // -15 deg
+        }
+        if keys.just_pressed(KeyCode::KeyT) {
+            ctx.place.yaw += std::f32::consts::FRAC_PI_6 * 0.5; // +15 deg
+        }
+        if scroll.delta.y > 0.0 || keys.just_pressed(KeyCode::BracketRight) {
+            ctx.place.adjust_scale(1.15);
+        } else if scroll.delta.y < 0.0 || keys.just_pressed(KeyCode::BracketLeft) {
+            ctx.place.adjust_scale(1.0 / 1.15);
+        }
+        let reach = psize * 45.0;
+        let hit = {
+            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+            body::look(&mut combined, pivot, dir, psize, reach).ok().flatten()
+        };
+        ctx.place.aim = hit.map(|h| {
+            let n = surface_normal(&mut ctx.physics.0, h, psize).unwrap_or([0.0, 1.0, 0.0]);
+            (h, n)
+        });
+
+        if grabbed && buttons.just_pressed(MouseButton::Left)
+            && let (Some(elem), Some((h, _))) = (ctx.place.current().cloned(), ctx.place.aim)
+        {
+            let id = ctx.place.alloc_id();
+            let scale = ctx.place.placement_scale(psize);
+            let pl = PlacedElement {
+                id,
+                module: elem.module.clone(),
+                seed: ctx.sculpt.seed.wrapping_mul(31).wrapping_add(id as u64),
+                pos: [h[0] as f32, h[1] as f32, h[2] as f32],
+                yaw: ctx.place.yaw,
+                scale,
+                stamp_size: psize,
+                after_edits: ctx.sculpt.edits.len(),
+                promoted: None,
+            };
+            match ctx.spawn_placed(pl.clone(), &mut player) {
+                Ok(name) => {
+                    ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
+                    ctx.place.redo_stack.clear();
+                    player.say(format!("placed {name} ({scale:.2}x)"));
+                }
+                Err(e) => player.say(format!("place error: {e}")),
+            }
+        }
+
+        if grabbed && (buttons.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::KeyX)) {
+            let piv32 = pivot.map(|c| c as f32);
+            let scene_hit = ctx.live.world.raycast_placed_owner(piv32, dir, reach);
+            let sdf_hit = ctx.place.raycast_placed_sdf(piv32, dir, reach);
+            let target_id = match (scene_hit, sdf_hit) {
+                (Some((a, ta)), Some((b, tb))) => Some(if ta <= tb { a } else { b }),
+                (Some((a, _)), None) => Some(a),
+                (None, Some((b, _))) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(id) = target_id {
+                if let Some(removed) = ctx.remove_placed(id) {
+                    ctx.place.undo_stack.push(WorldAction::RemoveElement(removed));
+                    ctx.place.redo_stack.clear();
+                    player.say(format!("removed element #{id}"));
+                }
+            } else {
+                player.say("aim at a placed element to remove it");
+            }
+        }
+    }
+
+    // Unified Undo / Redo across sculpt edits, lazy promotions, and placed elements.
+    if (tool_active && keys.just_pressed(KeyCode::KeyZ)) || (ctrl && keys.just_pressed(KeyCode::KeyZ)) {
+        if let Some(action) = ctx.place.undo_stack.pop() {
+            match action.clone() {
+                WorldAction::SdfEdit { edit, promoted_ids } => {
+                    if ctx.sculpt.pop_edit().is_some() {
+                        let demote: Vec<_> = promoted_ids.iter().map(|&(id, _)| (id, None)).collect();
+                        let promo_bounds = ctx.set_elements_promoted(&demote);
+                        if promo_bounds.is_empty() {
+                            ctx.commit_composed(Invalidate::Edit(&edit));
+                        } else {
+                            ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
+                        }
+                        ctx.place.redo_stack.push(action);
+                        player.say(format!("undo sculpt ({} edits)", ctx.sculpt.edits.len()));
+                    }
+                }
+                WorldAction::PlaceElement(pl) => {
+                    if ctx.remove_placed(pl.id).is_some() {
+                        ctx.place.redo_stack.push(action);
+                        player.say(format!("undo place ({} elements)", ctx.place.placed.len()));
+                    }
+                }
+                WorldAction::RemoveElement(pl) => {
+                    if ctx.spawn_placed(pl, &mut player).is_ok() {
+                        ctx.place.redo_stack.push(action);
+                        player.say(format!("restored element ({} elements)", ctx.place.placed.len()));
+                    }
+                }
+            }
         } else {
             player.say("nothing to undo");
         }
     }
-    if (sculpt.active && keys.just_pressed(KeyCode::KeyY)) || (ctrl && keys.just_pressed(KeyCode::KeyY)) {
-        if let Some(edit) = sculpt.redo(&mut chunks) {
-            physics.0.edits = sculpt.edits.clone();
-            if edit.op == Op::Add {
-                let (_, hi) = edit.influence_bounds();
-                let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
-                let mut combined = Combined { region: &mut physics.0, world: &live.world };
-                let _ = player.body.surface_from_solid(&mut combined, max_lift);
+
+    if (tool_active && keys.just_pressed(KeyCode::KeyY)) || (ctrl && keys.just_pressed(KeyCode::KeyY)) {
+        if let Some(action) = ctx.place.redo_stack.pop() {
+            match action.clone() {
+                WorldAction::SdfEdit { edit, promoted_ids } => {
+                    let repromote: Vec<_> = promoted_ids.iter().map(|&(id, idx)| (id, Some(idx))).collect();
+                    let promo_bounds = ctx.set_elements_promoted(&repromote);
+                    if ctx.sculpt.push_edit(edit).is_ok() {
+                        if promo_bounds.is_empty() {
+                            ctx.commit_composed(Invalidate::Edit(&edit));
+                        } else {
+                            ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
+                        }
+                        if edit.op == Op::Add {
+                            let (_, hi) = edit.influence_bounds();
+                            let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
+                            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                            let _ = player.body.surface_from_solid(&mut combined, max_lift);
+                        }
+                        ctx.place.undo_stack.push(action);
+                        player.say(format!("redo sculpt ({} edits)", ctx.sculpt.edits.len()));
+                    }
+                }
+                WorldAction::PlaceElement(pl) => {
+                    if ctx.spawn_placed(pl, &mut player).is_ok() {
+                        ctx.place.undo_stack.push(action);
+                        player.say(format!("redo place ({} elements)", ctx.place.placed.len()));
+                    }
+                }
+                WorldAction::RemoveElement(pl) => {
+                    if ctx.remove_placed(pl.id).is_some() {
+                        ctx.place.undo_stack.push(action);
+                        player.say(format!("redo remove ({} elements)", ctx.place.placed.len()));
+                    }
+                }
             }
-            player.say(format!("redo ({} edits)", sculpt.edits.len()));
         } else {
             player.say("nothing to redo");
         }
     }
+
+    // Save / Reload complete world (base area + seed + SDF edits + placed elements).
     if keys.just_pressed(KeyCode::F5) || (ctrl && keys.just_pressed(KeyCode::KeyS)) {
-        match sculpt.save() {
+        match ctx.sculpt.save_world(&ctx.place.placed) {
             Ok(()) => {
-                let msg = format!("saved {} edits to {}", sculpt.edits.len(), sculpt.save_path.display());
+                let msg = format!(
+                    "saved {} edits & {} elements to {}",
+                    ctx.sculpt.edits.len(),
+                    ctx.place.placed.len(),
+                    ctx.sculpt.save_path.display()
+                );
                 println!("{msg}");
                 player.say(msg);
             }
@@ -460,10 +838,9 @@ fn look_and_ask(
         }
     }
     if keys.just_pressed(KeyCode::F9) || (ctrl && keys.just_pressed(KeyCode::KeyL)) {
-        match sculpt.reload(&mut chunks) {
-            Ok(n) => {
-                physics.0.edits = sculpt.edits.clone();
-                let msg = format!("reloaded {n} edits from {}", sculpt.save_path.display());
+        match ctx.reload_world() {
+            Ok((edits_n, elems_n)) => {
+                let msg = format!("reloaded {edits_n} edits & {elems_n} elements from {}", ctx.sculpt.save_path.display());
                 println!("{msg}");
                 player.say(msg);
             }
@@ -491,7 +868,7 @@ fn look_and_ask(
         None
     };
     if let Some(to) = to {
-        let mut combined = Combined { region: &mut physics.0, world: &live.world };
+        let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
         change_size(&mut player, &mut combined, to);
     }
     if keys.just_pressed(KeyCode::KeyV) {
@@ -506,7 +883,7 @@ fn look_and_ask(
             player.body.feet = stood;
             player.body.seat = None;
         } else {
-            let mut combined = Combined { region: &mut physics.0, world: &live.world };
+            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
             if !player.body.sit(&mut combined).expect("the area asked") {
                 player.say("nothing to sit on here");
             }
@@ -525,11 +902,7 @@ fn change_size(player: &mut Player, area: &mut dyn Region, to: f32) {
     player.body.grow_to(to);
 }
 
-fn apply_commands(world: &mut SceneWorld, player: &mut Player, cmds: &[Command]) {
-    if cmds.is_empty() {
-        return;
-    }
-    let applied = world.apply(cmds);
+fn apply_side_effects(player: &mut Player, applied: &Applied) {
     if applied.impulse != [0.0, 0.0, 0.0] {
         for a in 0..3 {
             player.body.velocity[a] += applied.impulse[a];
@@ -538,22 +911,35 @@ fn apply_commands(world: &mut SceneWorld, player: &mut Player, cmds: &[Command])
             player.body.on = None;
         }
     }
-    if let Some(msg) = applied.said {
-        player.say(msg);
+    if let Some(msg) = &applied.said {
+        player.say(msg.clone());
     }
 }
 
-/// The runtime plugin ticked and the body moved on in steps of the physics.
-fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>, mut physics: NonSendMut<Physics>) {
+fn apply_commands(world: &mut SceneWorld, player: &mut Player, cmds: &[Command]) {
+    if cmds.is_empty() {
+        return;
+    }
+    let applied = world.apply(cmds);
+    apply_side_effects(player, &applied);
+}
+
+/// The runtime plugins (base area + placed elements) ticked and the body moved on in steps.
+fn step(
+    time: Res<Time>,
+    mut player: ResMut<Player>,
+    mut live: ResMut<LiveScene>,
+    mut physics: NonSendMut<Physics>,
+    mut elements: NonSendMut<Elements>,
+) {
     let dt = time.delta_secs().min(0.1);
     live.elapsed += dt;
 
-    // Build snapshot of player state for the sandboxed WASM runtime (`tick` / `interact`).
     let eye64 = player.body.eye();
     let eye32 = eye64.map(|c| c as f32);
     let look_dir = player.looking().to_array();
     let size = player.body.size;
-    let target = live.world.raycast_dynamic(eye32, look_dir, size * 12.0).map_or(0, |(id, _)| id);
+    let (hit_owner, hit_id) = live.world.raycast_dynamic_owned(eye32, look_dir, size * 12.0).map_or((BASE_OWNER, 0), |(o, id, _)| (o, id));
     let aim = {
         let mut combined = Combined { region: &mut physics.0, world: &live.world };
         match body::look(&mut combined, eye64, look_dir, size, size * 30.0) {
@@ -561,7 +947,7 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
             _ => [eye32[0] + look_dir[0] * size * 3.0, eye32[1] + look_dir[1] * size * 3.0, eye32[2] + look_dir[2] * size * 3.0],
         }
     };
-    let ps = PlayerState {
+    let ps_base = PlayerState {
         feet: player.body.feet.map(|c| c as f32),
         eye: eye32,
         look: look_dir,
@@ -569,21 +955,29 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
         size,
         grounded: player.body.on.is_some(),
         holding_use: live.holding_use,
-        target,
+        target: if hit_owner == BASE_OWNER { hit_id } else { 0 },
         aim,
         time: live.elapsed,
     };
 
     if dt > 0.0 {
-        match physics.0.tick(dt, &ps) {
+        match physics.0.tick(dt, &ps_base) {
             Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
             Err(e) => eprintln!("area tick error: {e}"),
         }
+        for eff in elements.0.tick_all(dt, &ps_base, hit_owner, hit_id, &mut live.world) {
+            apply_side_effects(&mut player, &eff);
+        }
     }
     if std::mem::take(&mut live.interact_pressed) {
-        match physics.0.interact(&ps) {
-            Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
-            Err(e) => eprintln!("area interact error: {e}"),
+        if hit_owner == BASE_OWNER {
+            match physics.0.interact(&ps_base) {
+                Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
+                Err(e) => eprintln!("area interact error: {e}"),
+            }
+        }
+        for eff in elements.0.interact(&ps_base, hit_owner, hit_id, &mut live.world) {
+            apply_side_effects(&mut player, &eff);
         }
     }
 
@@ -593,7 +987,6 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
         player.owed -= 1.0 / HZ;
         let mut combined = Combined { region: &mut physics.0, world: &live.world };
         player.body.step(&mut combined, intent, 1.0 / HZ).expect("the area asked");
-        // Growing or shrinking, the point looked at is kept in the middle of the view.
         if player.body.change.is_some() {
             if let Some(f) = player.focus {
                 let e = player.body.eye();
@@ -612,7 +1005,6 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
         player.body.blocked = false;
         player.say("no room to grow here");
     }
-    // The eye's height eased towards the body's, quickly, unless far behind.
     let target = player.body.eye();
     let k = 1.0 - (-25.0 * time.delta_secs() as f64).exp();
     player.eye = Some(match player.eye {
@@ -621,17 +1013,12 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
     });
 }
 
-/// How far behind the camera goes, seen from behind: `BEHIND`, or as near as what is in the way
-/// makes it (a ray from the point it turns about, back along the view, as the player's size sees the
-/// area), at once if nearer, slowly back out.
 fn frame(time: Res<Time>, mut player: ResMut<Player>, live: Res<LiveScene>, mut physics: NonSendMut<Physics>) {
     let want = if player.third { BEHIND } else { 0.0 };
     let size = player.body.size;
-    // Metres of the area to a unit of the renderer.
     let per = (size / DRAWN_AS) as f64;
     let eye = player.eye.unwrap_or(player.body.eye());
     let mut combined = Combined { region: &mut physics.0, world: &live.world };
-    // The point turned about: no nearer to what is over the head than a tenth of a unit.
     let over = match body::look(&mut combined, eye, [0.0, 1.0, 0.0], size, (PIVOT + 0.1) * size / DRAWN_AS).expect("the area asked") {
         Some(hit) => (((hit[1] - eye[1]) / per) as f32 - 0.1).clamp(0.0, PIVOT),
         None => PIVOT,
@@ -654,15 +1041,14 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, live: Res<LiveScene>, mut 
     player.back = if target < player.back { target } else { player.back + (target - player.back) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
 }
 
-/// Where the chunks are drawn, and whether: everything but the camera, the sun, the brush ghost, and the procedural scene.
+/// Where the chunks are drawn, and whether: everything but the camera, sun, ghosts, and procedural scene.
 type Placed<'w, 's> = Query<
     'w,
     's,
     (&'static mut Transform, &'static mut Visibility, Option<&'static mut MeshMaterial3d<SurfaceMaterial>>),
-    (Without<Camera3d>, Without<Sun>, Without<BrushGhost>, Without<scene::SceneNode>),
+    (Without<Camera3d>, Without<Sun>, Without<BrushGhost>, Without<ElementGhost>, Without<scene::SceneNode>),
 >;
 
-/// The chunks asked for and placed about the eye, the procedural scene synced, the camera turned.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn draw(
     mut commands: Commands,
@@ -719,8 +1105,6 @@ fn draw(
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
         camera.rotation = look(player.body.yaw, player.pitch);
         camera.translation = if player.third { Vec3::Y * player.lift - player.looking() * player.back } else { Vec3::ZERO };
-        // Haze is the air's, in metres, not the player's: a few hundred metres, a little more for a
-        // giant, whose eyes are high above it.
         fog.falloff = FogFalloff::from_visibility((200.0 + 60.0 * size) * DRAWN_AS / size);
     }
 }
@@ -734,6 +1118,7 @@ fn size_name(size: f32) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hud(
     mut text: Query<&mut Text, With<Hud>>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
@@ -741,6 +1126,7 @@ fn hud(
     chunks: Res<Chunks>,
     visuals: Res<SceneVisuals>,
     sculpt: Res<Sculpt>,
+    place: Res<PlaceMode>,
     diagnostics: Res<DiagnosticsStore>,
     area: Res<Area>,
 ) {
@@ -760,13 +1146,18 @@ fn hud(
     let c = chunks.counts;
     let feet = b.seat.map_or(b.feet, |s| s.at);
     let holes = if c.holes > 0 { format!(", {} not yet stood in for", c.holes) } else { String::new() };
-    let edits_note = if !sculpt.edits.is_empty() || sculpt.dirty {
-        format!("  /  {} edits{}", sculpt.edits.len(), if sculpt.dirty { "*" } else { "" })
+    let mods_note = if !sculpt.edits.is_empty() || !place.placed.is_empty() || sculpt.dirty {
+        format!(
+            "  /  {} edits, {} elements{}",
+            sculpt.edits.len(),
+            place.placed.len(),
+            if sculpt.dirty { "*" } else { "" }
+        )
     } else {
         String::new()
     };
     let mut s = format!(
-        "{}  /  {doing}{edits_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         c.shown,
         c.waiting,
@@ -777,16 +1168,16 @@ fn hud(
         feet[1],
         feet[2]
     );
+    let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
     if sculpt.active {
         let r = sculpt.radius(b.size);
         let r_str = if r < 0.1 {
             format!("{:.1} mm", r * 1000.0)
         } else if r < 1.0 {
-            format!("{:.1} cm", r * 100.0)
+            format!("{:.1} cm", r * 1000.0)
         } else {
             format!("{r:.2} m")
         };
-        let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
         let hint = if !grabbed {
             "  [click window to lock mouse]"
         } else if sculpt.aim.is_none() {
@@ -799,9 +1190,26 @@ fn hud(
             sculpt.preset.name(),
             sculpt.material().name()
         );
+    } else if place.active {
+        let hint = if !grabbed {
+            "  [click window to lock mouse]"
+        } else if place.aim.is_none() {
+            "  [aim at a surface within reach]"
+        } else {
+            ""
+        };
+        if let Some(el) = place.current() {
+            let kind = if el.is_sdf() { "SDF" } else { "Scene" };
+            let sc = place.placement_scale(b.size);
+            let deg = (place.yaw.to_degrees().rem_euclid(360.0)).round() as i32;
+            s += &format!(
+                "\nPLACE: {} [{kind}]  /  scale {sc:.2}x  /  yaw {deg}°{hint}  (LMB place, RMB/X remove, Tab next, R/T rotate, Wheel scale, Ctrl+R rescan)",
+                el.name
+            );
+        } else {
+            s += "\nPLACE: (no .wasm elements found — run ./elements/build.sh or plateau make-element)";
+        }
     }
-    // The area's places: when at one (within twice the smaller of the player and whom it is
-    // for), so; and with the flags shown, how far each is and which way.
     for (name, size, at) in &area.places {
         let far = ((at[0] - feet[0]).powi(2) + (at[1] - feet[1]).powi(2) + (at[2] - feet[2]).powi(2)).sqrt();
         if far < 2.0 * b.size.min(size.height()) as f64 {
@@ -830,9 +1238,6 @@ fn screenshot(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>, mut playe
     }
 }
 
-/// A place the tour stops at: who, where (across the ground; dropped from a little above the
-/// ground there), facing which way, whether to sit, a size to grow or shrink to there, and how
-/// long to go forward, measuring, and whether running.
 struct Stop {
     name: &'static str,
     size: f32,
@@ -854,14 +1259,9 @@ struct Tour {
 }
 
 enum Phase {
-    /// To go to the next stop.
     Arrive,
-    /// There since then, the chunks being made.
     Wait(Instant),
-    /// The chunks all made, after this long and this many: the frames measured, how many had
-    /// wanted chunks with nothing shown in their space, and the most such in a frame.
     Measure { arrived: Instant, settled: Instant, made: usize, took: (Duration, Duration), frames: Vec<f32>, holey: usize, most: usize },
-    /// The screenshot asked for: frames left until it is surely written.
     Shot(usize),
 }
 
@@ -873,15 +1273,12 @@ impl Tour {
             Stop { name: "person-at-the-start", size: person, at: START, yaw: 0.0, pitch: -0.05, sit: false, then: None, walk: None },
             Stop { name: "person-at-the-crack", size: person, at: [52.4, 30.0], yaw: -FRAC_PI_2, pitch: -0.55, sit: false, then: None, walk: None },
             Stop { name: "person-under-the-bench", size: person, at: [40.0, 21.5], yaw: 0.0, pitch: 0.55, sit: false, then: None, walk: None },
-            // Shrinking, the crack looked at stays in the middle of the view.
             Stop { name: "person-shrunk-at-the-crack", size: person, at: [53.4, 30.0], yaw: -FRAC_PI_2, pitch: -1.38, sit: false, then: Some(tiny), walk: None },
             Stop { name: "tiny-at-the-crack", size: tiny, at: [53.62, 30.0], yaw: -FRAC_PI_2, pitch: 0.05, sit: false, then: None, walk: None },
             Stop { name: "tiny-in-the-cave", size: tiny, at: [54.0, 30.25], yaw: 0.35, pitch: 0.0, sit: false, then: None, walk: None },
             Stop { name: "tiny-on-the-pond", size: tiny, at: [24.37, 36.82], yaw: 0.6, pitch: -0.08, sit: false, then: None, walk: None },
             Stop { name: "giant-over-the-garden", size: giant, at: [30.0, 62.0], yaw: 0.0, pitch: -0.45, sit: false, then: None, walk: None },
             Stop { name: "giant-on-the-bench", size: giant, at: [40.0, 23.5], yaw: PI, pitch: -0.4, sit: true, then: None, walk: None },
-            // Going, measured as they go: in at the gate, along the wall's foot past the crack,
-            // across the garden.
             Stop { name: "person-running-in-at-the-gate", size: person, at: START, yaw: 0.0, pitch: -0.1, sit: false, then: None, walk: Some((4.0, true)) },
             Stop { name: "tiny-running-along-the-wall", size: tiny, at: [53.62, 30.12], yaw: 0.0, pitch: -0.05, sit: false, then: None, walk: Some((4.0, true)) },
             Stop { name: "giant-walking-across-the-garden", size: giant, at: [20.0, 62.0], yaw: 0.3, pitch: -0.4, sit: false, then: None, walk: Some((3.0, false)) },
@@ -890,7 +1287,6 @@ impl Tour {
     }
 }
 
-/// The tour: each stop in turn, measured once its chunks are made, and a screenshot of it.
 fn go_on_tour(
     mut commands: Commands,
     mut tour: ResMut<Tour>,
@@ -933,7 +1329,6 @@ fn go_on_tour(
             }
         }
         Phase::Measure { arrived, settled, made, took, frames, holey, most } => {
-            // A second for the last chunks to be drawn, then two seconds measured, or the walk.
             let stop = &tour.stops[tour.next];
             if settled.elapsed() > Duration::from_secs(1) {
                 frames.push(time.delta_secs());

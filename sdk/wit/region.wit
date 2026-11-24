@@ -116,6 +116,14 @@ interface types {
         /// Show a short message on the player's HUD.
         say(string),
     }
+
+    /// Local SDF bounding box and smooth blend width for a standalone composable element.
+    /// `None` means the element is purely procedural `Scene` geometry (zero SDF sampling cost).
+    record element-bounds {
+        lo: point,
+        hi: point,
+        blend: f32,
+    }
 }
 
 /// What an area may ask of the engine. Each import is a capability given on purpose.
@@ -125,7 +133,7 @@ interface host {
 }
 
 world region {
-    use types.{point, answer, description, scene, player-state, command};
+    use types.{point, answer, description, scene, player-state, command, element-bounds};
 
     import host;
 
@@ -145,4 +153,7 @@ world region {
 
     /// Sandboxed runtime interaction called when the player uses/interacts (`F` / right-click).
     export interact: func(player: player-state) -> list<command>;
+
+    /// Local SDF bounds if this module is a standalone carvable landform element, or none.
+    export element-bounds: func() -> option<element-bounds>;
 }

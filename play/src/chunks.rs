@@ -1,7 +1,8 @@
 //! The area's surface about the player, made off the frame (POC_PLAN.md, steps 2, 7, and 8):
 //! view-directed `6×4×6` rings shifted forward along the look direction, frustum-prioritized chunk
 //! streaming, complementary 4×4 Bayer dithered LOD cross-fades, and live targeted chunk
-//! invalidation for scale-stamped SDF edits with zero-flicker in-place mesh swaps.
+//! invalidation for scale-stamped SDF edits & placed SDF `.wasm` elements with zero-flicker
+//! in-place mesh swaps.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -12,14 +13,40 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::chunk::{self, Key, Made};
-use plateau_engine::edit::{Edit, EditLog, Edited};
+use plateau_engine::compose::{Composed, ComposedLog, PlacementTransform};
+use plateau_engine::edit::Edit;
 use plateau_engine::picture::colour;
-use plateau_engine::{Compiled, rings};
+use plateau_engine::{Compiled, ElementBounds, Wasm, rings};
 
 use crate::surface::{FADE_SECONDS, Materials, SurfaceMaterial, properties};
 
 const MOST_KEPT: usize = 12_000;
 const MOST_A_FRAME: usize = 64;
+
+/// Which cached chunks need rebuilding when `ComposedLog` changes.
+pub enum Invalidate<'a> {
+    /// Rebuild all cached chunks (e.g., on full reload).
+    All,
+    /// Rebuild only chunks affected by one added or undone SDF edit.
+    Edit(&'a Edit),
+    /// Rebuild only chunks affected by one placed or removed SDF `.wasm` element.
+    SdfElement(PlacementTransform, ElementBounds),
+    /// Rebuild chunks affected by an edit and/or one or more lazily promoted elements.
+    Combined { edit: Option<&'a Edit>, bounds: &'a [(PlacementTransform, ElementBounds)] },
+}
+
+impl Invalidate<'_> {
+    fn affects(&self, key: Key) -> bool {
+        match *self {
+            Invalidate::All => true,
+            Invalidate::Edit(e) => e.affects_chunk(key),
+            Invalidate::SdfElement(tf, bounds) => tf.affects_chunk(bounds, key),
+            Invalidate::Combined { edit, bounds } => {
+                edit.is_some_and(|e| e.affects_chunk(key)) || bounds.iter().any(|&(tf, b)| tf.affects_chunk(b, key))
+            }
+        }
+    }
+}
 
 enum Known {
     Empty { revision: u64 },
@@ -37,7 +64,7 @@ impl Known {
 struct Jobs {
     todo: Vec<Key>,
     making: HashMap<Key, u64>,
-    edits: Arc<EditLog>,
+    composed: Arc<ComposedLog>,
     stop: bool,
 }
 
@@ -72,8 +99,8 @@ pub struct Chunks {
     queue: Arc<Queue>,
     done: Mutex<Receiver<Done>>,
     known: HashMap<Key, Known>,
-    /// Cached chunks invalidated by SDF edits that need rebuilding to at least `min_revision`.
-    /// Their old mesh stays visible until the rebuilt mesh arrives, preventing sculpting flicker.
+    /// Cached chunks invalidated by SDF edits/elements that need rebuilding to at least `min_revision`.
+    /// Their old mesh stays visible until the rebuilt mesh arrives, preventing flicker.
     stale: HashMap<Key, u64>,
     rings: rings::Rings,
     wanted: HashSet<Key>,
@@ -86,9 +113,9 @@ pub struct Chunks {
 }
 
 impl Chunks {
-    pub fn new(compiled: Arc<Compiled>, seed: u64, edits: Arc<EditLog>, materials: Materials) -> Chunks {
+    pub fn new(compiled: Arc<Compiled>, seed: u64, composed: Arc<ComposedLog>, materials: Materials) -> Chunks {
         let queue = Arc::new(Queue {
-            jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashMap::new(), edits, stop: false }),
+            jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashMap::new(), composed, stop: false }),
             more: Condvar::new(),
         });
         let (tell, done) = channel();
@@ -113,22 +140,18 @@ impl Chunks {
         }
     }
 
-    /// Publishes an updated `EditLog` snapshot to worker threads and invalidates affected chunks.
-    /// Pass `Some(edit)` for targeted invalidation of a single added/undone edit, or `None` to
-    /// invalidate all cached chunks (e.g., on full reload/clear).
-    pub fn set_edits(&mut self, edits: Arc<EditLog>, changed: Option<&Edit>) {
-        let rev = edits.revision();
+    /// Publishes an updated `ComposedLog` snapshot to worker threads and invalidates affected chunks.
+    pub fn set_composed(&mut self, composed: Arc<ComposedLog>, inv: Invalidate<'_>) {
+        let rev = composed.revision();
         {
             let mut jobs = self.queue.jobs.lock().unwrap();
-            jobs.edits = edits;
+            jobs.composed = composed;
         }
         for (&key, known) in &self.known {
-            if known.revision() < rev && changed.is_none_or(|e| e.affects_chunk(key)) {
+            if known.revision() < rev && inv.affects(key) {
                 self.stale.insert(key, rev);
             }
         }
-        // Any in-flight worker job on an affected chunk is now outdated; `update()` will re-queue it
-        // immediately at top priority. Wake workers once `update()` populates `todo`.
         self.queue.more.notify_all();
     }
 
@@ -186,8 +209,7 @@ impl Chunks {
                     !self.known.contains_key(k) && !making.contains_key(k)
                 }
             };
-            // Prioritize invalidated wanted chunks first so live sculpting responds immediately,
-            // then missing wanted chunks, then ahead chunks.
+            // Prioritize invalidated wanted chunks first so live sculpting & element placement respond immediately.
             let mut todo: Vec<Key> = Vec::new();
             for k in &wanted {
                 if self.stale.contains_key(k) && needs(k) && seen.insert(*k) {
@@ -217,7 +239,6 @@ impl Chunks {
             self.counts.slowest = self.counts.slowest.max(done.took);
             self.counts.total += done.took;
 
-            // Ignore out-of-order older revisions for a chunk we already have newer data for.
             if self.known.get(&done.key).is_some_and(|k| k.revision() > done.revision) {
                 continue;
             }
@@ -252,7 +273,6 @@ impl Chunks {
                 commands.entity(old_entity).despawn();
             }
             if was_known {
-                // In-place sculpted update: cancel any fade on this key so the new mesh shows crisply.
                 self.fading_in.remove(&done.key);
                 self.fading_out.remove(&done.key);
             }
@@ -372,34 +392,37 @@ impl Drop for Chunks {
 }
 
 fn work(queue: &Queue, tell: &Sender<Done>, compiled: &Compiled, seed: u64) {
-    let mut area = None;
+    let mut composed: Option<Composed<Wasm, Arc<ComposedLog>>> = None;
     loop {
-        let (key, edits) = {
+        let (key, log) = {
             let mut jobs = queue.jobs.lock().unwrap();
             loop {
                 if jobs.stop {
                     return;
                 }
                 if let Some(key) = jobs.todo.pop() {
-                    let edits = jobs.edits.clone();
-                    jobs.making.insert(key, edits.revision());
-                    break (key, edits);
+                    let log = jobs.composed.clone();
+                    jobs.making.insert(key, log.revision());
+                    break (key, log);
                 }
                 jobs = queue.more.wait(jobs).unwrap();
             }
         };
-        let revision = edits.revision();
+        let revision = log.revision();
         let started = Instant::now();
-        let made = match area.as_mut() {
-            Some(a) => Ok(a),
-            None => compiled.instantiate(seed).map(|a| area.insert(a)),
+        let made = match composed.as_mut() {
+            Some(c) => {
+                if c.log.revision() != revision {
+                    c.log = log;
+                    c.prune_instances();
+                }
+                Ok(c)
+            }
+            None => compiled.instantiate(seed).map(|a| composed.insert(Composed::new(a, log))),
         }
-        .and_then(|a| {
-            let mut edited = Edited::new(a, &*edits);
-            chunk::make(&mut edited, key)
-        });
+        .and_then(|c| chunk::make(c, key));
         if made.is_err() {
-            area = None;
+            composed = None;
         }
         if tell.send(Done { key, revision, made: made.map_err(|e| format!("{e:#}")), took: started.elapsed() }).is_err() {
             return;

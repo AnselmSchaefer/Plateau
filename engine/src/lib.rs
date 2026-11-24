@@ -12,8 +12,10 @@
 pub mod body;
 pub mod check;
 pub mod chunk;
+pub mod compose;
 pub mod edit;
 pub mod laws;
+pub mod mesh_sdf;
 pub mod picture;
 pub mod reach;
 pub mod rings;
@@ -21,7 +23,9 @@ pub mod scene;
 pub mod sketch;
 pub mod wasm;
 
+pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, SdfSource};
 pub use edit::{Edit, EditLog, Edited, Op, Shape, WorldSave};
+pub use mesh_sdf::MeshSdf;
 pub use wasm::{Compiled, Limits, Wasm};
 pub use wasmtime::{Error, Result};
 
@@ -44,6 +48,11 @@ pub trait Region {
     fn interact(&mut self, _player: &PlayerState) -> Result<Vec<Command>> {
         Ok(Vec::new())
     }
+    /// Local SDF bounding box & smooth blend width when this module is a standalone carvable
+    /// landform element (`None` for full areas and pure procedural `Scene` elements).
+    fn element_bounds(&mut self) -> Result<Option<ElementBounds>> {
+        Ok(None)
+    }
 }
 
 impl<R: Region + ?Sized> Region for &mut R {
@@ -65,6 +74,10 @@ impl<R: Region + ?Sized> Region for &mut R {
 
     fn interact(&mut self, player: &PlayerState) -> Result<Vec<Command>> {
         (**self).interact(player)
+    }
+
+    fn element_bounds(&mut self) -> Result<Option<ElementBounds>> {
+        (**self).element_bounds()
     }
 }
 
@@ -235,6 +248,14 @@ pub struct PlayerState {
     pub target: u32,
     pub aim: [f32; 3],
     pub time: f32,
+}
+
+/// Local SDF bounding box and optional smooth blend width for a standalone composable element.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementBounds {
+    pub lo: [f32; 3],
+    pub hi: [f32; 3],
+    pub blend: f32,
 }
 
 /// Orthogonal physical & world verbs a WASM plugin may request (all validated & clamped by engine).

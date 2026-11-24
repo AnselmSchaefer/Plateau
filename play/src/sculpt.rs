@@ -13,11 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bevy::prelude::*;
+use plateau_engine::compose::PlacedElement;
 use plateau_engine::edit::{Edit, EditLog, Op, Shape, WorldSave};
 use plateau_engine::picture::colour;
 use plateau_engine::{Material, Result};
-
-use crate::chunks::Chunks;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushPreset {
@@ -79,9 +78,8 @@ pub struct Sculpt {
     pub material_idx: usize,
     /// Brush radius as a multiple of `player.body.size`.
     pub radius_mult: f32,
-    /// Current immutable edit log snapshot shared with `Physics` and `Chunks` workers.
+    /// Current immutable edit log snapshot shared with `ComposedLog`.
     pub edits: Arc<EditLog>,
-    redo_stack: Vec<Edit>,
     pub save_path: PathBuf,
     pub area_name: String,
     pub seed: u64,
@@ -102,7 +100,6 @@ impl Sculpt {
             material_idx: 0, // Soil
             radius_mult: 0.75,
             edits,
-            redo_stack: Vec::new(),
             save_path,
             area_name,
             seed,
@@ -139,55 +136,38 @@ impl Sculpt {
         }
     }
 
-    pub fn push_edit(&mut self, edit: Edit, chunks: &mut Chunks) -> Result<()> {
+    pub fn push_edit(&mut self, edit: Edit) -> Result<()> {
         let mut next = (*self.edits).clone();
         next.push(edit)?;
         self.edits = Arc::new(next);
-        self.redo_stack.clear();
         self.dirty = true;
-        chunks.set_edits(self.edits.clone(), Some(&edit));
         Ok(())
     }
 
-    pub fn undo(&mut self, chunks: &mut Chunks) -> Option<Edit> {
+    pub fn pop_edit(&mut self) -> Option<Edit> {
         let mut next = (*self.edits).clone();
         let removed = next.pop()?;
         self.edits = Arc::new(next);
-        self.redo_stack.push(removed);
         self.dirty = true;
-        chunks.set_edits(self.edits.clone(), Some(&removed));
         Some(removed)
     }
 
-    pub fn redo(&mut self, chunks: &mut Chunks) -> Option<Edit> {
-        let edit = self.redo_stack.pop()?;
-        let mut next = (*self.edits).clone();
-        if next.push(edit).is_err() {
-            return None;
-        }
-        self.edits = Arc::new(next);
-        self.dirty = true;
-        chunks.set_edits(self.edits.clone(), Some(&edit));
-        Some(edit)
+    pub fn replace_edits(&mut self, edits: Vec<Edit>) -> Result<()> {
+        let next_rev = self.edits.revision() + 1;
+        self.edits = Arc::new(EditLog::from_edits_with_revision(edits, next_rev)?);
+        self.dirty = false;
+        Ok(())
     }
 
-    pub fn save(&mut self) -> Result<()> {
-        let world = WorldSave::new(self.area_name.clone(), self.seed, self.edits.edits().to_vec());
+    pub fn save_world(&mut self, elements: &[PlacedElement]) -> Result<()> {
+        let world = WorldSave::with_elements(self.area_name.clone(), self.seed, self.edits.edits().to_vec(), elements.to_vec());
         world.save(&self.save_path)?;
         self.dirty = false;
         Ok(())
     }
 
-    pub fn reload(&mut self, chunks: &mut Chunks) -> Result<usize> {
-        let world = WorldSave::load(&self.save_path)?;
-        let count = world.edits.len();
-        let next_rev = self.edits.revision() + 1;
-        let log = EditLog::from_edits_with_revision(world.edits, next_rev)?;
-        self.edits = Arc::new(log);
-        self.redo_stack.clear();
-        self.dirty = false;
-        chunks.set_edits(self.edits.clone(), None);
-        Ok(count)
+    pub fn load_world(&self) -> Result<WorldSave> {
+        WorldSave::load(&self.save_path)
     }
 }
 

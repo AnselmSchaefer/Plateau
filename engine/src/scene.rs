@@ -1,13 +1,19 @@
-//! Runtime procedural scene state, dynamic instance collision, and crosshair targeting.
+//! Runtime procedural scene state, multi-layer composable element isolation, dynamic instance
+//! collision, and crosshair targeting.
 //!
-//! Keeps track of an area's raw meshes, solid/dynamic instances, and dynamic lights, applies
-//! validated `Command`s emitted by `tick` / `interact`, and wraps any `Region` (`Combined`) so
-//! `Body::step` and `body::look` automatically walk on and collide with solid procedural meshes
-//! (stairs, moving platforms, bridges, doors) alongside the SDF terrain!
+//! Keeps track of the base area (`owner = 0`) and every placed standalone `.wasm` element
+//! (`owner = placement_id > 0`), applies validated `Command`s emitted by `tick` / `interact`
+//! strictly within each owner's namespace, and wraps any `Region` (`Combined`) so `Body::step`
+//! and `body::look` automatically walk on and collide with solid procedural meshes alongside the
+//! SDF terrain.
 
 use std::collections::HashMap;
 
-use crate::{Answer, Command, Description, Instance, Light, Material, MeshData, Region, Result, Scene};
+use crate::compose::PlacementTransform;
+use crate::{Answer, Command, Description, ElementBounds, Instance, Light, Material, MeshData, Region, Result, Scene};
+
+/// Owner namespace reserved for the base area's own `Scene`. Placed elements use `id >= 1`.
+pub const BASE_OWNER: u32 = 0;
 
 /// Precomputed local AABB and triangle data for one mesh, for fast collision and raycasting.
 #[derive(Clone, Debug)]
@@ -43,9 +49,10 @@ impl MeshBounds {
     }
 }
 
-/// Live state of one placed instance (static or dynamic).
+/// Live state of one placed instance (static or dynamic), stored in world coordinates.
 #[derive(Clone, Debug)]
 pub struct LiveInstance {
+    pub owner: u32,
     pub instance: Instance,
     pub visible: bool,
     pub world_lo: [f32; 3],
@@ -55,8 +62,8 @@ pub struct LiveInstance {
 }
 
 impl LiveInstance {
-    fn new(instance: Instance, bounds: &MeshBounds) -> LiveInstance {
-        let mut live = LiveInstance { instance, visible: true, world_lo: [0.0; 3], world_hi: [0.0; 3], min_scale: 1.0 };
+    fn new(owner: u32, instance: Instance, bounds: &MeshBounds) -> LiveInstance {
+        let mut live = LiveInstance { owner, instance, visible: true, world_lo: [0.0; 3], world_hi: [0.0; 3], min_scale: 1.0 };
         live.recompute_aabb(bounds);
         live
     }
@@ -83,16 +90,20 @@ impl LiveInstance {
     }
 }
 
-/// Live procedural scene state + collision & raycast queries.
+/// Live procedural scene state + collision & raycast queries across base area (`owner = 0`) and
+/// any number of placed standalone elements (`owner > 0`).
 #[derive(Clone, Debug, Default)]
 pub struct SceneWorld {
-    bounds: Vec<MeshBounds>,
-    /// All solid static instances (checked for physics collision).
-    solid_static: Vec<LiveInstance>,
-    /// All dynamic instances (`id > 0`), keyed by id.
-    pub dynamic: HashMap<u32, LiveInstance>,
-    /// Active point lights, keyed by id.
-    pub lights: HashMap<u32, Light>,
+    /// Local mesh collision bounds, namespaced per owner.
+    bounds: HashMap<u32, Vec<MeshBounds>>,
+    /// Solid static instances (`id == 0, solid == true`), keyed by owner for clean removal.
+    solid_static: HashMap<u32, Vec<LiveInstance>>,
+    /// Non-solid static instances belonging to placed elements (`owner > 0`) for removal picking.
+    placed_static: HashMap<u32, Vec<LiveInstance>>,
+    /// All dynamic instances (`id > 0`), keyed by `(owner, local_id)`.
+    pub dynamic: HashMap<(u32, u32), LiveInstance>,
+    /// Active point lights, keyed by `(owner, local_id)`.
+    pub lights: HashMap<(u32, u32), Light>,
 }
 
 /// Side effects from applying a batch of runtime WASM `Command`s that the player/renderer should act on.
@@ -100,60 +111,171 @@ pub struct SceneWorld {
 pub struct Applied {
     pub impulse: [f32; 3],
     pub said: Option<String>,
-    pub dirty_instances: Vec<u32>,
-    pub dirty_lights: Vec<u32>,
+    pub dirty_instances: Vec<(u32, u32)>,
+    pub dirty_lights: Vec<(u32, u32)>,
 }
 
 impl SceneWorld {
     pub fn from_scene(scene: &Scene) -> SceneWorld {
-        let bounds: Vec<MeshBounds> = scene.meshes.iter().map(MeshBounds::from_mesh).collect();
-        let mut solid_static = Vec::new();
-        let mut dynamic = HashMap::new();
-        for &inst in &scene.instances {
-            let Some(b) = bounds.get(inst.mesh as usize) else { continue };
-            let live = LiveInstance::new(inst, b);
-            if inst.id > 0 {
-                dynamic.insert(inst.id, live);
-            } else if inst.solid {
-                solid_static.push(live);
-            }
-        }
-        let mut lights = HashMap::new();
-        for &l in &scene.lights {
-            if l.id > 0 && l.intensity > 0.0 {
-                lights.insert(l.id, l);
-            }
-        }
-        SceneWorld { bounds, solid_static, dynamic, lights }
+        let mut world = SceneWorld::default();
+        world.add_layer(BASE_OWNER, scene, None);
+        world
     }
 
-    /// Applies validated runtime `Command`s from `tick` / `interact` to the live scene state.
+    /// Adds (or replaces) a scene layer owned by `owner`. If `transform` is `Some`, all instances
+    /// and lights are transformed from element-local space into world space.
+    pub fn add_layer(&mut self, owner: u32, scene: &Scene, transform: Option<PlacementTransform>) {
+        self.add_layer_filtered(owner, scene, transform, false);
+    }
+
+    /// Adds (or replaces) a scene layer owned by `owner`. When `skip_solid` is `true` (used when
+    /// a `Scene` element's solid meshes have been lazily promoted to the carvable SDF layer),
+    /// `solid: true` instances are omitted so only decorative `solid: false` instances and lights
+    /// remain in `SceneWorld`.
+    pub fn add_layer_filtered(&mut self, owner: u32, scene: &Scene, transform: Option<PlacementTransform>, skip_solid: bool) {
+        self.remove_layer(owner);
+        let bounds: Vec<MeshBounds> = scene.meshes.iter().map(MeshBounds::from_mesh).collect();
+        let mut solid_static = Vec::new();
+        let mut placed_static = Vec::new();
+        for &raw in &scene.instances {
+            if skip_solid && raw.solid {
+                continue;
+            }
+            let Some(b) = bounds.get(raw.mesh as usize) else { continue };
+            let inst = match transform {
+                Some(tf) => tf.transform_instance(raw),
+                None => raw,
+            };
+            let live = LiveInstance::new(owner, inst, b);
+            if inst.id > 0 {
+                self.dynamic.insert((owner, inst.id), live);
+            } else if inst.solid {
+                solid_static.push(live);
+            } else if owner != BASE_OWNER {
+                placed_static.push(live);
+            }
+        }
+        for &raw in &scene.lights {
+            let l = match transform {
+                Some(tf) => tf.transform_light(raw),
+                None => raw,
+            };
+            if l.id > 0 && l.intensity > 0.0 {
+                self.lights.insert((owner, l.id), l);
+            }
+        }
+        self.bounds.insert(owner, bounds);
+        if !solid_static.is_empty() {
+            self.solid_static.insert(owner, solid_static);
+        }
+        if !placed_static.is_empty() {
+            self.placed_static.insert(owner, placed_static);
+        }
+    }
+
+    /// Returns the `owner > 0` of any solid placed element whose world AABB overlaps `(lo, hi)`.
+    pub fn solid_placed_overlapping(&self, lo: [f32; 3], hi: [f32; 3]) -> Vec<u32> {
+        let mut owners = Vec::new();
+        let overlaps = |a_lo: [f32; 3], a_hi: [f32; 3]| (0..3).all(|i| a_hi[i] >= lo[i] && a_lo[i] <= hi[i]);
+        for (&owner, list) in &self.solid_static {
+            if owner == BASE_OWNER || owners.contains(&owner) {
+                continue;
+            }
+            if list.iter().any(|l| overlaps(l.world_lo, l.world_hi)) {
+                owners.push(owner);
+            }
+        }
+        for (&(owner, _), live) in &self.dynamic {
+            if owner == BASE_OWNER || !live.visible || !live.instance.solid || owners.contains(&owner) {
+                continue;
+            }
+            if overlaps(live.world_lo, live.world_hi) {
+                owners.push(owner);
+            }
+        }
+        owners.sort_unstable();
+        owners
+    }
+
+    /// Raycasts against visible **solid** instances belonging to placed elements (`owner > 0`),
+    /// returning `(placement_id, hit_t)` for lazy Scene→SDF sculpt targeting.
+    pub fn raycast_solid_placed(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32)> {
+        let mut best_t = max_dist;
+        let mut best_owner = None;
+        for (&owner, list) in &self.solid_static {
+            if owner == BASE_OWNER {
+                continue;
+            }
+            for live in list {
+                if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
+                    best_t = t;
+                    best_owner = Some(owner);
+                }
+            }
+        }
+        for (&(owner, _), live) in &self.dynamic {
+            if owner == BASE_OWNER || !live.visible || !live.instance.solid {
+                continue;
+            }
+            if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
+                best_t = t;
+                best_owner = Some(owner);
+            }
+        }
+        best_owner.map(|o| (o, best_t))
+    }
+
+    /// Removes every mesh, static/dynamic instance, and light owned by `owner`.
+    pub fn remove_layer(&mut self, owner: u32) {
+        self.bounds.remove(&owner);
+        self.solid_static.remove(&owner);
+        self.placed_static.remove(&owner);
+        self.dynamic.retain(|&(o, _), _| o != owner);
+        self.lights.retain(|&(o, _), _| o != owner);
+    }
+
+    /// Applies validated runtime `Command`s for the base area (`owner = 0`).
     pub fn apply(&mut self, commands: &[Command]) -> Applied {
+        self.apply_for(BASE_OWNER, commands, None)
+    }
+
+    /// Applies validated runtime `Command`s strictly within `owner`'s namespace. When `transform`
+    /// is `Some`, local transforms, lights, and impulses are converted to world space first.
+    pub fn apply_for(&mut self, owner: u32, commands: &[Command], transform: Option<PlacementTransform>) -> Applied {
         let mut applied = Applied::default();
-        for cmd in commands {
+        for raw_cmd in commands {
+            let cmd = match transform {
+                Some(tf) => tf.transform_command(raw_cmd.clone()),
+                None => raw_cmd.clone(),
+            };
             match cmd {
                 Command::SetTransform(inst) => {
                     if inst.id == 0 {
                         continue;
                     }
-                    if let Some(live) = self.dynamic.get_mut(&inst.id) {
-                        let mesh_idx = if (inst.mesh as usize) < self.bounds.len() { inst.mesh } else { live.instance.mesh };
-                        live.instance = Instance { mesh: mesh_idx, ..*inst };
-                        if let Some(b) = self.bounds.get(mesh_idx as usize) {
+                    let key = (owner, inst.id);
+                    if let Some(live) = self.dynamic.get_mut(&key) {
+                        let owner_bounds = self.bounds.get(&owner);
+                        let mesh_len = owner_bounds.map_or(0, Vec::len);
+                        let mesh_idx = if (inst.mesh as usize) < mesh_len { inst.mesh } else { live.instance.mesh };
+                        live.instance = Instance { mesh: mesh_idx, ..inst };
+                        if let Some(b) = owner_bounds.and_then(|v| v.get(mesh_idx as usize)) {
                             live.recompute_aabb(b);
                         }
-                        applied.dirty_instances.push(inst.id);
+                        applied.dirty_instances.push(key);
                     }
                 }
                 Command::SetVisible(id, vis) => {
-                    if let Some(live) = self.dynamic.get_mut(id) {
-                        live.visible = *vis;
-                        applied.dirty_instances.push(*id);
+                    let key = (owner, id);
+                    if let Some(live) = self.dynamic.get_mut(&key) {
+                        live.visible = vis;
+                        applied.dirty_instances.push(key);
                     }
                 }
                 Command::SetSolid(id, sol) => {
-                    if let Some(live) = self.dynamic.get_mut(id) {
-                        live.instance.solid = *sol;
+                    let key = (owner, id);
+                    if let Some(live) = self.dynamic.get_mut(&key) {
+                        live.instance.solid = sol;
                     }
                 }
                 Command::ApplyImpulse(dv) => {
@@ -163,16 +285,17 @@ impl SceneWorld {
                 }
                 Command::SetLight(l) => {
                     if l.id > 0 {
+                        let key = (owner, l.id);
                         if l.intensity <= 0.0 {
-                            self.lights.remove(&l.id);
+                            self.lights.remove(&key);
                         } else {
-                            self.lights.insert(l.id, *l);
+                            self.lights.insert(key, l);
                         }
-                        applied.dirty_lights.push(l.id);
+                        applied.dirty_lights.push(key);
                     }
                 }
                 Command::Say(msg) => {
-                    applied.said = Some(msg.clone());
+                    applied.said = Some(msg);
                 }
             }
         }
@@ -188,12 +311,16 @@ impl SceneWorld {
     pub fn distance_to_solids(&self, p: [f32; 3], best: f32) -> Option<Answer> {
         let mut d_best = best;
         let mut hit: Option<Answer> = None;
-        for live in self.solid_static.iter().chain(self.dynamic.values().filter(|l| l.visible && l.instance.solid)) {
+        let statics = self.solid_static.values().flat_map(|v| v.iter());
+        let dynamics = self.dynamic.values().filter(|l| l.visible && l.instance.solid);
+        for live in statics.chain(dynamics) {
             let box_d = aabb_distance(p, live.world_lo, live.world_hi);
             if box_d >= d_best {
                 continue;
             }
-            let Some(b) = self.bounds.get(live.instance.mesh as usize) else { continue };
+            let Some(b) = self.bounds.get(&live.owner).and_then(|v| v.get(live.instance.mesh as usize)) else {
+                continue;
+            };
             let local = world_to_local(p, &live.instance);
             for &(ta, tb, tc, mat) in &b.tris {
                 let d_local = point_triangle_distance(local, ta, tb, tc);
@@ -207,12 +334,29 @@ impl SceneWorld {
         hit
     }
 
-    /// Raycasts against visible dynamic instances (`id > 0`) up to `max_dist`, returning `(id, hit_t)`.
+    /// Raycasts against visible dynamic instances (`id > 0`) across all owners, returning
+    /// `(owner, local_id, hit_t)`.
+    pub fn raycast_dynamic_owned(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, u32, f32)> {
+        let mut best_t = max_dist;
+        let mut best = None;
+        for (&(owner, id), live) in &self.dynamic {
+            if !live.visible {
+                continue;
+            }
+            if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
+                best_t = t;
+                best = Some((owner, id));
+            }
+        }
+        best.map(|(owner, id)| (owner, id, best_t))
+    }
+
+    /// Raycasts against visible dynamic instances (`id > 0`) of the base area (`owner = 0`).
     pub fn raycast_dynamic(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32)> {
         let mut best_t = max_dist;
         let mut best_id = None;
-        for (&id, live) in &self.dynamic {
-            if !live.visible {
+        for (&(owner, id), live) in &self.dynamic {
+            if owner != BASE_OWNER || !live.visible {
                 continue;
             }
             if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
@@ -221,6 +365,34 @@ impl SceneWorld {
             }
         }
         best_id.map(|id| (id, best_t))
+    }
+
+    /// Raycasts against any visible static or dynamic instance belonging to a placed element
+    /// (`owner > 0`), returning `(placement_id, hit_t)` for interactive removal/selection.
+    pub fn raycast_placed_owner(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32)> {
+        let mut best_t = max_dist;
+        let mut best_owner = None;
+        for (&owner, list) in self.solid_static.iter().chain(self.placed_static.iter()) {
+            if owner == BASE_OWNER {
+                continue;
+            }
+            for live in list {
+                if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
+                    best_t = t;
+                    best_owner = Some(owner);
+                }
+            }
+        }
+        for (&(owner, _), live) in &self.dynamic {
+            if owner == BASE_OWNER || !live.visible {
+                continue;
+            }
+            if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
+                best_t = t;
+                best_owner = Some(owner);
+            }
+        }
+        best_owner.map(|o| (o, best_t))
     }
 }
 
@@ -249,6 +421,10 @@ impl<R: Region + ?Sized> Region for Combined<'_, R> {
 
     fn describe(&mut self) -> Result<Description> {
         self.region.describe()
+    }
+
+    fn element_bounds(&mut self) -> Result<Option<ElementBounds>> {
+        self.region.element_bounds()
     }
 }
 

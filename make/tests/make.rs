@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use plateau_make::{Builder, Made, Reply, Settings, Writer, make, source_of};
+use plateau_make::{Builder, Made, Reply, Settings, Writer, judge_element, make, make_element, source_of};
 
 /// The area, with the pillar `PILLAR` metres high: 3 m keeps every law; half a metre, a person
 /// jumps onto it.
@@ -214,4 +214,48 @@ fn a_version_that_kept_every_law_is_kept_if_the_look_fails() {
     assert!(!made.looked);
     assert_eq!(made.kept.as_deref(), source_of(&right()).as_deref());
     assert!(dir.join("area.rs").exists() && dir.join("area.wasm").exists());
+}
+
+const GOOD_ELEMENT: &str = r#"use plateau_sdk::*;
+
+struct StoneCairn;
+
+impl Element for StoneCairn {
+    fn new(_: u64) -> Self { StoneCairn }
+    fn name(&self) -> &str { "Stone Cairn" }
+    fn sdf_bounds(&self) -> Option<ElementBounds> {
+        Some(ElementBounds::new(point(-1.5, -1.0, -1.5), point(1.5, 2.0, 1.5), 0.2))
+    }
+    fn sample(&self, p: Point, _view: &View) -> Answer {
+        let a = sphere(p - point(0.0, 0.35, 0.0), 0.65);
+        let b = sphere(p - point(0.0, 1.05, 0.0), 0.42);
+        Answer::new(smooth_union(a, b, 0.15), Material::Stone)
+    }
+}
+
+element!(StoneCairn);
+"#;
+
+#[test]
+fn make_element_catches_clipped_bounds_and_keeps_fixed_element() {
+    let clipped = GOOD_ELEMENT.replace("point(-1.5, -1.0, -1.5), point(1.5, 2.0, 1.5)", "point(-0.3, -0.3, -0.3), point(0.3, 0.5, 0.3)");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/plateau-make-tests/element-cairn");
+    std::fs::remove_dir_all(&dir).ok();
+    let mut writer = StandIn {
+        answers: vec![format!("```rust\n{clipped}```"), format!("```rust\n{GOOD_ELEMENT}```")].into(),
+        asked: Vec::new(),
+    };
+    let made = make_element(&mut writer, builder(), "a stacked stone cairn", &dir, QUICK, &mut |_| {}).unwrap();
+    let came: Vec<_> = made.rounds.iter().map(|r| (r.asked, r.came.as_str())).collect();
+    assert_eq!(came, [("write", "breaks: element bounds containment"), ("laws", "keeps every law")]);
+    assert!(made.kept.is_some());
+    assert!(dir.join("element.rs").exists() && dir.join("element.wasm").exists());
+
+    // Also verify all four carried showcase elements pass `judge_element`.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in ["tree", "bridge", "lantern", "hill"] {
+        let bytes = std::fs::read(root.join(format!("elements/modules/{name}.wasm"))).unwrap();
+        let judged = judge_element(&bytes, QUICK);
+        assert!(judged.kept(), "{name} broke element laws: {:?}", judged.broken);
+    }
 }

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use plateau_engine::sketch::Sketch;
 use plateau_make::claude::Claude;
-use plateau_make::{Builder, Made, Settings, guide, judge, log, make, pictures};
+use plateau_make::{Builder, Made, Settings, element_guide, guide, judge, judge_element, log, make, make_element, pictures};
 
 /// The test set (POC_PLAN.md, step 5): five requests, kept, made again whenever the guide or the
 /// SDK changes.
@@ -83,6 +83,17 @@ fn main() {
             let sketch = flag(&args, "--sketch").map(PathBuf::from);
             check(&repo, &name, sketch.as_deref())
         }
+        Some("make-element") => {
+            let words = args.get(1).cloned().unwrap_or_else(|| usage());
+            let name = flag(&args, "--name").unwrap_or_else(|| {
+                words.split_whitespace().take(4).collect::<Vec<_>>().join("-").to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "")
+            });
+            one_element(&repo, &name, &words).map(|made| println!("{}", log(&words, &made)))
+        }
+        Some("check-element") => {
+            let name = args.get(1).cloned().unwrap_or_else(|| usage());
+            check_element(&repo, &name)
+        }
         _ => usage(),
     };
     if let Err(e) = result {
@@ -92,7 +103,13 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("plateau make \"<words>\" [--sketch MAP.png] [--name NAME]\nplateau test-set [NAME ...]\nplateau check NAME [--sketch MAP.png]");
+    eprintln!(
+        "plateau make \"<words>\" [--sketch MAP.png] [--name NAME]\n\
+         plateau make-element \"<words>\" [--name NAME]\n\
+         plateau test-set [NAME ...]\n\
+         plateau check NAME [--sketch MAP.png]\n\
+         plateau check-element NAME"
+    );
     std::process::exit(2)
 }
 
@@ -137,5 +154,50 @@ fn check(repo: &Path, name: &str, sketch_path: Option<&Path>) -> Result<(), Stri
     std::fs::write(dir.join("area.wasm"), &module).map_err(|e| e.to_string())?;
     pictures(&module, &dir.join("pictures"), Settings::default())?;
     println!("{name} keeps every law ({:.0} s); area.wasm and pictures made again", judged.seconds);
+    Ok(())
+}
+
+/// One standalone composable element made into `made/elements/NAME/`.
+fn one_element(repo: &Path, name: &str, words: &str) -> Result<Made, String> {
+    let dir = repo.join("made/elements").join(name);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let work = repo.join("target/plateau-make/elements").join(name);
+    let builder = Builder::new(repo, &work)?;
+    let guide_file = work.join("element-guide.md");
+    std::fs::write(&guide_file, element_guide(repo)?).map_err(|e| e.to_string())?;
+    let mut claude = Claude::new(&guide_file, &dir);
+    let made = make_element(&mut claude, &builder, words, &dir, Settings::default(), &mut |line| eprintln!("{name}: {line}"))?;
+    std::fs::write(dir.join("log.md"), log(words, &made)).map_err(|e| e.to_string())?;
+    std::fs::remove_dir_all(dir.join("build")).ok();
+    Ok(made)
+}
+
+/// Verifies `made/elements/NAME/element.rs` (or `elements/NAME/element.rs`) and writes its `.wasm`.
+fn check_element(repo: &Path, name: &str) -> Result<(), String> {
+    let made_dir = repo.join("made/elements").join(name);
+    let carried_dir = repo.join("elements").join(name);
+    let (src_path, out_wasm) = if made_dir.join("element.rs").exists() {
+        (made_dir.join("element.rs"), made_dir.join("element.wasm"))
+    } else if carried_dir.join("element.rs").exists() {
+        (carried_dir.join("element.rs"), repo.join("elements/modules").join(format!("{name}.wasm")))
+    } else {
+        return Err(format!("no element.rs found in {} or {}", made_dir.display(), carried_dir.display()));
+    };
+    let source = std::fs::read_to_string(&src_path).map_err(|e| format!("{}: {e}", src_path.display()))?;
+    let work = repo.join("target/plateau-make/elements").join(name);
+    let module = Builder::new(repo, &work)?.build_element(&source, &work.join("check"))?;
+    let judged = judge_element(&module, Settings::default());
+    if !judged.kept() {
+        let broken: String = judged.broken.iter().map(|(law, why)| format!("\n- {law}: {why}")).collect();
+        return Err(format!("{name} breaks:{broken}"));
+    }
+    if let Some(parent) = out_wasm.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&out_wasm, &module).map_err(|e| e.to_string())?;
+    println!("{name} keeps every element law ({:.2} s); wrote {}", judged.seconds, out_wasm.display());
     Ok(())
 }

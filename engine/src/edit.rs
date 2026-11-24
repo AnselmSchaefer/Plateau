@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use wasmtime::bail;
 
-use crate::{Answer, Command, Description, Material, PlayerState, Region, Result, Scene, chunk};
+use crate::compose::PlacedElement;
+use crate::{Answer, Command, Description, ElementBounds, Material, PlayerState, Region, Result, Scene, chunk};
 
 /// Whether an SDF edit adds material or carves space away.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -235,6 +236,8 @@ impl Edit {
 /// Left child is always strictly earlier in time than right child so CSG order is preserved.
 #[derive(Clone, Debug)]
 struct Node {
+    start: usize,
+    end: usize,
     lo: [f32; 3],
     hi: [f32; 3],
     max_blend: f32,
@@ -324,7 +327,14 @@ impl EditLog {
 
     /// Applies all edits in chronological order to `(points, out)` using exact BVH pruning.
     pub fn apply_batch(&self, points: &[[f32; 3]], out: &mut [Answer]) {
-        if self.edits.is_empty() || points.is_empty() {
+        self.apply_batch_range(0, self.edits.len(), points, out);
+    }
+
+    /// Applies edits in the chronological slice `[range_start..range_end)` to `(points, out)`
+    /// using exact BVH range & spatial pruning (bit-exact with sequential evaluation).
+    pub fn apply_batch_range(&self, range_start: usize, range_end: usize, points: &[[f32; 3]], out: &mut [Answer]) {
+        let range_end = range_end.min(self.edits.len());
+        if range_start >= range_end || self.edits.is_empty() || points.is_empty() {
             return;
         }
         debug_assert_eq!(points.len(), out.len());
@@ -343,7 +353,7 @@ impl EditLog {
             batch_max_d = max_f32(batch_max_d, ans.distance);
         }
         if !self.nodes.is_empty() {
-            self.visit(0, blo, bhi, &mut batch_min_d, &mut batch_max_d, points, out);
+            self.visit(0, range_start, range_end, blo, bhi, &mut batch_min_d, &mut batch_max_d, points, out);
         }
     }
 
@@ -351,6 +361,8 @@ impl EditLog {
     fn visit(
         &self,
         idx: usize,
+        range_start: usize,
+        range_end: usize,
         blo: [f32; 3],
         bhi: [f32; 3],
         batch_min_d: &mut f32,
@@ -359,6 +371,9 @@ impl EditLog {
         out: &mut [Answer],
     ) {
         let node = &self.nodes[idx];
+        if node.end <= range_start || node.start >= range_end {
+            return;
+        }
         let box_d = aabb_to_aabb_distance(blo, bhi, node.lo, node.hi);
         if box_d > 0.0 {
             let need_add = node.has_add && *batch_max_d > box_d - node.max_blend;
@@ -369,8 +384,8 @@ impl EditLog {
         }
         match node.kind {
             NodeKind::Branch { left, right } => {
-                self.visit(left, blo, bhi, batch_min_d, batch_max_d, points, out);
-                self.visit(right, blo, bhi, batch_min_d, batch_max_d, points, out);
+                self.visit(left, range_start, range_end, blo, bhi, batch_min_d, batch_max_d, points, out);
+                self.visit(right, range_start, range_end, blo, bhi, batch_min_d, batch_max_d, points, out);
             }
             NodeKind::Leaf(edit_idx) => {
                 let edit = &self.edits[edit_idx];
@@ -421,6 +436,8 @@ impl EditLog {
             let (lo, hi) = e.bounds();
             let id = self.nodes.len();
             self.nodes.push(Node {
+                start,
+                end,
                 lo,
                 hi,
                 max_blend: e.blend,
@@ -432,6 +449,8 @@ impl EditLog {
         }
         let id = self.nodes.len();
         self.nodes.push(Node {
+            start,
+            end,
             lo: [0.0; 3],
             hi: [0.0; 3],
             max_blend: 0.0,
@@ -446,6 +465,8 @@ impl EditLog {
         let lo = [min_f32(nl.lo[0], nr.lo[0]), min_f32(nl.lo[1], nr.lo[1]), min_f32(nl.lo[2], nr.lo[2])];
         let hi = [max_f32(nl.hi[0], nr.hi[0]), max_f32(nl.hi[1], nr.hi[1]), max_f32(nl.hi[2], nr.hi[2])];
         self.nodes[id] = Node {
+            start,
+            end,
             lo,
             hi,
             max_blend: max_f32(nl.max_blend, nr.max_blend),
@@ -492,6 +513,10 @@ impl<R: Region, E: Borrow<EditLog>> Region for Edited<R, E> {
     fn interact(&mut self, player: &PlayerState) -> Result<Vec<Command>> {
         self.region.interact(player)
     }
+
+    fn element_bounds(&mut self) -> Result<Option<ElementBounds>> {
+        self.region.element_bounds()
+    }
 }
 
 /// Estimates the unit outward surface normal of `area` at `at` (for a viewer `size` tall) using
@@ -515,19 +540,24 @@ pub fn surface_normal(area: &mut dyn Region, at: [f64; 3], size: f32) -> Result<
 /// Current save file format version.
 pub const SAVE_VERSION: u32 = 1;
 
-/// Composable world save file: base area + seed + chronological SDF edit log (extensible for
-/// future standalone `.wasm` elements and relocated `Scene` objects).
+/// Composable world save file: base area + seed + chronological SDF edit log + placed standalone
+/// `.wasm` elements (extensible for future relocated `Scene` objects).
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSave {
     pub version: u32,
     pub area: String,
     pub seed: u64,
     pub edits: Vec<Edit>,
+    pub elements: Vec<PlacedElement>,
 }
 
 impl WorldSave {
     pub fn new(area: impl Into<String>, seed: u64, edits: Vec<Edit>) -> WorldSave {
-        WorldSave { version: SAVE_VERSION, area: area.into(), seed, edits }
+        WorldSave { version: SAVE_VERSION, area: area.into(), seed, edits, elements: Vec::new() }
+    }
+
+    pub fn with_elements(area: impl Into<String>, seed: u64, edits: Vec<Edit>, elements: Vec<PlacedElement>) -> WorldSave {
+        WorldSave { version: SAVE_VERSION, area: area.into(), seed, edits, elements }
     }
 
     /// Serializes to a human-readable, deterministic, bit-exact text representation.
@@ -586,6 +616,20 @@ impl WorldSave {
                 }
             }
         }
+        for el in &self.elements {
+            let [px, py, pz] = el.pos;
+            if let Some(p) = el.promoted {
+                s.push_str(&format!(
+                    "element {} {} seed {} pos {} {} {} yaw {} scale {} size {} after {} promoted {}\n",
+                    el.id, el.module, el.seed, px, py, pz, el.yaw, el.scale, el.stamp_size, el.after_edits, p
+                ));
+            } else {
+                s.push_str(&format!(
+                    "element {} {} seed {} pos {} {} {} yaw {} scale {} size {} after {}\n",
+                    el.id, el.module, el.seed, px, py, pz, el.yaw, el.scale, el.stamp_size, el.after_edits
+                ));
+            }
+        }
         s
     }
 
@@ -595,6 +639,7 @@ impl WorldSave {
         let mut area = String::new();
         let mut seed = None;
         let mut edits = Vec::new();
+        let mut elements = Vec::new();
         for (line_no, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -614,13 +659,17 @@ impl WorldSave {
                 let edit = parse_sdf_line(line, line_no + 1)?;
                 edit.validate()?;
                 edits.push(edit);
+            } else if line.starts_with("element ") {
+                let el = parse_element_line(line, line_no + 1)?;
+                el.validate()?;
+                elements.push(el);
             } else {
                 bail!("line {}: unknown record `{line}`", line_no + 1);
             }
         }
         let version = version.ok_or_else(|| wasmtime::format_err!("missing `plateau-world` header"))?;
         let seed = seed.ok_or_else(|| wasmtime::format_err!("missing `seed` field"))?;
-        Ok(WorldSave { version, area, seed, edits })
+        Ok(WorldSave { version, area, seed, edits, elements })
     }
 
     /// Writes the save file atomically (write temp file in same directory, then rename).
@@ -696,6 +745,43 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<Edit> {
         bail!("line {line_no}: trailing tokens in sdf record");
     }
     Ok(Edit { op, shape, center, blend, material, stamp_size })
+}
+
+fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
+    let tok: Vec<&str> = line.split_whitespace().collect();
+    if tok.len() != 17 && tok.len() != 19 {
+        bail!("line {line_no}: expected 17 or 19 tokens in element record, got {}", tok.len());
+    }
+    let expect = |i: usize, kw: &str| -> Result<()> {
+        match tok.get(i) {
+            Some(&s) if s == kw => Ok(()),
+            other => bail!("line {line_no}: expected `{kw}` at token {i}, got {other:?}"),
+        }
+    };
+    let pf = |i: usize| -> Result<f32> {
+        tok[i].parse::<f32>().map_err(|e| wasmtime::format_err!("line {line_no}: bad float at token {i}: {e}"))
+    };
+    let id = tok[1].parse::<u32>().map_err(|e| wasmtime::format_err!("line {line_no}: bad element id: {e}"))?;
+    let module = tok[2].to_string();
+    expect(3, "seed")?;
+    let seed = tok[4].parse::<u64>().map_err(|e| wasmtime::format_err!("line {line_no}: bad element seed: {e}"))?;
+    expect(5, "pos")?;
+    let pos = [pf(6)?, pf(7)?, pf(8)?];
+    expect(9, "yaw")?;
+    let yaw = pf(10)?;
+    expect(11, "scale")?;
+    let scale = pf(12)?;
+    expect(13, "size")?;
+    let stamp_size = pf(14)?;
+    expect(15, "after")?;
+    let after_edits = tok[16].parse::<usize>().map_err(|e| wasmtime::format_err!("line {line_no}: bad after_edits: {e}"))?;
+    let promoted = if tok.len() == 19 {
+        expect(17, "promoted")?;
+        Some(tok[18].parse::<usize>().map_err(|e| wasmtime::format_err!("line {line_no}: bad promoted index: {e}"))?)
+    } else {
+        None
+    };
+    Ok(PlacedElement { id, module, seed, pos, yaw, scale, stamp_size, after_edits, promoted })
 }
 
 fn material_from_name(name: &str) -> Option<Material> {

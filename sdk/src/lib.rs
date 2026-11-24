@@ -37,7 +37,7 @@ pub mod rt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub use bindings::plateau::region::types::{
-    Answer, Borders, Command, Description, Edge, Instance, Light, Material, MeshData, Place, PlayerState, Point, Scene, Size, Vertex,
+    Answer, Borders, Command, Description, Edge, ElementBounds, Instance, Light, Material, MeshData, Place, PlayerState, Point, Scene, Size, Vertex,
 };
 pub use mesh::{MeshBuilder, Quat, SceneBuilder, instance, light};
 
@@ -70,6 +70,88 @@ pub trait Area: 'static {
     fn interact(&mut self, _player: &PlayerState) -> Vec<Command> {
         Vec::new()
     }
+    /// Local SDF bounding box & blend width when this module is a standalone carvable landform
+    /// element (`None` for full areas and pure procedural `Scene` elements).
+    fn element_bounds(&self) -> Option<ElementBounds> {
+        None
+    }
+}
+
+impl ElementBounds {
+    pub fn new(lo: Point, hi: Point, blend: f32) -> ElementBounds {
+        ElementBounds { lo, hi, blend }
+    }
+}
+
+/// A standalone composable `.wasm` element that can be placed onto any existing area at any size
+/// (tiny, person, giant) without recompiling the base area.
+///
+/// Authored in element-local space centered around `(0, 0, 0)` with its base at `y = 0`:
+/// - **Procedural `Scene` objects** (trees, bridges, lanterns, contraptions): leave `sdf_bounds()`
+///   as `None` and emit raw meshes, instances (`solid: true` for collision), lights, and optional
+///   local-space `tick` / `interact` commands.
+/// - **Carvable SDF landforms** (hills, boulders, arches, caves): return `Some(ElementBounds)`
+///   from `sdf_bounds()` and implement `sample()` in local coordinates (optionally also adding
+///   procedural `Scene` details).
+pub trait Element: 'static {
+    fn new(seed: u64) -> Self;
+    fn name(&self) -> &str;
+    fn sdf_bounds(&self) -> Option<ElementBounds> {
+        None
+    }
+    fn sample(&self, _at: Point, _view: &View) -> Answer {
+        Answer::new(1e4, Material::Soil)
+    }
+    fn scene(&self) -> Scene {
+        Scene { meshes: Vec::new(), instances: Vec::new(), lights: Vec::new() }
+    }
+    fn tick(&mut self, _dt: f32, _player: &PlayerState) -> Vec<Command> {
+        Vec::new()
+    }
+    fn interact(&mut self, _player: &PlayerState) -> Vec<Command> {
+        Vec::new()
+    }
+}
+
+/// Exports a type implementing `Element` as a standalone composable Plateau `.wasm` module
+/// (`element!(OakTree);`). Uses the exact same sandboxed `plateau:region@0.1.0` contract as
+/// `area!`, plus `element-bounds` metadata and native `played(seed)` for tests.
+#[macro_export]
+macro_rules! element {
+    ($ty:ty) => {
+        #[doc(hidden)]
+        pub struct __PlateauElementArea($ty);
+
+        impl $crate::Area for __PlateauElementArea {
+            fn new(seed: u64) -> Self {
+                __PlateauElementArea(<$ty as $crate::Element>::new(seed))
+            }
+            fn describe(&self) -> $crate::Description {
+                $crate::Description {
+                    name: <$ty as $crate::Element>::name(&self.0).into(),
+                    places: ::std::vec::Vec::new(),
+                    borders: $crate::Borders::of_ground(|_, _| 0.0),
+                }
+            }
+            fn sample(&self, at: $crate::Point, view: &$crate::View) -> $crate::Answer {
+                <$ty as $crate::Element>::sample(&self.0, at, view)
+            }
+            fn scene(&self) -> $crate::Scene {
+                <$ty as $crate::Element>::scene(&self.0)
+            }
+            fn tick(&mut self, dt: f32, player: &$crate::PlayerState) -> ::std::vec::Vec<$crate::Command> {
+                <$ty as $crate::Element>::tick(&mut self.0, dt, player)
+            }
+            fn interact(&mut self, player: &$crate::PlayerState) -> ::std::vec::Vec<$crate::Command> {
+                <$ty as $crate::Element>::interact(&mut self.0, player)
+            }
+            fn element_bounds(&self) -> ::core::option::Option<$crate::ElementBounds> {
+                <$ty as $crate::Element>::sdf_bounds(&self.0)
+            }
+        }
+
+        $crate::area!(__PlateauElementArea);
+    };
 }
 
 /// Makes the type an area: `area!(Garden);` once, in the area's file. Built for WebAssembly it
@@ -133,6 +215,10 @@ macro_rules! area {
                 fn interact(player: $crate::PlayerState) -> ::std::vec::Vec<$crate::Command> {
                     with_mut(|a| $crate::Area::interact(a, &player))
                 }
+
+                fn element_bounds() -> ::core::option::Option<$crate::ElementBounds> {
+                    with(|a| $crate::Area::element_bounds(a))
+                }
             }
 
             $crate::__export_region_impl!(Exports with_types_in $crate::bindings);
@@ -153,7 +239,7 @@ pub fn sample_all<A: Area>(area: &A, points: &[Point], size: f32) -> Vec<Answer>
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod native {
-    use crate::{Answer, Area, Command, Description, PlayerState, Point, Scene};
+    use crate::{Answer, Area, Command, Description, ElementBounds, PlayerState, Point, Scene};
 
     /// An area as the engine's tests play it, as the world's exports are called.
     pub trait Played {
@@ -167,6 +253,9 @@ pub mod native {
         }
         fn interact(&mut self, _player: &PlayerState) -> Vec<Command> {
             Vec::new()
+        }
+        fn element_bounds(&self) -> Option<ElementBounds> {
+            None
         }
     }
 
@@ -185,6 +274,9 @@ pub mod native {
         }
         fn interact(&mut self, player: &PlayerState) -> Vec<Command> {
             Area::interact(self, player)
+        }
+        fn element_bounds(&self) -> Option<ElementBounds> {
+            Area::element_bounds(self)
         }
     }
 }

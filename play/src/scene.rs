@@ -1,12 +1,13 @@
-//! GPU procedural scene renderer & runtime sync (`Scene` / `SceneWorld`).
+//! Multi-layer GPU procedural scene renderer & runtime sync (`Scene` / `SceneWorld`).
 //!
-//! - Static instances (`id == 0`) are merged once on load into a single batched Bevy `Mesh`
-//!   (1 draw call), sharing the exact same `SurfaceMaterial` and vertex attributes as terrain.
-//! - Dynamic instances (`id > 0`) share uploaded `Handle<Mesh>` assets (GPU instancing) and
-//!   update their `Transform`, `Visibility`, and mesh index every frame from `SceneWorld`.
-//! - Dynamic point lights (`SceneWorld::lights`) are spawned/updated/despawned in Bevy, with
-//!   positions, ranges, and physically scaled intensities (`intensity * scale²`) so lighting
-//!   looks consistent at tiny, person, and giant scales.
+//! - Base area (`owner = 0`) and each placed standalone `.wasm` element (`owner > 0`) live in their
+//!   own layer so placing or removing elements never rebuilds the base area's static mesh batch.
+//! - Static instances (`id == 0`) per layer are merged into 1 draw call using the shared
+//!   `SurfaceMaterial`.
+//! - Dynamic instances (`id > 0`) share uploaded `Handle<Mesh>` assets per owner and update their
+//!   `Transform`, `Visibility`, and mesh index every frame from `SceneWorld`.
+//! - Dynamic point lights (`SceneWorld::lights`) are spawned/updated/despawned per `(owner, id)`
+//!   with physically scaled intensities (`intensity * scale²`) across tiny, person, and giant scales.
 
 use std::collections::HashMap;
 
@@ -14,13 +15,12 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::picture::colour;
-use plateau_engine::scene::SceneWorld;
+use plateau_engine::scene::{BASE_OWNER, SceneWorld};
 use plateau_engine::{Light, Material, MeshData, Scene};
 
 use crate::surface::{SurfaceMaterial, properties};
 
-/// Shared marker for every entity owned by the procedural scene (static batch, dynamic instances,
-/// and dynamic lights) so chunk placement queries skip them cleanly.
+/// Shared marker for every entity owned by the procedural scene so chunk placement skips them.
 #[derive(Component)]
 pub struct SceneNode;
 
@@ -28,15 +28,24 @@ pub struct SceneNode;
 pub struct StaticSceneMesh;
 
 #[derive(Component)]
-pub struct DynamicInstance(pub u32);
+pub struct DynamicInstance {
+    pub owner: u32,
+    pub id: u32,
+}
 
 #[derive(Component)]
-pub struct SceneLight(pub u32);
+pub struct SceneLight {
+    pub owner: u32,
+    pub id: u32,
+}
 
 #[derive(Resource)]
 pub struct SceneVisuals {
-    mesh_handles: Vec<Option<Handle<Mesh>>>,
-    light_entities: HashMap<u32, Entity>,
+    pub material: Handle<SurfaceMaterial>,
+    layer_meshes: HashMap<u32, Vec<Option<Handle<Mesh>>>>,
+    layer_entities: HashMap<u32, Vec<Entity>>,
+    layer_triangles: HashMap<u32, usize>,
+    light_entities: HashMap<(u32, u32), Entity>,
     pub triangles: usize,
 }
 
@@ -45,7 +54,7 @@ fn vertex_color(mat: Material, tint: [u8; 3]) -> [f32; 4] {
     [r * (tint[0] as f32 / 255.0), g * (tint[1] as f32 / 255.0), b * (tint[2] as f32 / 255.0), 1.0]
 }
 
-fn to_bevy_mesh(m: &MeshData) -> Option<Mesh> {
+pub fn to_bevy_mesh(m: &MeshData) -> Option<Mesh> {
     if m.vertices.is_empty() || m.indices.is_empty() {
         return None;
     }
@@ -68,7 +77,7 @@ fn to_bevy_mesh(m: &MeshData) -> Option<Mesh> {
     Some(out)
 }
 
-fn build_static_batch(scene: &Scene) -> Option<(Mesh, usize)> {
+pub fn build_merged_mesh(scene: &Scene, static_only: bool, skip_solid: bool) -> Option<(Mesh, usize)> {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut colors = Vec::new();
@@ -76,7 +85,7 @@ fn build_static_batch(scene: &Scene) -> Option<(Mesh, usize)> {
     let mut indices = Vec::new();
 
     for inst in &scene.instances {
-        if inst.id != 0 {
+        if (static_only && inst.id != 0) || (skip_solid && inst.solid) {
             continue;
         }
         let Some(m) = scene.meshes.get(inst.mesh as usize) else { continue };
@@ -142,7 +151,7 @@ fn light_components(l: &Light, eye: [f64; 3], scale: f64) -> (PointLight, Transf
     (pl, tf)
 }
 
-/// Uploads scene meshes, spawns the batched static mesh, dynamic instances, and initial lights.
+/// Initializes `SceneVisuals` and spawns the base area layer (`owner = 0`).
 pub fn spawn(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -150,48 +159,127 @@ pub fn spawn(
     scene: &Scene,
     world: &SceneWorld,
 ) -> SceneVisuals {
-    let mut triangles = 0usize;
+    let mut visuals = SceneVisuals {
+        material,
+        layer_meshes: HashMap::new(),
+        layer_entities: HashMap::new(),
+        layer_triangles: HashMap::new(),
+        light_entities: HashMap::new(),
+        triangles: 0,
+    };
+    spawn_layer(commands, meshes, &mut visuals, BASE_OWNER, scene, world);
+    visuals
+}
 
-    if let Some((batch, tris)) = build_static_batch(scene) {
-        triangles += tris;
-        commands.spawn((
-            Mesh3d(meshes.add(batch)),
-            MeshMaterial3d(material.clone()),
-            Transform::default(),
-            Visibility::Visible,
-            SceneNode,
-            StaticSceneMesh,
-        ));
+/// Uploads and spawns one scene layer (`owner = 0` for base area, `owner > 0` for a placed element).
+pub fn spawn_layer(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    visuals: &mut SceneVisuals,
+    owner: u32,
+    scene: &Scene,
+    world: &SceneWorld,
+) {
+    spawn_layer_filtered(commands, meshes, visuals, owner, scene, world, false);
+}
+
+/// Uploads and spawns one scene layer, optionally omitting `solid: true` static instances when the
+/// layer's solid geometry has been lazily promoted into the carvable SDF layer.
+pub fn spawn_layer_filtered(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    visuals: &mut SceneVisuals,
+    owner: u32,
+    scene: &Scene,
+    world: &SceneWorld,
+    skip_solid: bool,
+) {
+    despawn_layer(commands, visuals, owner);
+
+    let mut entities = Vec::new();
+    let mut tris = 0usize;
+
+    if let Some((batch, batch_tris)) = build_merged_mesh(scene, true, skip_solid) {
+        tris += batch_tris;
+        let entity = commands
+            .spawn((
+                Mesh3d(meshes.add(batch)),
+                MeshMaterial3d(visuals.material.clone()),
+                Transform::default(),
+                Visibility::Visible,
+                SceneNode,
+                StaticSceneMesh,
+            ))
+            .id();
+        entities.push(entity);
     }
 
     let mesh_handles: Vec<Option<Handle<Mesh>>> = scene.meshes.iter().map(|m| to_bevy_mesh(m).map(|bm| meshes.add(bm))).collect();
 
-    for (&id, live) in &world.dynamic {
+    for (&(inst_owner, id), live) in &world.dynamic {
+        if inst_owner != owner {
+            continue;
+        }
         let Some(Some(handle)) = mesh_handles.get(live.instance.mesh as usize) else { continue };
         if let Some(m) = scene.meshes.get(live.instance.mesh as usize) {
-            triangles += m.indices.len() / 3;
+            tris += m.indices.len() / 3;
         }
-        commands.spawn((
-            Mesh3d(handle.clone()),
-            MeshMaterial3d(material.clone()),
-            Transform::default(),
-            if live.visible { Visibility::Visible } else { Visibility::Hidden },
-            SceneNode,
-            DynamicInstance(id),
-        ));
+        let entity = commands
+            .spawn((
+                Mesh3d(handle.clone()),
+                MeshMaterial3d(visuals.material.clone()),
+                Transform::default(),
+                if live.visible { Visibility::Visible } else { Visibility::Hidden },
+                SceneNode,
+                DynamicInstance { owner, id },
+            ))
+            .id();
+        entities.push(entity);
     }
 
-    let mut light_entities = HashMap::new();
-    for (&id, l) in &world.lights {
+    for (&(light_owner, id), l) in &world.lights {
+        if light_owner != owner {
+            continue;
+        }
         let (pl, tf) = light_components(l, [0.0; 3], 1.0);
-        let entity = commands.spawn((pl, tf, SceneNode, SceneLight(id))).id();
-        light_entities.insert(id, entity);
+        let entity = commands.spawn((pl, tf, SceneNode, SceneLight { owner, id })).id();
+        visuals.light_entities.insert((owner, id), entity);
     }
 
-    SceneVisuals { mesh_handles, light_entities, triangles }
+    visuals.layer_meshes.insert(owner, mesh_handles);
+    visuals.layer_entities.insert(owner, entities);
+    visuals.layer_triangles.insert(owner, tris);
+    visuals.triangles += tris;
 }
 
-/// Keeps static batch, dynamic instances, and dynamic lights synced with the player's eye & scale.
+/// Despawns every GPU entity and light belonging to `owner`.
+pub fn despawn_layer(commands: &mut Commands, visuals: &mut SceneVisuals, owner: u32) {
+    if let Some(entities) = visuals.layer_entities.remove(&owner) {
+        for entity in entities {
+            commands.entity(entity).despawn();
+        }
+    }
+    visuals.layer_meshes.remove(&owner);
+    if let Some(tris) = visuals.layer_triangles.remove(&owner) {
+        visuals.triangles = visuals.triangles.saturating_sub(tris);
+    }
+    let light_keys: Vec<(u32, u32)> = visuals.light_entities.keys().copied().filter(|&(o, _)| o == owner).collect();
+    for key in light_keys {
+        if let Some(entity) = visuals.light_entities.remove(&key) {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+/// Despawns all placed element layers (`owner > 0`), leaving the base area intact.
+pub fn despawn_placed_layers(commands: &mut Commands, visuals: &mut SceneVisuals) {
+    let owners: Vec<u32> = visuals.layer_entities.keys().copied().filter(|&o| o != BASE_OWNER).collect();
+    for owner in owners {
+        despawn_layer(commands, visuals, owner);
+    }
+}
+
+/// Keeps static batches, dynamic instances, and dynamic lights synced with the player's eye & scale.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn sync(
     commands: &mut Commands,
@@ -218,8 +306,9 @@ pub fn sync(
         tf.scale = Vec3::splat(s);
     }
 
-    for (DynamicInstance(id), mut tf, mut vis, mut mesh3d) in dynamic_q.iter_mut() {
-        let Some(live) = world.dynamic.get(id) else {
+    for (di, mut tf, mut vis, mut mesh3d) in dynamic_q.iter_mut() {
+        let key = (di.owner, di.id);
+        let Some(live) = world.dynamic.get(&key) else {
             vis.set_if_neq(Visibility::Hidden);
             continue;
         };
@@ -233,24 +322,24 @@ pub fn sync(
         tf.rotation = if q.length_squared() > 1e-6 { q.normalize() } else { Quat::IDENTITY };
         tf.scale = Vec3::from_array(live.instance.scale) * s;
         vis.set_if_neq(if live.visible { Visibility::Visible } else { Visibility::Hidden });
-        if let Some(Some(handle)) = visuals.mesh_handles.get(live.instance.mesh as usize)
+        if let Some(Some(handle)) = visuals.layer_meshes.get(&di.owner).and_then(|v| v.get(live.instance.mesh as usize))
             && mesh3d.0 != *handle
         {
             mesh3d.0 = handle.clone();
         }
     }
 
-    // Despawn lights removed by SetLight(intensity == 0).
-    let removed: Vec<u32> = visuals.light_entities.keys().copied().filter(|id| !world.lights.contains_key(id)).collect();
-    for id in removed {
-        if let Some(entity) = visuals.light_entities.remove(&id) {
+    // Despawn lights removed by SetLight(intensity == 0) or despawned layers.
+    let removed: Vec<(u32, u32)> = visuals.light_entities.keys().copied().filter(|k| !world.lights.contains_key(k)).collect();
+    for key in removed {
+        if let Some(entity) = visuals.light_entities.remove(&key) {
             commands.entity(entity).despawn();
         }
     }
 
     // Update existing lights.
-    for (SceneLight(id), mut tf, mut pl) in light_q.iter_mut() {
-        if let Some(l) = world.lights.get(id) {
+    for (sl, mut tf, mut pl) in light_q.iter_mut() {
+        if let Some(l) = world.lights.get(&(sl.owner, sl.id)) {
             let (next_pl, next_tf) = light_components(l, eye, scale);
             *pl = next_pl;
             *tf = next_tf;
@@ -258,11 +347,11 @@ pub fn sync(
     }
 
     // Spawn newly added lights.
-    for (&id, l) in &world.lights {
-        if !visuals.light_entities.contains_key(&id) {
+    for (&(owner, id), l) in &world.lights {
+        if !visuals.light_entities.contains_key(&(owner, id)) {
             let (pl, tf) = light_components(l, eye, scale);
-            let entity = commands.spawn((pl, tf, SceneNode, SceneLight(id))).id();
-            visuals.light_entities.insert(id, entity);
+            let entity = commands.spawn((pl, tf, SceneNode, SceneLight { owner, id })).id();
+            visuals.light_entities.insert((owner, id), entity);
         }
     }
 }
