@@ -140,17 +140,27 @@ impl Chunks {
         }
     }
 
-    /// Publishes an updated `ComposedLog` snapshot to worker threads and invalidates affected chunks.
+    /// Publishes an updated `ComposedLog` snapshot to worker threads and invalidates affected chunks
+    /// (both cached in `known` and currently in-flight in `jobs.making` so stale builds never
+    /// overwrite or leave permanent holes).
     pub fn set_composed(&mut self, composed: Arc<ComposedLog>, inv: Invalidate<'_>) {
         let rev = composed.revision();
-        {
+        let in_flight: Vec<Key> = {
             let mut jobs = self.queue.jobs.lock().unwrap();
             jobs.composed = composed;
-        }
+            jobs.making
+                .iter()
+                .filter(|&(&k, &r)| r < rev && inv.affects(k))
+                .map(|(&k, _)| k)
+                .collect()
+        };
         for (&key, known) in &self.known {
             if known.revision() < rev && inv.affects(key) {
                 self.stale.insert(key, rev);
             }
+        }
+        for key in in_flight {
+            self.stale.insert(key, rev);
         }
         self.queue.more.notify_all();
     }
@@ -242,8 +252,13 @@ impl Chunks {
             if self.known.get(&done.key).is_some_and(|k| k.revision() > done.revision) {
                 continue;
             }
-            if self.stale.get(&done.key).is_some_and(|&need| done.revision >= need) {
-                self.stale.remove(&done.key);
+            if let Some(&need) = self.stale.get(&done.key) {
+                if done.revision >= need {
+                    self.stale.remove(&done.key);
+                } else if self.known.contains_key(&done.key) {
+                    // Discard superseded in-flight build rather than flashing a stale empty/old mesh.
+                    continue;
+                }
             }
 
             let was_known = self.known.contains_key(&done.key);

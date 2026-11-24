@@ -5,6 +5,7 @@
 //! `cargo run --release -p plateau-play [-- area.wasm] [--seed N] [--save file.plateau] [--element elem.wasm ...] [--tour folder [--behind]]`;
 //! the walled garden (`areas/modules/garden.wasm`) unless another module is given.
 
+mod carry;
 mod chunks;
 mod figure;
 mod flags;
@@ -26,10 +27,12 @@ use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
+use carry::{CarriedItem, CarryAssets, CarryGhost, CarryState, FallingElement, HeldVisual};
 use chunks::{Chunks, Invalidate};
 use place::{ElementGhost, PlaceMode, PreviewAssets, WorldAction};
 use plateau_engine::body::{self, Body, Intent};
 use plateau_engine::compose::{Composed, ComposedLog, ElementRuntime, PlacedElement, PlacementTransform};
+use plateau_engine::cut::{CarryDecision, check_carry, check_cut, choose_cut_plane, clip_scene, format_mass, toppled_transform, world_edit_to_local};
 use plateau_engine::edit::{Edit, EditLog, Op, WorldSave, surface_normal};
 use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld};
 use plateau_engine::{Command, Compiled, ElementBounds, Limits, PlayerState, Region, SIZES, START, Scene, Wasm, rings};
@@ -142,6 +145,7 @@ fn main() {
         })
         .insert_resource(Sculpt::new(initial_edits, save_path, described.name.clone(), seed))
         .insert_resource(place_mode)
+        .insert_resource(CarryState::default())
         .insert_resource(LiveScene { world, elapsed: 0.0, interact_pressed: false, holding_use: false })
         .insert_resource(Player {
             body,
@@ -160,7 +164,10 @@ fn main() {
         .insert_non_send(Physics(physics))
         .insert_non_send(Elements(element_runtime))
         .add_systems(Startup, setup)
-        .add_systems(Update, (look_and_ask, step, frame, draw, sculpt::place_ghost, place::place_ghost, figure::animate, flags::place, hud).chain());
+        .add_systems(
+            Update,
+            (look_and_ask, step, frame, draw, sculpt::place_ghost, place::place_ghost, carry::sync_visuals, figure::animate, flags::place, hud).chain(),
+        );
     if let Some(folder) = tour {
         std::fs::create_dir_all(&folder).expect("the tour's folder");
         app.insert_resource(Tour::new(folder)).add_systems(Update, go_on_tour.before(step));
@@ -253,11 +260,13 @@ fn setup(
     }
     commands.insert_resource(visuals);
     let composed = area.initial_composed.take().unwrap_or_else(|| Arc::new(ComposedLog::empty()));
+    let surface_opaque = surface.opaque.clone();
     commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, composed, surface));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
     flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
     sculpt::spawn_ghost(&mut commands, &mut meshes, &mut materials);
     place::spawn_ghost(&mut commands, &mut meshes, &mut materials);
+    carry::spawn_visuals(&mut commands, &mut meshes, &mut materials, surface_opaque);
     let sun = Vec3::new(0.48, 0.70, 0.53).normalize();
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
@@ -275,7 +284,7 @@ fn setup(
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
         Text::new(
-            "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  B sculpt  /  P place element (LMB place, RMB/X remove, Tab next, R/T rotate, Wheel scale, Ctrl+R rescan)\n\
+            "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  K chop  /  G grab & carry (H flat, R/T turn, Wheel tilt)  /  B sculpt  /  P place\n\
              1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  C sit  /  V view  /  M flags  /  F12 shot",
         ),
         text(14.0),
@@ -303,8 +312,8 @@ fn sizes() -> [f32; 3] {
     SIZES.map(|(_, h)| h)
 }
 
-/// Bundled resources for world editing (`B` sculpt & `P` place element) to keep Bevy's system
-/// parameter count compact.
+/// Bundled resources for world editing (`B` sculpt, `P` place element, `K` chop, `G` carry) to keep
+/// Bevy's system parameter count compact.
 #[derive(SystemParam)]
 struct EditCtx<'w, 's> {
     commands: Commands<'w, 's>,
@@ -313,6 +322,8 @@ struct EditCtx<'w, 's> {
     preview: ResMut<'w, PreviewAssets>,
     sculpt: ResMut<'w, Sculpt>,
     place: ResMut<'w, PlaceMode>,
+    carry: ResMut<'w, CarryState>,
+    carry_assets: Res<'w, CarryAssets>,
     chunks: ResMut<'w, Chunks>,
     live: ResMut<'w, LiveScene>,
     physics: NonSendMut<'w, Physics>,
@@ -320,24 +331,44 @@ struct EditCtx<'w, 's> {
 }
 
 impl EditCtx<'_, '_> {
+    fn excluded_sdf_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.carry.falling.iter().map(|f| f.id).collect();
+        if let Some(h) = &self.carry.held {
+            ids.push(h.id);
+        }
+        ids
+    }
+
     fn commit_composed(&mut self, inv: Invalidate<'_>) {
-        let composed = self.place.build_composed(self.sculpt.edits.clone());
+        let exclude = self.excluded_sdf_ids();
+        let composed = self.place.build_composed_excluding(self.sculpt.edits.clone(), &exclude);
         self.physics.0.log = composed.clone();
         self.physics.0.prune_instances();
         self.chunks.set_composed(composed, inv);
     }
 
+    /// Syncs macro-LOD solid `Scene` proxies for promoted elements when the player grows/shrinks
+    /// across `PROMOTED_SDF_MAX_SIZE_RATIO` (e.g., switching to Giant keeps carved tree trunks solid!).
+    fn sync_macro_proxies(&mut self, viewer_size: f32) {
+        let changed = self.elements.0.sync_macro_proxies(viewer_size, &mut self.live.world);
+        for (id, world_scene, skip_solid) in changed {
+            scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, id, &world_scene, &self.live.world, skip_solid);
+        }
+    }
+
     fn spawn_placed(&mut self, pl: PlacedElement, player: &mut Player) -> plateau_engine::Result<String> {
         let compiled = self.place.catalog.get_or_load(&pl.module)?;
         let name = compiled.name.clone();
-        let world_scene = self.elements.0.spawn(pl.clone(), &compiled, &mut self.live.world)?;
-        scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, pl.id, &world_scene, &self.live.world, pl.is_promoted());
+        let world_scene = self.elements.0.spawn_for_size(pl.clone(), &compiled, &mut self.live.world, player.body.size)?;
+        let skip_solid = self.elements.0.should_skip_solid(pl.id);
+        scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, pl.id, &world_scene, &self.live.world, skip_solid);
         self.place.placed.push(pl.clone());
         self.sculpt.dirty = true;
         let sdf_bounds = if let Some(bounds) = compiled.sdf_bounds {
             Some(bounds)
         } else if pl.is_promoted() {
-            self.place.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed)?.map(|m| m.bounds())
+            let _ = self.place.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)?;
+            self.place.sdf_bounds_of(&pl)
         } else {
             None
         };
@@ -356,6 +387,7 @@ impl EditCtx<'_, '_> {
     }
 
     fn remove_placed(&mut self, id: u32) -> Option<PlacedElement> {
+        self.carry.cancel_fall(id);
         let idx = self.place.placed.iter().position(|e| e.id == id)?;
         let removed = self.place.placed.remove(idx);
         let sdf_bounds = self.place.sdf_bounds_of(&removed);
@@ -366,6 +398,119 @@ impl EditCtx<'_, '_> {
             self.commit_composed(Invalidate::SdfElement(removed.transform(), bounds));
         }
         Some(removed)
+    }
+
+    /// Updates a placed element's world transform in `PlaceMode`, `ElementRuntime`, `SceneWorld`,
+    /// GPU visuals, and (for promoted elements not mid-fall) `ComposedLog`.
+    fn relocate_placed(&mut self, id: u32, tf: PlacementTransform, player: Option<&mut Player>) -> bool {
+        let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        let old_tf = self.place.placed[pos].transform();
+        let old_bounds = self.place.sdf_bounds_of(&self.place.placed[pos]);
+        self.place.placed[pos].set_transform(tf);
+        let scale = self.place.placed[pos].scale;
+        let mid_fall = self.carry.falling.iter().any(|f| f.id == id);
+        let skip_solid = if mid_fall { false } else { self.elements.0.should_skip_solid(id) };
+        if let Some(world_scene) = self.elements.0.relocate(id, tf, &mut self.live.world) {
+            scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, id, &world_scene, &self.live.world, skip_solid);
+        }
+        if !mid_fall && let Some(bounds) = old_bounds {
+            let inv_bounds = [(old_tf, bounds), (tf, bounds)];
+            self.commit_composed(Invalidate::Combined { edit: None, bounds: &inv_bounds });
+        }
+        self.sculpt.dirty = true;
+        if let Some(p) = player {
+            let max_lift = (scale * 3.0) as f64 + p.body.size as f64;
+            let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
+            let _ = p.body.surface_from_solid(&mut combined, max_lift);
+        }
+        true
+    }
+
+    /// Cancels an active carry and restores the object cleanly to where it was picked up.
+    fn cancel_carry(&mut self) -> Option<String> {
+        let item = self.carry.held.take()?;
+        let sdf_bounds = self.place.placed.iter().find(|e| e.id == item.id).and_then(|pl| self.place.sdf_bounds_of(pl));
+        if let Some(pos) = self.place.placed.iter().position(|e| e.id == item.id) {
+            self.place.placed[pos].set_transform(item.original_tf);
+        }
+        let _ = self.elements.0.relocate(item.id, item.original_tf, &mut self.live.world);
+        if let Some(world_scene) = self.elements.0.set_held(item.id, false, &mut self.live.world) {
+            let skip_solid = self.elements.0.should_skip_solid(item.id);
+            scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, item.id, &world_scene, &self.live.world, skip_solid);
+        }
+        if let Some(bounds) = sdf_bounds {
+            self.commit_composed(Invalidate::SdfElement(item.original_tf, bounds));
+        }
+        Some(item.name)
+    }
+
+    /// Places the currently carried object at `aim_world`, restoring solid collision / SDF chunks
+    /// and optionally pushing an undoable `RelocateElement` action.
+    fn drop_carried_at(&mut self, aim_world: [f64; 3], player: &mut Player, record_undo: bool) -> Option<String> {
+        let item = self.carry.held.take()?;
+        let new_tf = item.target_transform(aim_world);
+        let sdf_bounds = self.place.placed.iter().find(|e| e.id == item.id).and_then(|pl| self.place.sdf_bounds_of(pl));
+        if let Some(pos) = self.place.placed.iter().position(|e| e.id == item.id) {
+            self.place.placed[pos].set_transform(new_tf);
+        }
+        let _ = self.elements.0.relocate(item.id, new_tf, &mut self.live.world);
+        if let Some(world_scene) = self.elements.0.set_held(item.id, false, &mut self.live.world) {
+            let skip_solid = self.elements.0.should_skip_solid(item.id);
+            scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, item.id, &world_scene, &self.live.world, skip_solid);
+        }
+        if let Some(bounds) = sdf_bounds {
+            self.commit_composed(Invalidate::SdfElement(new_tf, bounds));
+        }
+        self.sculpt.dirty = true;
+        if record_undo {
+            self.place.undo_stack.push(WorldAction::RelocateElement { id: item.id, before: item.original_tf, after: new_tf });
+            self.place.redo_stack.clear();
+        }
+        let max_lift = (item.scale * 3.0) as f64 + player.body.size as f64;
+        let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
+        let _ = player.body.surface_from_solid(&mut combined, max_lift);
+        Some(item.name)
+    }
+
+    /// Snaps any in-flight topple animations immediately to their resting transforms (called before
+    /// save, undo/redo, or reload so world state is always settled).
+    fn finish_all_falls(&mut self, player: Option<&mut Player>) {
+        let pending = std::mem::take(&mut self.carry.falling);
+        for fall in pending {
+            let to_tf = PlacementTransform::with_rot(fall.to_pos, fall.to_rot, fall.scale);
+            self.relocate_placed(fall.id, to_tf, None);
+        }
+        if let Some(p) = player {
+            let max_lift = p.body.size as f64 * 3.0;
+            let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
+            let _ = p.body.surface_from_solid(&mut combined, max_lift);
+        }
+    }
+
+    /// Advances smooth gravity-eased topple animations for newly chopped objects.
+    fn tick_falling(&mut self, dt: f32, player: &mut Player) {
+        if self.carry.falling.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        let mut updates = Vec::new();
+        for (idx, fall) in self.carry.falling.iter_mut().enumerate() {
+            fall.elapsed += dt;
+            let tf = fall.sample();
+            let finished = fall.elapsed >= fall.duration;
+            updates.push((fall.id, tf, finished));
+            if finished {
+                done.push(idx);
+            }
+        }
+        for idx in done.into_iter().rev() {
+            self.carry.falling.remove(idx);
+        }
+        for (id, tf, finished) in updates {
+            self.relocate_placed(id, tf, if finished { Some(&mut *player) } else { None });
+        }
     }
 
     /// Lazily promotes any solid `Scene` placed elements overlapping `edit` (or `aimed_owner`)
@@ -394,15 +539,17 @@ impl EditCtx<'_, '_> {
             }
             let module = self.place.placed[pos].module.clone();
             let seed = self.place.placed[pos].seed;
+            let clips = self.place.placed[pos].clips.clone();
             let Ok(compiled) = self.place.catalog.get_or_load(&module) else { continue };
             if compiled.is_sdf() {
                 continue;
             }
-            let Ok(Some(mesh_sdf)) = self.place.catalog.get_or_build_mesh_sdf(&module, seed) else { continue };
+            let Ok(Some(mesh_sdf)) = self.place.catalog.get_or_build_mesh_sdf(&module, seed, &clips) else { continue };
             self.place.placed[pos].promoted = Some(edit_idx);
             let tf = self.place.placed[pos].transform();
             if let Some(world_scene) = self.elements.0.set_promoted(id, Some(edit_idx), &mut self.live.world) {
-                scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, id, &world_scene, &self.live.world, true);
+                let skip = self.elements.0.should_skip_solid(id);
+                scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, id, &world_scene, &self.live.world, skip);
             }
             promoted.push((id, edit_idx));
             bounds_list.push((tf, mesh_sdf.bounds()));
@@ -419,12 +566,14 @@ impl EditCtx<'_, '_> {
             let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else { continue };
             let module = self.place.placed[pos].module.clone();
             let seed = self.place.placed[pos].seed;
+            let clips = self.place.placed[pos].clips.clone();
             let tf = self.place.placed[pos].transform();
-            if let Ok(Some(mesh_sdf)) = self.place.catalog.get_or_build_mesh_sdf(&module, seed) {
+            if let Ok(Some(mesh_sdf)) = self.place.catalog.get_or_build_mesh_sdf(&module, seed, &clips) {
                 bounds_list.push((tf, mesh_sdf.bounds()));
             }
             self.place.placed[pos].promoted = next_state;
             if let Some(world_scene) = self.elements.0.set_promoted(id, next_state, &mut self.live.world) {
+                let skip = self.elements.0.should_skip_solid(id);
                 scene::spawn_layer_filtered(
                     &mut self.commands,
                     &mut self.meshes,
@@ -432,7 +581,7 @@ impl EditCtx<'_, '_> {
                     id,
                     &world_scene,
                     &self.live.world,
-                    next_state.is_some(),
+                    skip,
                 );
             }
         }
@@ -440,6 +589,8 @@ impl EditCtx<'_, '_> {
     }
 
     fn reload_world(&mut self) -> plateau_engine::Result<(usize, usize)> {
+        self.carry.held = None;
+        self.carry.falling.clear();
         let saved = self.sculpt.load_world()?;
         let edit_count = saved.edits.len();
         self.sculpt.replace_edits(saved.edits)?;
@@ -492,6 +643,9 @@ fn look_and_ask(
     if tour.is_some() {
         return;
     }
+    ctx.tick_falling(time.delta_secs().min(0.1), &mut player);
+    ctx.sync_macro_proxies(player.body.size);
+
     let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
     if grabbed && player.body.change.is_none() {
         player.body.yaw -= motion.delta.x * 0.0025;
@@ -499,14 +653,34 @@ fn look_and_ask(
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
+    let carry_speed = ctx.carry.speed_factor();
     player.intent = Intent {
-        forward: if ctrl { 0.0 } else { held(KeyCode::KeyW) - held(KeyCode::KeyS) },
-        right: held(KeyCode::KeyD) - held(KeyCode::KeyA),
+        forward: if ctrl { 0.0 } else { (held(KeyCode::KeyW) - held(KeyCode::KeyS)) * carry_speed },
+        right: (held(KeyCode::KeyD) - held(KeyCode::KeyA)) * carry_speed,
         run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
         jump: keys.pressed(KeyCode::Space),
     };
 
+    // If shrinking made the carried object exceed current size's carry capacity, set it down safely.
+    if let Some(item) = &ctx.carry.held
+        && !check_carry(&item.physics, false, player.body.size).is_allowed()
+    {
+        let fwd = Vec3::new(-player.body.yaw.sin(), 0.0, -player.body.yaw.cos());
+        let dist = (player.body.size * 1.5).max(item.physics.world_radius(item.scale) + player.body.size * 0.5) as f64;
+        let drop_pos = [
+            player.body.feet[0] + fwd.x as f64 * dist,
+            player.body.feet[1],
+            player.body.feet[2] + fwd.z as f64 * dist,
+        ];
+        if let Some(name) = ctx.drop_carried_at(drop_pos, &mut player, true) {
+            player.say(format!("{name} too heavy at this size — set down"));
+        }
+    }
+
     if keys.just_pressed(KeyCode::KeyB) {
+        if ctx.carry.is_carrying() {
+            let _ = ctx.cancel_carry();
+        }
         ctx.sculpt.active = !ctx.sculpt.active;
         ctx.sculpt.hold_timer = 0.0;
         ctx.sculpt.last_stamp = None;
@@ -521,6 +695,9 @@ fn look_and_ask(
     }
 
     if keys.just_pressed(KeyCode::KeyP) {
+        if ctx.carry.is_carrying() {
+            let _ = ctx.cancel_carry();
+        }
         ctx.place.active = !ctx.place.active;
         if ctx.place.active {
             ctx.sculpt.active = false;
@@ -543,7 +720,7 @@ fn look_and_ask(
         player.say(format!("rescanned elements: {n} available"));
     }
 
-    let tool_active = ctx.sculpt.active || ctx.place.active;
+    let tool_active = ctx.sculpt.active || ctx.place.active || ctx.carry.is_carrying();
     if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
         ctx.live.interact_pressed = true;
     }
@@ -621,32 +798,76 @@ fn look_and_ask(
                         d2 >= min_step * min_step
                     });
                 if spacing_ok {
-                    // Lazy Scene → SDF conversion: if this sculpt touches any unpromoted solid
-                    // placed `Scene` element (tree, bridge, etc.), promote its solid mesh to SDF
-                    // right before this edit so carving/adding cuts into it seamlessly!
+                    // Check if the player is sculpting directly onto a discrete procedural `Scene`
+                    // element (either unpromoted or already promoted). If so, store the edit in
+                    // that element's `local_edits` so carved tunnels & notches travel and rotate
+                    // with the object if it is later chopped (`K`) or carried (`G`)!
                     let edit_idx = ctx.sculpt.edits.len();
-                    let aimed_solid = ctx
+                    let hit_dist = ((h[0] - pivot[0]).powi(2) + (h[1] - pivot[1]).powi(2) + (h[2] - pivot[2]).powi(2)).sqrt() as f32;
+                    let tol = ctx.sculpt.radius(psize) * 2.0 + psize * 0.5;
+                    let aimed_unpromoted = ctx
                         .live
                         .world
                         .raycast_solid_placed(pivot.map(|c| c as f32), dir, reach)
-                        .and_then(|(owner, t)| {
-                            let hit_dist = ((h[0] - pivot[0]).powi(2) + (h[1] - pivot[1]).powi(2) + (h[2] - pivot[2]).powi(2)).sqrt() as f32;
-                            if (t - hit_dist).abs() <= ctx.sculpt.radius(psize) * 2.0 + psize * 0.5 {
-                                Some(owner)
-                            } else {
-                                None
+                        .and_then(|(owner, t)| if (t - hit_dist).abs() <= tol { Some(owner) } else { None });
+                    let aimed_promoted_scene = ctx
+                        .place
+                        .raycast_placed_sdf(pivot.map(|c| c as f32), dir, reach)
+                        .and_then(|(owner, _)| {
+                            let pl = ctx.place.placed.iter().find(|e| e.id == owner)?;
+                            if !pl.is_promoted() || ctx.place.catalog.get(&pl.module).is_some_and(|c| c.is_sdf()) {
+                                return None;
                             }
+                            let b = ctx.place.sdf_bounds_of(pl)?;
+                            let (lo, hi) = pl.transform().world_bounds(b);
+                            let h32 = [h[0] as f32, h[1] as f32, h[2] as f32];
+                            let pad = ctx.sculpt.radius(psize) + 0.15 * pl.scale;
+                            let inside = (0..3).all(|a| h32[a] >= lo[a] - pad && h32[a] <= hi[a] + pad);
+                            inside.then_some(owner)
                         });
-                    let (promoted_ids, promo_bounds, promo_names) = ctx.promote_overlapping_scene_elements(&edit, aimed_solid, edit_idx);
-                    match ctx.sculpt.push_edit(edit) {
-                        Ok(()) => {
-                            ctx.place.undo_stack.push(WorldAction::SdfEdit { edit, promoted_ids });
-                            ctx.place.redo_stack.clear();
-                            if promo_bounds.is_empty() {
-                                ctx.commit_composed(Invalidate::Edit(&edit));
+                    let direct_scene_target = aimed_unpromoted.or(aimed_promoted_scene).filter(|&owner| {
+                        ctx.place
+                            .placed
+                            .iter()
+                            .find(|e| e.id == owner)
+                            .is_some_and(|pl| !ctx.place.catalog.get(&pl.module).is_some_and(|c| c.is_sdf()))
+                    });
+
+                    if let Some(target_id) = direct_scene_target
+                        && let Some(pos) = ctx.place.placed.iter().position(|e| e.id == target_id)
+                    {
+                        let module = ctx.place.placed[pos].module.clone();
+                        let seed = ctx.place.placed[pos].seed;
+                        let clips = ctx.place.placed[pos].clips.clone();
+                        let tf = ctx.place.placed[pos].transform();
+                        if let Ok(Some(_)) = ctx.place.catalog.get_or_build_mesh_sdf(&module, seed, &clips) {
+                            let local_edit = world_edit_to_local(&edit, tf);
+                            let newly_promoted = if ctx.place.placed[pos].is_promoted() {
+                                None
                             } else {
+                                ctx.place.placed[pos].promoted = Some(edit_idx);
+                                Some(edit_idx)
+                            };
+                            ctx.place.placed[pos].local_edits.push(local_edit);
+                            ctx.sculpt.dirty = true;
+                            if newly_promoted.is_some()
+                                && let Some(world_scene) = ctx.elements.0.set_promoted(target_id, Some(edit_idx), &mut ctx.live.world)
+                            {
+                                let skip = ctx.elements.0.should_skip_solid(target_id);
+                                scene::spawn_layer_filtered(&mut ctx.commands, &mut ctx.meshes, &mut ctx.visuals, target_id, &world_scene, &ctx.live.world, skip);
+                            }
+                            if newly_promoted.is_some() {
+                                let bounds = ctx.place.sdf_bounds_of(&ctx.place.placed[pos]);
+                                let promo_bounds: Vec<_> = bounds.into_iter().map(|b| (tf, b)).collect();
                                 ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
-                                player.say(format!("{} converted to carvable solid", promo_names.join(", ")));
+                            } else {
+                                ctx.commit_composed(Invalidate::Edit(&edit));
+                            }
+                            ctx.place.undo_stack.push(WorldAction::ElementSdfEdit { id: target_id, edit: local_edit, newly_promoted });
+                            ctx.place.redo_stack.clear();
+                            if newly_promoted.is_some() {
+                                let name = ctx.place.catalog.get(&module).map_or_else(|| format!("#{target_id}"), |c| c.name.clone());
+                                player.say(format!("{name} sculpted (still choppable & carriable)"));
                             }
                             if edit.op == Op::Add {
                                 let (_, hi) = edit.influence_bounds();
@@ -657,7 +878,31 @@ fn look_and_ask(
                             ctx.sculpt.last_stamp = Some(edit.center);
                             ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
                         }
-                        Err(e) => player.say(format!("sculpt error: {e}")),
+                    } else {
+                        // World terrain sculpt: lazily promote any solid `Scene` elements touched
+                        // by this world edit so carving/adding cuts into them seamlessly.
+                        let (promoted_ids, promo_bounds, promo_names) = ctx.promote_overlapping_scene_elements(&edit, aimed_unpromoted, edit_idx);
+                        match ctx.sculpt.push_edit(edit) {
+                            Ok(()) => {
+                                ctx.place.undo_stack.push(WorldAction::SdfEdit { edit, promoted_ids });
+                                ctx.place.redo_stack.clear();
+                                if promo_bounds.is_empty() {
+                                    ctx.commit_composed(Invalidate::Edit(&edit));
+                                } else {
+                                    ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
+                                    player.say(format!("{} converted to carvable solid", promo_names.join(", ")));
+                                }
+                                if edit.op == Op::Add {
+                                    let (_, hi) = edit.influence_bounds();
+                                    let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
+                                    let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                                    let _ = player.body.surface_from_solid(&mut combined, max_lift);
+                                }
+                                ctx.sculpt.last_stamp = Some(edit.center);
+                                ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
+                            }
+                            Err(e) => player.say(format!("sculpt error: {e}")),
+                        }
                     }
                 }
             }
@@ -705,10 +950,13 @@ fn look_and_ask(
                 seed: ctx.sculpt.seed.wrapping_mul(31).wrapping_add(id as u64),
                 pos: [h[0] as f32, h[1] as f32, h[2] as f32],
                 yaw: ctx.place.yaw,
+                rot: None,
                 scale,
                 stamp_size: psize,
                 after_edits: ctx.sculpt.edits.len(),
                 promoted: None,
+                clips: Vec::new(),
+                local_edits: Vec::new(),
             };
             match ctx.spawn_placed(pl.clone(), &mut player) {
                 Ok(name) => {
@@ -742,8 +990,258 @@ fn look_and_ask(
         }
     }
 
-    // Unified Undo / Redo across sculpt edits, lazy promotions, and placed elements.
+    // Chop / Cut discrete procedural Scene objects (Step 8c: K key — works on both unpromoted and
+    // tunnel-carved promoted Scene elements!).
+    if keys.just_pressed(KeyCode::KeyK) && !ctx.carry.is_carrying() {
+        ctx.sculpt.active = false;
+        ctx.sculpt.aim = None;
+        ctx.place.active = false;
+        ctx.place.aim = None;
+        let reach = psize * 10.0;
+        let piv32 = pivot.map(|c| c as f32);
+        let scene_hit = ctx.live.world.raycast_placed_surface(piv32, dir, reach);
+        let sdf_hit = ctx.place.raycast_placed_sdf(piv32, dir, reach).map(|(id, t)| {
+            let exact = {
+                let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                body::look(&mut combined, pivot, dir, psize, reach).ok().flatten()
+            };
+            let hit_p = exact.map_or([piv32[0] + dir[0] * t, piv32[1] + dir[1] * t, piv32[2] + dir[2] * t], |h| [h[0] as f32, h[1] as f32, h[2] as f32]);
+            (id, t, hit_p)
+        });
+        let target_hit = match (scene_hit, sdf_hit) {
+            (Some((a, ta, pa)), Some((b, tb, pb))) => Some(if ta <= tb { (a, pa) } else { (b, pb) }),
+            (Some((a, _, pa)), None) => Some((a, pa)),
+            (None, Some((b, _, pb))) => Some((b, pb)),
+            (None, None) => None,
+        };
+        if let Some((id, hit_world)) = target_hit {
+            ctx.finish_all_falls(Some(&mut player));
+            if let Some(original) = ctx.place.placed.iter().find(|e| e.id == id).cloned() {
+                let is_sdf = ctx.place.catalog.get(&original.module).is_some_and(|e| e.is_sdf());
+                let elem_name = ctx.place.catalog.get(&original.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
+                if let Some(phys) = ctx.elements.0.physics_of(id) {
+                    match check_cut(&phys, is_sdf, psize) {
+                        Err(reason) => player.say(reason),
+                        Ok(()) => {
+                            let orig_tf = original.transform();
+                            let hit_local = orig_tf.world_to_local_point(hit_world);
+                            if let Some(plane) = choose_cut_plane(&phys, hit_local) {
+                                let raw_local = ctx.elements.0.local_scene_of(id).cloned();
+                                if let Some(cur_scene) = raw_local {
+                                    let lower_sc = clip_scene(&cur_scene, &[plane.flipped()]);
+                                    let upper_sc = clip_scene(&cur_scene, &[plane]);
+                                    let lower_ok = !lower_sc.instances.is_empty();
+                                    let upper_ok = !upper_sc.instances.is_empty();
+                                    if lower_ok && upper_ok {
+                                        let mut lower = original.clone();
+                                        lower.clips.push(plane.flipped());
+
+                                        let upper_id = ctx.place.alloc_id();
+                                        let mut upper = original.clone();
+                                        upper.id = upper_id;
+                                        upper.clips.push(plane);
+
+                                        let upper_phys = plateau_engine::cut::ObjectPhysics::compute(&upper_sc, upper.scale);
+                                        let was_upright = !CarriedItem::is_rot_horizontal(orig_tf.rot);
+
+                                        // Compute target resting transform for the detached upper half.
+                                        let target_upper_tf = if was_upright {
+                                            let flen = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt();
+                                            let (fx, fz) = if flen > 1e-3 {
+                                                (dir[0] / flen, dir[2] / flen)
+                                            } else {
+                                                (-player.body.yaw.sin(), -player.body.yaw.cos())
+                                            };
+                                            let probe_x = orig_tf.pos[0] as f64 + (fx * upper_phys.world_span * 0.45) as f64;
+                                            let probe_z = orig_tf.pos[2] as f64 + (fz * upper_phys.world_span * 0.45) as f64;
+                                            let ground_y = {
+                                                let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                                                let start_y = orig_tf.pos[1] as f64 + upper_phys.world_span as f64 + 1.0;
+                                                body::look(&mut combined, [probe_x, start_y, probe_z], [0.0, -1.0, 0.0], psize, upper_phys.world_span * 2.0 + 10.0)
+                                                    .ok()
+                                                    .flatten()
+                                                    .map_or(orig_tf.pos[1], |h| h[1] as f32)
+                                            };
+                                            toppled_transform(orig_tf, &upper_phys, [fx, fz], ground_y)
+                                        } else {
+                                            // Cross-cutting an already lying log: nudge apart cleanly along cut normal.
+                                            let wn = orig_tf.local_to_world_dir(plane.normal);
+                                            let gap = (0.14 * upper.scale).max(0.01);
+                                            let shifted = [
+                                                orig_tf.pos[0] + wn[0] * gap,
+                                                orig_tf.pos[1] + wn[1] * gap,
+                                                orig_tf.pos[2] + wn[2] * gap,
+                                            ];
+                                            PlacementTransform::with_rot(shifted, orig_tf.rot, orig_tf.scale)
+                                        };
+
+                                        let mut upper_settled = upper.clone();
+                                        upper_settled.set_transform(target_upper_tf);
+
+                                        if was_upright {
+                                            ctx.carry.falling.push(FallingElement {
+                                                id: upper_id,
+                                                from_pos: orig_tf.pos,
+                                                from_rot: orig_tf.rot,
+                                                to_pos: target_upper_tf.pos,
+                                                to_rot: target_upper_tf.rot,
+                                                scale: orig_tf.scale,
+                                                elapsed: 0.0,
+                                                duration: 0.48,
+                                            });
+                                        }
+                                        ctx.remove_placed(original.id);
+                                        let spawn_lower = ctx.spawn_placed(lower.clone(), &mut player);
+                                        let spawn_upper = ctx.spawn_placed(if was_upright { upper.clone() } else { upper_settled.clone() }, &mut player);
+                                        if spawn_lower.is_ok() && spawn_upper.is_ok() {
+                                            if was_upright && upper.is_promoted() {
+                                                // Show solid procedural mesh during the 0.48s fall so
+                                                // promoted carved trunks animate smoothly, then restore
+                                                // exact SDF + tunnel on settle!
+                                                if let Some(world_scene) = ctx.elements.0.relocate(upper_id, orig_tf, &mut ctx.live.world) {
+                                                    scene::spawn_layer_filtered(&mut ctx.commands, &mut ctx.meshes, &mut ctx.visuals, upper_id, &world_scene, &ctx.live.world, false);
+                                                }
+                                            }
+                                            ctx.place.undo_stack.push(WorldAction::CutElement {
+                                                original,
+                                                lower,
+                                                upper: upper_settled,
+                                            });
+                                            ctx.place.redo_stack.clear();
+                                            player.say(format!("chopped {elem_name} — press G to carry"));
+                                        } else {
+                                            ctx.carry.cancel_fall(upper_id);
+                                        }
+                                    } else {
+                                        player.say("cut plane missed solid geometry — aim nearer the middle");
+                                    }
+                                }
+                            } else {
+                                player.say("too small to cut cleanly");
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            player.say("aim at a placed object within reach to chop (K)");
+        }
+    }
+
+    // Grab / Carry / Rotate / Tilt / Place discrete procedural Scene objects (Step 8c: G key).
+    if ctx.carry.is_carrying() {
+        let reach = (psize * 12.0).max(ctx.carry.held.as_ref().map_or(0.0, |h| h.physics.world_span * 2.5));
+        let aim = {
+            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+            body::look(&mut combined, pivot, dir, psize, reach).ok().flatten()
+        };
+        if let Some(item) = &mut ctx.carry.held {
+            item.aim = aim.or_else(|| {
+                let d = (psize * 3.5).max(item.physics.world_radius(item.scale) + psize) as f64;
+                Some([pivot[0] + dir[0] as f64 * d, player.body.feet[1], pivot[2] + dir[2] as f64 * d])
+            });
+            if keys.just_pressed(KeyCode::KeyH) {
+                item.flat = !item.flat;
+                item.pitch = 0.0;
+                player.say(if item.flat { "orientation: horizontal (bridge)" } else { "orientation: upright" });
+            }
+            if !ctrl && keys.just_pressed(KeyCode::KeyR) {
+                item.yaw -= std::f32::consts::FRAC_PI_6 * 0.5; // -15 deg
+            }
+            if keys.just_pressed(KeyCode::KeyT) {
+                item.yaw += std::f32::consts::FRAC_PI_6 * 0.5; // +15 deg
+            }
+            if scroll.delta.y > 0.0 || keys.just_pressed(KeyCode::BracketRight) {
+                item.pitch = (item.pitch + 10.0f32.to_radians()).clamp(-50.0f32.to_radians(), 50.0f32.to_radians());
+            } else if scroll.delta.y < 0.0 || keys.just_pressed(KeyCode::BracketLeft) {
+                item.pitch = (item.pitch - 10.0f32.to_radians()).clamp(-50.0f32.to_radians(), 50.0f32.to_radians());
+            }
+        }
+        if keys.just_pressed(KeyCode::KeyG) || (grabbed && buttons.just_pressed(MouseButton::Left)) {
+            if let Some(target_aim) = ctx.carry.held.as_ref().and_then(|h| h.aim)
+                && let Some(name) = ctx.drop_carried_at(target_aim, &mut player, true)
+            {
+                player.say(format!("placed {name} down"));
+            }
+        } else if (grabbed && buttons.just_pressed(MouseButton::Right)) || keys.just_pressed(KeyCode::KeyX) {
+            if let Some(name) = ctx.cancel_carry() {
+                player.say(format!("returned {name}"));
+            }
+        }
+    } else if keys.just_pressed(KeyCode::KeyG) {
+        ctx.sculpt.active = false;
+        ctx.sculpt.aim = None;
+        ctx.place.active = false;
+        ctx.place.aim = None;
+        let reach = psize * 10.0;
+        let piv32 = pivot.map(|c| c as f32);
+        let scene_hit = ctx.live.world.raycast_placed_surface(piv32, dir, reach).map(|(o, t, _)| (o, t))
+            .or_else(|| ctx.live.world.raycast_placed_owner(piv32, dir, reach));
+        let sdf_hit = ctx.place.raycast_placed_sdf(piv32, dir, reach);
+        let target_id = match (scene_hit, sdf_hit) {
+            (Some((a, ta)), Some((b, tb))) => Some(if ta <= tb { a } else { b }),
+            (Some((a, _)), None) => Some(a),
+            (None, Some((b, _))) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(id) = target_id {
+            ctx.finish_all_falls(Some(&mut player));
+            if let Some(pl) = ctx.place.placed.iter().find(|e| e.id == id).cloned() {
+                let is_sdf = ctx.place.catalog.get(&pl.module).is_some_and(|e| e.is_sdf());
+                let name = ctx.place.catalog.get(&pl.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
+                let phys = ctx.elements.0.physics_of(id);
+                if let Some(phys) = phys {
+                    match check_carry(&phys, is_sdf, psize) {
+                        CarryDecision::Blocked(reason) => player.say(reason),
+                        CarryDecision::Allowed { speed_factor } => {
+                            let orig_tf = pl.transform();
+                            let sdf_bounds = ctx.place.sdf_bounds_of(&pl);
+                            let flat = CarriedItem::is_rot_horizontal(orig_tf.rot);
+                            let mesh_handle = ctx
+                                .elements
+                                .0
+                                .local_scene_of(id)
+                                .and_then(|sc| scene::build_merged_mesh(sc, false, false))
+                                .map_or_else(|| ctx.carry_assets.fallback.clone(), |(m, _)| ctx.meshes.add(m));
+                            ctx.elements.0.set_held(id, true, &mut ctx.live.world);
+                            scene::despawn_layer(&mut ctx.commands, &mut ctx.visuals, id);
+                            ctx.carry.held = Some(CarriedItem {
+                                id,
+                                name: name.clone(),
+                                scale: pl.scale,
+                                physics: phys,
+                                original_tf: orig_tf,
+                                speed_factor,
+                                yaw: player.body.yaw,
+                                pitch: 0.0,
+                                flat,
+                                aim: None,
+                                mesh: mesh_handle,
+                            });
+                            if let Some(bounds) = sdf_bounds {
+                                ctx.commit_composed(Invalidate::SdfElement(orig_tf, bounds));
+                            }
+                            player.say(format!(
+                                "carrying {name} ({}) — H flat, R/T turn, Wheel tilt, LMB/G place",
+                                format_mass(phys.world_mass_kg)
+                            ));
+                        }
+                    }
+                } else {
+                    player.say("rooted in terrain — sculpt with B");
+                }
+            }
+        } else {
+            player.say("aim at a placed object within reach to grab (G)");
+        }
+    }
+
+    // Unified Undo / Redo across sculpt edits, lazy promotions, placements, cuts, and relocations.
     if (tool_active && keys.just_pressed(KeyCode::KeyZ)) || (ctrl && keys.just_pressed(KeyCode::KeyZ)) {
+        if ctx.carry.is_carrying() {
+            let _ = ctx.cancel_carry();
+        }
+        ctx.finish_all_falls(Some(&mut player));
         if let Some(action) = ctx.place.undo_stack.pop() {
             match action.clone() {
                 WorldAction::SdfEdit { edit, promoted_ids } => {
@@ -759,6 +1257,26 @@ fn look_and_ask(
                         player.say(format!("undo sculpt ({} edits)", ctx.sculpt.edits.len()));
                     }
                 }
+                WorldAction::ElementSdfEdit { id, newly_promoted, .. } => {
+                    if let Some(pos) = ctx.place.placed.iter().position(|e| e.id == id) {
+                        let old_bounds = ctx.place.sdf_bounds_of(&ctx.place.placed[pos]);
+                        let tf = ctx.place.placed[pos].transform();
+                        ctx.place.placed[pos].local_edits.pop();
+                        if newly_promoted.is_some() {
+                            ctx.place.placed[pos].promoted = None;
+                            if let Some(world_scene) = ctx.elements.0.set_promoted(id, None, &mut ctx.live.world) {
+                                scene::spawn_layer_filtered(&mut ctx.commands, &mut ctx.meshes, &mut ctx.visuals, id, &world_scene, &ctx.live.world, false);
+                            }
+                        }
+                        if let Some(b) = old_bounds {
+                            ctx.commit_composed(Invalidate::SdfElement(tf, b));
+                        } else {
+                            ctx.commit_composed(Invalidate::All);
+                        }
+                        ctx.place.redo_stack.push(action);
+                        player.say("undo object sculpt");
+                    }
+                }
                 WorldAction::PlaceElement(pl) => {
                     if ctx.remove_placed(pl.id).is_some() {
                         ctx.place.redo_stack.push(action);
@@ -771,6 +1289,20 @@ fn look_and_ask(
                         player.say(format!("restored element ({} elements)", ctx.place.placed.len()));
                     }
                 }
+                WorldAction::CutElement { original, lower, upper } => {
+                    ctx.remove_placed(upper.id);
+                    ctx.remove_placed(lower.id);
+                    if ctx.spawn_placed(original, &mut player).is_ok() {
+                        ctx.place.redo_stack.push(action);
+                        player.say("undo chop");
+                    }
+                }
+                WorldAction::RelocateElement { id, before, .. } => {
+                    if ctx.relocate_placed(id, before, Some(&mut player)) {
+                        ctx.place.redo_stack.push(action);
+                        player.say("undo move");
+                    }
+                }
             }
         } else {
             player.say("nothing to undo");
@@ -778,6 +1310,10 @@ fn look_and_ask(
     }
 
     if (tool_active && keys.just_pressed(KeyCode::KeyY)) || (ctrl && keys.just_pressed(KeyCode::KeyY)) {
+        if ctx.carry.is_carrying() {
+            let _ = ctx.cancel_carry();
+        }
+        ctx.finish_all_falls(Some(&mut player));
         if let Some(action) = ctx.place.redo_stack.pop() {
             match action.clone() {
                 WorldAction::SdfEdit { edit, promoted_ids } => {
@@ -799,6 +1335,30 @@ fn look_and_ask(
                         player.say(format!("redo sculpt ({} edits)", ctx.sculpt.edits.len()));
                     }
                 }
+                WorldAction::ElementSdfEdit { id, edit, newly_promoted } => {
+                    if let Some(pos) = ctx.place.placed.iter().position(|e| e.id == id) {
+                        let module = ctx.place.placed[pos].module.clone();
+                        let seed = ctx.place.placed[pos].seed;
+                        let clips = ctx.place.placed[pos].clips.clone();
+                        let _ = ctx.place.catalog.get_or_build_mesh_sdf(&module, seed, &clips);
+                        ctx.place.placed[pos].local_edits.push(edit);
+                        if let Some(idx) = newly_promoted {
+                            ctx.place.placed[pos].promoted = Some(idx);
+                            if let Some(world_scene) = ctx.elements.0.set_promoted(id, Some(idx), &mut ctx.live.world) {
+                                let skip = ctx.elements.0.should_skip_solid(id);
+                                scene::spawn_layer_filtered(&mut ctx.commands, &mut ctx.meshes, &mut ctx.visuals, id, &world_scene, &ctx.live.world, skip);
+                            }
+                        }
+                        let tf = ctx.place.placed[pos].transform();
+                        if let Some(b) = ctx.place.sdf_bounds_of(&ctx.place.placed[pos]) {
+                            ctx.commit_composed(Invalidate::SdfElement(tf, b));
+                        } else {
+                            ctx.commit_composed(Invalidate::All);
+                        }
+                        ctx.place.undo_stack.push(action);
+                        player.say("redo object sculpt");
+                    }
+                }
                 WorldAction::PlaceElement(pl) => {
                     if ctx.spawn_placed(pl, &mut player).is_ok() {
                         ctx.place.undo_stack.push(action);
@@ -811,6 +1371,19 @@ fn look_and_ask(
                         player.say(format!("redo remove ({} elements)", ctx.place.placed.len()));
                     }
                 }
+                WorldAction::CutElement { original, lower, upper } => {
+                    ctx.remove_placed(original.id);
+                    if ctx.spawn_placed(lower, &mut player).is_ok() && ctx.spawn_placed(upper, &mut player).is_ok() {
+                        ctx.place.undo_stack.push(action);
+                        player.say("redo chop");
+                    }
+                }
+                WorldAction::RelocateElement { id, after, .. } => {
+                    if ctx.relocate_placed(id, after, Some(&mut player)) {
+                        ctx.place.undo_stack.push(action);
+                        player.say("redo move");
+                    }
+                }
             }
         } else {
             player.say("nothing to redo");
@@ -819,6 +1392,10 @@ fn look_and_ask(
 
     // Save / Reload complete world (base area + seed + SDF edits + placed elements).
     if keys.just_pressed(KeyCode::F5) || (ctrl && keys.just_pressed(KeyCode::KeyS)) {
+        if ctx.carry.is_carrying() {
+            let _ = ctx.cancel_carry();
+        }
+        ctx.finish_all_falls(Some(&mut player));
         match ctx.sculpt.save_world(&ctx.place.placed) {
             Ok(()) => {
                 let msg = format!(
@@ -1041,12 +1618,12 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, live: Res<LiveScene>, mut 
     player.back = if target < player.back { target } else { player.back + (target - player.back) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
 }
 
-/// Where the chunks are drawn, and whether: everything but the camera, sun, ghosts, and procedural scene.
+/// Where the chunks are drawn, and whether: everything but the camera, sun, ghosts, carried item, and procedural scene.
 type Placed<'w, 's> = Query<
     'w,
     's,
     (&'static mut Transform, &'static mut Visibility, Option<&'static mut MeshMaterial3d<SurfaceMaterial>>),
-    (Without<Camera3d>, Without<Sun>, Without<BrushGhost>, Without<ElementGhost>, Without<scene::SceneNode>),
+    (Without<Camera3d>, Without<Sun>, Without<BrushGhost>, Without<ElementGhost>, Without<HeldVisual>, Without<CarryGhost>, Without<scene::SceneNode>),
 >;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1127,6 +1704,7 @@ fn hud(
     visuals: Res<SceneVisuals>,
     sculpt: Res<Sculpt>,
     place: Res<PlaceMode>,
+    carry: Res<CarryState>,
     diagnostics: Res<DiagnosticsStore>,
     area: Res<Area>,
 ) {
@@ -1169,7 +1747,18 @@ fn hud(
         feet[2]
     );
     let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
-    if sculpt.active {
+    if let Some(item) = &carry.held {
+        let orient = if item.flat { "horizontal" } else { "upright" };
+        let yaw_deg = item.yaw.to_degrees().rem_euclid(360.0).round() as i32;
+        let tilt_deg = item.pitch.to_degrees().round() as i32;
+        let speed_pct = (item.speed_factor * 100.0).round() as i32;
+        s += &format!(
+            "\nCARRY: {} ({}, pace {}%)  /  {orient}  /  yaw {yaw_deg}° tilt {tilt_deg:+}°  (LMB/G place, H flip flat, R/T turn, Wheel tilt, RMB/X cancel)",
+            item.name,
+            format_mass(item.physics.world_mass_kg),
+            speed_pct
+        );
+    } else if sculpt.active {
         let r = sculpt.radius(b.size);
         let r_str = if r < 0.1 {
             format!("{:.1} mm", r * 1000.0)

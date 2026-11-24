@@ -7,16 +7,19 @@
 //! - The moment a player carves or sculpts onto a solid `Scene` element, its `solid: true`
 //!   instances are baked into an element-local `MeshSdf` while decorative `solid: false` instances
 //!   (e.g. swaying oak canopy, bridge handrails, glowing lantern head) remain crisp in `Scene`.
-//! - **Exact `|grad d| == 1`** at every scale (down to sub-millimetre tiny caves) via BVH
-//!   point-to-triangle distance.
-//! - **Exact union sign for overlapping closed sub-parts** (e.g. trunk + buttress roots, or
-//!   overlapping bridge planks) via BVH signed ray-winding (`exits - enters > 0`), with face
-//!   normals automatically aligned to outward vertex normals so every `MeshBuilder` primitive
-//!   produces consistent outward orientation.
+//! - **Exact union of overlapping closed sub-parts**: each `solid: true` instance is partitioned
+//!   into connected closed components (e.g., oak trunk + 4 buttress roots + 5 boughs, or
+//!   overlapping bridge planks) and evaluated as `min_k d_k(p)`. This eliminates internal buried
+//!   zero-crossings where sub-parts overlap, preventing `smooth_cut` tearing and Surface Nets
+//!   distortions when carving deep tunnels into multi-part procedural meshes!
+//! - **Exact `|grad d| <= 1`** at every scale (down to sub-millimetre tiny caves) via per-component
+//!   BVH point-to-triangle distance + signed ray-winding (`exits - enters > 0`).
+
+use std::collections::HashMap;
 
 use crate::{Answer, ElementBounds, Instance, Material, Scene};
 
-/// One world/local triangle with outward-aligned unit face normal and tight AABB.
+/// One local triangle with outward-aligned unit face normal and tight AABB.
 #[derive(Clone, Copy, Debug)]
 struct SdfTri {
     a: [f32; 3],
@@ -42,14 +45,23 @@ struct BvhNode {
     kind: NodeKind,
 }
 
-/// Deterministic, immutable BVH-backed Signed Distance Field over all `solid: true` triangles of a
-/// procedural `Scene` (in element-local space).
+/// Exact BVH-backed SDF for one connected closed sub-mesh component.
 #[derive(Clone, Debug)]
-pub struct MeshSdf {
+struct ComponentSdf {
     tris: Vec<SdfTri>,
     nodes: Vec<BvhNode>,
     lo: [f32; 3],
     hi: [f32; 3],
+}
+
+/// Deterministic, immutable BVH-backed Signed Distance Field over the exact union of all connected
+/// `solid: true` sub-parts of a procedural `Scene` (in element-local space).
+#[derive(Clone, Debug)]
+pub struct MeshSdf {
+    components: Vec<ComponentSdf>,
+    lo: [f32; 3],
+    hi: [f32; 3],
+    total_tris: usize,
 }
 
 /// Three deterministic, non-axis-aligned unit directions for signed ray-winding with grazing fallback.
@@ -59,18 +71,8 @@ const WINDING_DIRS: [[f32; 3]; 3] = [
     [0.317_248_6, -0.441_125_2, 0.840_096_5],
 ];
 
-impl MeshSdf {
-    /// Builds a `MeshSdf` from all `solid: true` instances in `scene` (in the scene's own local
-    /// space). Returns `None` if the scene has no solid triangles.
-    pub fn from_solid_scene(scene: &Scene) -> Option<MeshSdf> {
-        let mut tris = Vec::new();
-        for inst in &scene.instances {
-            if !inst.solid {
-                continue;
-            }
-            let Some(mesh) = scene.meshes.get(inst.mesh as usize) else { continue };
-            append_instance_tris(inst, mesh, &mut tris);
-        }
+impl ComponentSdf {
+    fn from_tris(mut tris: Vec<SdfTri>) -> Option<ComponentSdf> {
         if tris.is_empty() {
             return None;
         }
@@ -82,7 +84,6 @@ impl MeshSdf {
                 hi[a] = max_f32(hi[a], t.hi[a]);
             }
         }
-        // Small padding so bounds strictly enclose vertices on all 6 faces.
         let pad = 1e-3;
         for a in 0..3 {
             lo[a] -= pad;
@@ -91,36 +92,21 @@ impl MeshSdf {
         let mut nodes = Vec::with_capacity(tris.len() * 2);
         let len = tris.len();
         build_bvh(&mut tris, 0, len, &mut nodes);
-        Some(MeshSdf { tris, nodes, lo, hi })
+        Some(ComponentSdf { tris, nodes, lo, hi })
     }
 
-    pub fn lo(&self) -> [f32; 3] {
-        self.lo
-    }
-
-    pub fn hi(&self) -> [f32; 3] {
-        self.hi
-    }
-
-    pub fn bounds(&self) -> ElementBounds {
-        ElementBounds { lo: self.lo, hi: self.hi, blend: 0.0 }
-    }
-
-    pub fn triangle_count(&self) -> usize {
-        self.tris.len()
-    }
-
-    /// Evaluates the exact signed distance and surface material at local point `p`.
-    /// Returns `None` if `p` is guaranteed farther than `max_dist` from every triangle.
-    pub fn sample(&self, p: [f32; 3], max_dist: f32) -> Option<Answer> {
+    fn sample(&self, p: [f32; 3], max_dist: f32) -> Option<Answer> {
         if self.nodes.is_empty() {
             return None;
         }
         let root_d = point_to_aabb_distance(p, self.lo, self.hi);
-        if root_d >= max_dist {
+        if root_d > 0.0 && root_d >= max_dist {
             return None;
         }
-        let (best_d, best_mat) = self.closest_triangle(p, max_dist)?;
+        // When `root_d == 0.0`, `p` may be inside this component; search with unbounded `f32::INFINITY`
+        // so interior depth is always exact.
+        let search_limit = if root_d == 0.0 { f32::INFINITY } else { max_dist };
+        let (best_d, best_mat) = self.closest_triangle(p, search_limit)?;
         let inside = if root_d == 0.0 { self.is_inside(p) } else { false };
         let distance = if inside { -max_f32(best_d, 1e-5) } else { best_d };
         Some(Answer { distance, material: best_mat })
@@ -156,7 +142,6 @@ impl MeshSdf {
                 NodeKind::Branch { left, right } => {
                     let dl = point_to_aabb_distance(p, self.nodes[left as usize].lo, self.nodes[left as usize].hi);
                     let dr = point_to_aabb_distance(p, self.nodes[right as usize].lo, self.nodes[right as usize].hi);
-                    // Push farther child first so nearer child pops first and tightens `best_d` early.
                     if dl < dr {
                         if dr < best_d && sp < stack.len() {
                             stack[sp] = right;
@@ -182,8 +167,6 @@ impl MeshSdf {
         best_mat.map(|m| (best_d, m))
     }
 
-    /// Exact integer winding test (`exits - enters > 0`) for unions of closed outward-oriented
-    /// sub-meshes, retrying with alternate non-axis-aligned directions if a ray grazes an edge.
     fn is_inside(&self, p: [f32; 3]) -> bool {
         let mut last = 0i32;
         for &dir in &WINDING_DIRS {
@@ -195,9 +178,6 @@ impl MeshSdf {
         last > 0
     }
 
-    /// Casts a ray from `p` along unit direction `dir` and counts `exits - enters` across all
-    /// triangles intersected at `t > 0`. Returns `(winding, grazed)` where `grazed` signals an
-    /// edge/vertex near-hit that warrants retrying a different ray direction.
     fn ray_winding(&self, p: [f32; 3], dir: [f32; 3]) -> (i32, bool) {
         let inv = [1.0 / dir[0], 1.0 / dir[1], 1.0 / dir[2]];
         let mut winding = 0i32;
@@ -244,6 +224,153 @@ impl MeshSdf {
     }
 }
 
+impl MeshSdf {
+    /// Builds a `MeshSdf` from the exact union of all connected closed `solid: true` sub-parts
+    /// in `scene` (in the scene's own local space). Returns `None` if no solid triangles exist.
+    pub fn from_solid_scene(scene: &Scene) -> Option<MeshSdf> {
+        let mut components = Vec::new();
+        let mut total_tris = 0usize;
+        for inst in &scene.instances {
+            if !inst.solid {
+                continue;
+            }
+            let Some(mesh) = scene.meshes.get(inst.mesh as usize) else { continue };
+            let mut inst_tris = Vec::new();
+            append_instance_tris(inst, mesh, &mut inst_tris);
+            if inst_tris.is_empty() {
+                continue;
+            }
+            total_tris += inst_tris.len();
+            for group in split_connected_components(inst_tris) {
+                if let Some(comp) = ComponentSdf::from_tris(group) {
+                    components.push(comp);
+                }
+            }
+        }
+        if components.is_empty() {
+            return None;
+        }
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for c in &components {
+            for a in 0..3 {
+                lo[a] = min_f32(lo[a], c.lo[a]);
+                hi[a] = max_f32(hi[a], c.hi[a]);
+            }
+        }
+        Some(MeshSdf { components, lo, hi, total_tris })
+    }
+
+    pub fn lo(&self) -> [f32; 3] {
+        self.lo
+    }
+
+    pub fn hi(&self) -> [f32; 3] {
+        self.hi
+    }
+
+    pub fn bounds(&self) -> ElementBounds {
+        ElementBounds { lo: self.lo, hi: self.hi, blend: 0.0 }
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.total_tris
+    }
+
+    /// Evaluates the exact union signed distance `min_k d_k(p)` and surface material at local
+    /// point `p`. Returns `None` if `p` is guaranteed farther than `max_dist` from every component.
+    pub fn sample(&self, p: [f32; 3], max_dist: f32) -> Option<Answer> {
+        if self.components.is_empty() {
+            return None;
+        }
+        let root_d = point_to_aabb_distance(p, self.lo, self.hi);
+        if root_d > 0.0 && root_d >= max_dist {
+            return None;
+        }
+        let mut best: Option<Answer> = None;
+        let mut best_d = max_dist;
+        for comp in &self.components {
+            let cd = point_to_aabb_distance(p, comp.lo, comp.hi);
+            // Only skip when strictly outside `comp`'s AABB (`cd > 0.0`): when `cd == 0.0`, `p`
+            // may lie inside `comp` with a negative distance deeper than `best_d`!
+            if cd > 0.0 && cd >= best_d {
+                continue;
+            }
+            let comp_limit = if best_d > 0.0 { best_d } else { f32::INFINITY };
+            if let Some(ans) = comp.sample(p, comp_limit)
+                && ans.distance < best_d
+            {
+                best_d = ans.distance;
+                best = Some(ans);
+            }
+        }
+        best
+    }
+}
+
+/// Partitions `tris` into connected components by welding shared vertex positions (within 0.1 mm),
+/// so `cuboid` / `extrude` / clipped meshes stay single closed components while overlapping
+/// `sweep_tube` branches/roots or bridge planks separate into clean independent union sub-parts.
+fn split_connected_components(tris: Vec<SdfTri>) -> Vec<Vec<SdfTri>> {
+    let n = tris.len();
+    if n <= 1 {
+        return vec![tris];
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    let find = |parent: &mut [usize], mut x: usize| -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    };
+    let union = |parent: &mut [usize], a: usize, b: usize| {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    };
+
+    let quant = |p: [f32; 3]| -> [i64; 3] {
+        [
+            (p[0] as f64 * 10_000.0).round() as i64,
+            (p[1] as f64 * 10_000.0).round() as i64,
+            (p[2] as f64 * 10_000.0).round() as i64,
+        ]
+    };
+
+    let mut vert_owner: HashMap<[i64; 3], usize> = HashMap::with_capacity(n * 2);
+    for (ti, tri) in tris.iter().enumerate() {
+        for p in [tri.a, tri.b, tri.c] {
+            let key = quant(p);
+            if let Some(&first_ti) = vert_owner.get(&key) {
+                union(&mut parent, first_ti, ti);
+            } else {
+                vert_owner.insert(key, ti);
+            }
+        }
+    }
+
+    // Group triangles deterministically in order of first appearance.
+    let mut root_to_group: HashMap<usize, usize> = HashMap::new();
+    let mut groups: Vec<Vec<SdfTri>> = Vec::new();
+    for (ti, tri) in tris.into_iter().enumerate() {
+        let root = find(&mut parent, ti);
+        let gidx = match root_to_group.get(&root) {
+            Some(&idx) => idx,
+            None => {
+                let idx = groups.len();
+                root_to_group.insert(root, idx);
+                groups.push(Vec::new());
+                idx
+            }
+        };
+        groups[gidx].push(tri);
+    }
+    groups
+}
+
 fn append_instance_tris(inst: &Instance, mesh: &crate::MeshData, out: &mut Vec<SdfTri>) {
     let sc = inst.scale;
     let inv_sc = [
@@ -270,12 +397,10 @@ fn append_instance_tris(inst: &Instance, mesh: &crate::MeshData, out: &mut Vec<S
         let mut g = cross3(e1, e2);
         let glen = len3(g);
         if glen <= 1e-10 {
-            continue; // skip degenerate zero-area triangles
+            continue;
         }
         g = [g[0] / glen, g[1] / glen, g[2] / glen];
 
-        // Align geometric face normal to the outward vertex normals emitted by MeshBuilder
-        // (guarantees consistent outward orientation across cuboid, sweep_tube, ellipsoid, cone, etc.).
         let na = xform_n(va.normal);
         let nb = xform_n(vb.normal);
         let nc = xform_n(vc.normal);
@@ -312,7 +437,6 @@ fn build_bvh(tris: &mut [SdfTri], start: usize, end: usize, nodes: &mut Vec<BvhN
         nodes.push(BvhNode { lo, hi, kind: NodeKind::Leaf { start: start as u32, count: count as u32 } });
         return idx;
     }
-    // Longest centroid extent axis.
     let ext = [chi[0] - clo[0], chi[1] - clo[1], chi[2] - clo[2]];
     let axis = if ext[0] >= ext[1] && ext[0] >= ext[2] {
         0

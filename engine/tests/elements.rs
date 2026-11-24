@@ -18,7 +18,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use plateau_engine::body::{Body, Intent};
-use plateau_engine::compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, SdfElementEntry};
+use plateau_engine::compose::{
+    CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PROMOTED_SDF_MAX_SIZE_RATIO, PlacedElement, PlacementTransform, SdfElementEntry,
+    euler_quat,
+};
+use plateau_engine::cut::{ClipPlane, ObjectPhysics, check_carry, check_cut, choose_cut_plane, clip_scene, toppled_transform, world_edit_to_local};
 use plateau_engine::edit::{Edit, EditLog, Shape, WorldSave};
 use plateau_engine::scene::{Combined, SceneWorld};
 use plateau_engine::{Limits, Material, PlayerState, Region, SIZES, Wasm, chunk, hash, laws};
@@ -88,10 +92,13 @@ fn placed_sdf_hill_carves_tiny_cave_and_preserves_chronological_order() {
         seed: 42,
         pos: [32.0, 0.0, 48.0],
         yaw: 0.4,
+        rot: None,
         scale: 1.0,
         stamp_size: SIZES[1].1,
         after_edits: 1,
         promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
     };
 
     // 3. Carve a tiny cave right into the placed hill's flank (`after_edits = 1`, so `edits[1]` runs AFTER hill!).
@@ -152,10 +159,13 @@ fn placed_bridge_is_walkable_solid_geometry_at_every_scale() {
             seed: 9,
             pos: [32.0, deck_base_y, 45.0],
             yaw: 0.0,
+            rot: None,
             scale,
             stamp_size: player_size,
             after_edits: 0,
             promoted: None,
+            clips: Vec::new(),
+            local_edits: Vec::new(),
         };
         runtime.spawn(pl, &bridge, &mut world).unwrap();
 
@@ -186,10 +196,13 @@ fn multiple_lantern_placements_isolate_state_transforms_and_scale_lights() {
         seed: 101,
         pos: [20.0, 0.0, 20.0],
         yaw: 0.0,
+        rot: None,
         scale: 0.01,
         stamp_size: SIZES[0].1,
         after_edits: 0,
         promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
     };
     let pl2 = PlacedElement {
         id: 2,
@@ -197,10 +210,13 @@ fn multiple_lantern_placements_isolate_state_transforms_and_scale_lights() {
         seed: 202,
         pos: [40.0, 0.0, 40.0],
         yaw: std::f32::consts::FRAC_PI_2,
+        rot: None,
         scale: 1.0,
         stamp_size: SIZES[1].1,
         after_edits: 0,
         promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
     };
     runtime.spawn(pl1, &lantern, &mut world).unwrap();
     runtime.spawn(pl2, &lantern, &mut world).unwrap();
@@ -252,8 +268,8 @@ fn world_save_round_trip_is_bit_exact_and_backward_compatible() {
         Edit::carve(Shape::Sphere { radius: 0.4 }, [32.0, 0.8, 48.0], 0.1, Some(Material::Stone), 1.7),
     ];
     let elements = vec![
-        PlacedElement { id: 1, module: hill.module.clone(), seed: 55, pos: [32.0, 0.0, 48.0], yaw: 0.75, scale: 1.15, stamp_size: 1.7, after_edits: 1, promoted: None },
-        PlacedElement { id: 2, module: tree.module.clone(), seed: 77, pos: [25.0, 0.0, 42.0], yaw: 1.2, scale: 0.85, stamp_size: 1.7, after_edits: 2, promoted: Some(2) },
+        PlacedElement { id: 1, module: hill.module.clone(), seed: 55, pos: [32.0, 0.0, 48.0], yaw: 0.75, rot: None, scale: 1.15, stamp_size: 1.7, after_edits: 1, promoted: None, clips: Vec::new(), local_edits: Vec::new() },
+        PlacedElement { id: 2, module: tree.module.clone(), seed: 77, pos: [25.0, 0.0, 42.0], yaw: 1.2, rot: None, scale: 0.85, stamp_size: 1.7, after_edits: 2, promoted: Some(2), clips: Vec::new(), local_edits: Vec::new() },
     ];
     let save = WorldSave::with_elements("The walled garden", 7, edits, elements);
     let tmp = std::env::temp_dir().join(format!("plateau-8b-save-{}.plateau", std::process::id()));
@@ -289,7 +305,7 @@ fn world_save_round_trip_is_bit_exact_and_backward_compatible() {
 fn targeted_chunk_invalidation_for_sdf_element_is_sound_and_local() {
     let hill = load_element("hill");
     let bounds = hill.sdf_bounds.unwrap();
-    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 11, pos: [32.0, 0.0, 48.0], yaw: 0.3, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None };
+    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 11, pos: [32.0, 0.0, 48.0], yaw: 0.3, rot: None, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None, clips: Vec::new(), local_edits: Vec::new() };
     let entry = SdfElementEntry::new(pl, hill.compiled.clone(), bounds);
 
     let mut base = garden(7);
@@ -319,7 +335,7 @@ fn sdf_hill_keeps_distance_laws_and_nans_unseen_when_composed() {
     let pts = plateau_engine::points_near([0.0, 0.0, 0.0], 3.0, 2000, 1);
     assert_eq!(laws::nans_unseen(&bytes, 7, &pts).unwrap(), Ok(()));
 
-    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 7, pos: [32.0, 0.0, 48.0], yaw: 0.2, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None };
+    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 7, pos: [32.0, 0.0, 48.0], yaw: 0.2, rot: None, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None, clips: Vec::new(), local_edits: Vec::new() };
     let mut composed = Composed::new(
         garden(7),
         Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::new(pl, hill.compiled.clone(), bounds)], 1)),
@@ -381,10 +397,13 @@ fn lazy_scene_to_sdf_promotion_carves_tiny_home_inside_oak_tree_while_keeping_ca
         seed: 7,
         pos: [32.0, 0.0, 48.0],
         yaw: 0.0,
+        rot: None,
         scale: 1.0,
         stamp_size: SIZES[1].1,
         after_edits: 0,
         promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
     };
     runtime.spawn(pl.clone(), &tree, &mut world).unwrap();
     // Both trunk (id=1, solid) and canopy (id=2, non-solid) live in SceneWorld initially.
@@ -393,7 +412,7 @@ fn lazy_scene_to_sdf_promotion_carves_tiny_home_inside_oak_tree_while_keeping_ca
 
     // 2. Player begins carving a tiny room inside the trunk -> lazily promote solid trunk to MeshSdf!
     pl.promoted = Some(0);
-    let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed).unwrap().expect("tree has solid trunk");
+    let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips).unwrap().expect("tree has solid trunk");
     runtime.set_promoted(1, Some(0), &mut world).unwrap();
 
     // Solid trunk moved out of SceneWorld into SDF, while swaying canopy stays crisp in SceneWorld!
@@ -443,7 +462,10 @@ fn lazy_scene_to_sdf_promotion_carves_tiny_home_inside_oak_tree_while_keeping_ca
     let save = WorldSave::with_elements("The walled garden", 7, edits.edits().to_vec(), vec![pl.clone()]);
     let reloaded = WorldSave::from_text(&save.to_text()).unwrap();
     assert_eq!(reloaded.elements[0].promoted, Some(0));
-    let mesh_sdf_reloaded = catalog.get_or_build_mesh_sdf(&reloaded.elements[0].module, reloaded.elements[0].seed).unwrap().unwrap();
+    let mesh_sdf_reloaded = catalog
+        .get_or_build_mesh_sdf(&reloaded.elements[0].module, reloaded.elements[0].seed, &reloaded.elements[0].clips)
+        .unwrap()
+        .unwrap();
     let mut composed_reloaded = Composed::new(
         garden(7),
         Arc::new(ComposedLog::new(
@@ -468,7 +490,7 @@ fn lazy_scene_to_sdf_promotion_carves_tiny_home_inside_oak_tree_while_keeping_ca
 fn lazy_scene_to_sdf_promotion_carves_bridge_deck_and_keeps_distance_laws() {
     let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
     let bridge = catalog.get_or_load("elements/modules/bridge.wasm").unwrap();
-    let mesh_sdf = catalog.get_or_build_mesh_sdf(&bridge.module, 9).unwrap().expect("bridge has solid deck");
+    let mesh_sdf = catalog.get_or_build_mesh_sdf(&bridge.module, 9, &[]).unwrap().expect("bridge has solid deck");
 
     let pl = PlacedElement {
         id: 1,
@@ -476,10 +498,13 @@ fn lazy_scene_to_sdf_promotion_carves_bridge_deck_and_keeps_distance_laws() {
         seed: 9,
         pos: [32.0, 2.5, 45.0],
         yaw: 0.0,
+        rot: None,
         scale: 1.0,
         stamp_size: SIZES[1].1,
         after_edits: 0,
         promoted: Some(0),
+        clips: Vec::new(),
+        local_edits: Vec::new(),
     };
 
     // Uncarved promoted bridge holds a person at the arch crest (y ≈ 2.5 + 0.48 = 2.98).
@@ -504,4 +529,486 @@ fn lazy_scene_to_sdf_promotion_carves_bridge_deck_and_keeps_distance_laws() {
     let d = carved.describe().unwrap();
     assert_eq!(laws::never_too_long(&mut carved, &d, 1, 200).unwrap(), Ok(()));
     assert_eq!(laws::surfaces_have_an_inside(&mut carved, &d, 1, 200).unwrap(), Ok(()));
+}
+
+#[test]
+fn chop_oak_tree_splits_into_watertight_stump_and_felled_log_and_second_cut_trims_crown() {
+    let tree = load_element("tree");
+    let mut world = SceneWorld::default();
+    let mut runtime = ElementRuntime::new();
+
+    let standing = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 0.0, 48.0],
+        yaw: 0.0,
+        rot: None,
+        scale: 1.0,
+        stamp_size: SIZES[1].1,
+        after_edits: 0,
+        promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
+    };
+    runtime.spawn(standing.clone(), &tree, &mut world).unwrap();
+
+    // Exact surface raycast hits the oak trunk at y ≈ 0.8 m.
+    let (hit_id, _, hit_world) = world
+        .raycast_placed_surface([32.0, 0.8, 52.0], [0.0, 0.0, -1.0], 10.0)
+        .expect("ray must hit oak trunk");
+    assert_eq!(hit_id, 1);
+    assert!((hit_world[1] - 0.8).abs() < 0.05, "expected hit near y=0.8, got {:?}", hit_world);
+
+    let phys = runtime.physics_of(1).unwrap();
+    assert!(phys.rooted, "standing oak tree must be rooted");
+    assert!(phys.local_volume_m3 > 0.3, "expected substantial oak trunk volume, got {}", phys.local_volume_m3);
+
+    let hit_local = standing.transform().world_to_local_point(hit_world);
+    let cut_plane = choose_cut_plane(&phys, hit_local).expect("cut plane chosen");
+    assert_eq!(cut_plane.normal, [0.0, 1.0, 0.0], "oak tree longest axis should cut horizontally (+Y)");
+    assert!((cut_plane.offset - 0.8).abs() < 0.1, "cut offset should match aimed y: {}", cut_plane.offset);
+
+    // Split into stump (lower) + felled tree (upper).
+    let mut stump = standing.clone();
+    stump.clips.push(cut_plane.flipped());
+
+    let mut felled = standing.clone();
+    felled.id = 2;
+    felled.clips.push(cut_plane);
+    let upper_sc = clip_scene(runtime.local_scene_of(1).unwrap(), &[cut_plane]);
+    let upper_phys = ObjectPhysics::compute(&upper_sc, 1.0);
+    let toppled_tf = toppled_transform(standing.transform(), &upper_phys, [0.0, -1.0], 0.0);
+    felled.set_transform(toppled_tf);
+
+    runtime.remove(1, &mut world).unwrap();
+    runtime.spawn(stump.clone(), &tree, &mut world).unwrap();
+    runtime.spawn(felled.clone(), &tree, &mut world).unwrap();
+
+    // Stump keeps solid trunk base (id 1) and drops canopy (id 2), remaining rooted.
+    assert!(world.dynamic.contains_key(&(1, 1)), "stump must keep solid wood base");
+    assert!(!world.dynamic.contains_key(&(1, 2)), "stump must not keep leafy canopy");
+    let stump_phys = runtime.physics_of(1).unwrap();
+    assert!(stump_phys.rooted, "stump remains rooted in the ground");
+    assert!(stump_phys.solid_triangles > 10 && stump_phys.local_volume_m3 > 0.05);
+
+    // Felled tree keeps both trunk & canopy, is no longer rooted, and tips horizontally.
+    assert!(world.dynamic.contains_key(&(2, 1)), "felled tree keeps solid trunk");
+    assert!(world.dynamic.contains_key(&(2, 2)), "felled tree keeps canopy until trimmed");
+    let felled_phys = runtime.physics_of(2).unwrap();
+    assert!(!felled_phys.rooted, "felled upper trunk must not be rooted");
+    assert!(felled_phys.local_lo[1] >= cut_plane.offset - 0.02);
+
+    // Second cut at local y = 2.6 m trims off upper boughs & leafy canopy into a clean timber log!
+    let trim_plane = ClipPlane::new([0.0, -1.0, 0.0], -2.6);
+    let mut clean_log = felled.clone();
+    clean_log.id = 3;
+    clean_log.clips.push(trim_plane);
+    runtime.spawn(clean_log, &tree, &mut world).unwrap();
+    assert!(world.dynamic.contains_key(&(3, 1)), "trimmed log must keep solid trunk");
+    assert!(!world.dynamic.contains_key(&(3, 2)), "trimmed log must drop upper leafy canopy");
+    let log_phys = runtime.physics_of(3).unwrap();
+    assert!(log_phys.local_hi[1] <= 2.62 && log_phys.local_lo[1] >= cut_plane.offset - 0.02);
+    assert!(log_phys.world_mass_kg < felled_phys.world_mass_kg, "trimmed log must weigh less than full felled tree");
+}
+
+#[test]
+fn scale_aware_carry_and_cut_limits_across_tiny_person_and_giant() {
+    let tree = load_element("tree");
+    let lantern = load_element("lantern");
+    let [tiny, person, giant] = [SIZES[0].1, SIZES[1].1, SIZES[2].1];
+
+    let tree_standing = ObjectPhysics::compute(&tree.preview_scene, 1.0);
+    let cut = ClipPlane::new([0.0, 1.0, 0.0], 0.7);
+    let tree_felled_sc = clip_scene(&tree.preview_scene, &[cut]);
+    let tree_felled = ObjectPhysics::compute(&tree_felled_sc, 1.0);
+    let tiny_felled = ObjectPhysics::compute(&tree_felled_sc, 0.01);
+    let lantern_phys = ObjectPhysics::compute(&lantern.preview_scene, 1.0);
+
+    // Tiny (1.7 cm) cannot chop or carry a person-scale tree.
+    assert!(check_cut(&tree_standing, false, tiny).is_err(), "tiny must not chop a 5m tree");
+    assert!(!check_carry(&tree_felled, false, tiny).is_allowed(), "tiny must not carry a person-scale log");
+
+    // Tiny CAN chop & carry a tiny-scale (0.01x) tree (exact scale-invariant physics!).
+    let tiny_standing = ObjectPhysics::compute(&tree.preview_scene, 0.01);
+    assert!(check_cut(&tiny_standing, false, tiny).is_ok(), "tiny must chop a tiny tree");
+    assert!(check_carry(&tiny_felled, false, tiny).is_allowed(), "tiny must carry a tiny felled log");
+
+    // Person (1.7 m) must chop a standing person-scale oak tree before carrying it, then carries with heft.
+    assert!(check_cut(&tree_standing, false, person).is_ok(), "person must chop standing tree");
+    assert!(!check_carry(&tree_standing, false, person).is_allowed(), "person must chop rooted oak tree first");
+    let carry_log = check_carry(&tree_felled, false, person);
+    assert!(carry_log.is_allowed(), "person must carry felled oak tree: {carry_log:?}");
+    assert!(carry_log.speed_factor() < 0.98 && carry_log.speed_factor() >= 0.60, "felled oak should feel weighty: {}", carry_log.speed_factor());
+
+    // Light PostLantern can be picked up directly by a person without chopping!
+    assert!(check_carry(&lantern_phys, false, person).is_allowed(), "person should lift post lantern directly");
+
+    // Giant (17 m) can pluck a whole uncut person-scale oak tree straight out of the ground effortlessly!
+    let giant_carry = check_carry(&tree_standing, false, giant);
+    assert!(giant_carry.is_allowed(), "giant must uproot standing person-scale tree: {giant_carry:?}");
+    assert!(giant_carry.speed_factor() > 0.99, "person-scale tree should feel feather-light to a giant");
+
+    // Native SDF landforms (`is_sdf == true`) are part of terrain and cannot be carried or chopped.
+    assert!(!check_carry(&tree_felled, true, giant).is_allowed());
+    assert!(check_cut(&tree_felled, true, person).is_err());
+}
+
+#[test]
+fn felled_tree_laid_horizontally_acts_as_walkable_solid_bridge_across_gap() {
+    let tree = load_element("tree");
+    let mut world = SceneWorld::default();
+    let mut runtime = ElementRuntime::new();
+
+    // Chop oak tree into a clean 3.4m straight timber log (y in [0.5, 3.9]).
+    let clips = vec![ClipPlane::new([0.0, 1.0, 0.0], 0.5), ClipPlane::new([0.0, -1.0, 0.0], -3.9)];
+    // Rotate +90° around X so local +Y trunk lies flat horizontally along world +Z!
+    // Place elevated at y = 2.5 m above the lawn so ONLY the felled trunk holds the player up!
+    let rot = euler_quat(0.0, std::f32::consts::FRAC_PI_2, 0.0);
+    let mut log = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 2.5, 44.0],
+        yaw: 0.0,
+        rot: Some(rot),
+        scale: 1.0,
+        stamp_size: SIZES[1].1,
+        after_edits: 0,
+        promoted: None,
+        clips,
+        local_edits: Vec::new(),
+    };
+    runtime.spawn(log.clone(), &tree, &mut world).unwrap();
+
+    // While held in-hand, collision disappears; when placed back down, collision returns.
+    runtime.set_held(1, true, &mut world).unwrap();
+    assert!(!world.has_solids(), "held object must not collide while carried");
+    let placed_tf = PlacementTransform::with_rot([32.0, 2.5, 44.0], rot, 1.0);
+    runtime.relocate(1, placed_tf, &mut world).unwrap();
+    runtime.set_held(1, false, &mut world).unwrap();
+    assert!(world.has_solids(), "placed log must immediately be solid");
+    log.set_transform(placed_tf);
+
+    let mut composed = Composed::new(garden(7), Arc::new(ComposedLog::empty()));
+    let mut combined = Combined { region: &mut composed, world: &world };
+
+    // Local y in [0.5, 3.9] rotated +90° around X maps to world z in [44.5, 47.9] at y ≈ 2.5 + radius (~2.72 m).
+    let mut person = Body::standing(&mut combined, [32.0, 3.8, 45.0], SIZES[1].1).unwrap();
+    assert!(person.feet[1] > 2.55, "person should stand atop horizontal felled tree trunk (~2.7m), got {}", person.feet[1]);
+    assert_eq!(person.on, Some(Material::Wood), "person should be standing on Wood");
+
+    // Walk 2 metres along the horizontal log (+Z is yaw = PI).
+    person.yaw = std::f32::consts::PI;
+    for _ in 0..160 {
+        person.step(&mut combined, Intent { forward: 1.0, ..Intent::default() }, 1.0 / 120.0).unwrap();
+    }
+    assert!(person.feet[2] > 46.2, "person should walk forward along the felled log bridge, z={}", person.feet[2]);
+    assert!(person.feet[1] > 2.50, "person should remain elevated on the felled log bridge (not fall to lawn), y={}", person.feet[1]);
+}
+
+#[test]
+fn clipped_horizontal_felled_tree_promotes_lazily_to_carvable_mesh_sdf() {
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let tree = catalog.get_or_load("elements/modules/tree.wasm").unwrap();
+
+    // Chopped oak log (watertight capped at both ends!) laid horizontally along +Z at (32, 2.0, 44).
+    let clips = vec![ClipPlane::new([0.0, 1.0, 0.0], 0.6), ClipPlane::new([0.0, -1.0, 0.0], -3.6)];
+    let rot = euler_quat(0.0, std::f32::consts::FRAC_PI_2, 0.0);
+    let pl = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 2.0, 44.0],
+        yaw: 0.0,
+        rot: Some(rot),
+        scale: 1.0,
+        stamp_size: SIZES[1].1,
+        after_edits: 0,
+        promoted: Some(0),
+        clips: clips.clone(),
+        local_edits: Vec::new(),
+    };
+
+    // Build MeshSdf of the CLIPPED oak log!
+    let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &clips).unwrap().expect("clipped log has solid MeshSdf");
+    assert!(mesh_sdf.lo()[1] >= 0.58 && mesh_sdf.hi()[1] <= 3.62, "MeshSdf bounds must match clipped log: {:?}..{:?}", mesh_sdf.lo(), mesh_sdf.hi());
+
+    // Local point (0, 2.0, 0) maps under +90° X rotation to world (32, 2.0, 46.0) — must be solid Wood!
+    // Meanwhile local y = 0.2 (stump, clipped away!) at world (32, 2.0, 44.2) must be open air!
+    let mut uncarved = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::from_promoted_mesh(pl.clone(), mesh_sdf.clone())], 1)),
+    );
+    let mut ans = Vec::new();
+    uncarved.sample(&[[32.0, 2.0, 46.0], [32.0, 2.0, 44.2]], SIZES[0].1, &mut ans).unwrap();
+    assert!(ans[0].distance < -0.10 && ans[0].material == Material::Wood, "horizontal clipped log core must be solid Wood: {:?}", ans[0]);
+    assert!(ans[1].distance > 0.25, "clipped-away stump region must be open air: {:?}", ans[1]);
+
+    // Carve a hollow notch right into the horizontal felled log!
+    let mut edits = EditLog::new();
+    edits.push(Edit::carve(Shape::Sphere { radius: 0.45 }, [32.0, 2.0, 46.0], 0.02, Some(Material::Wood), SIZES[1].1)).unwrap();
+    let mut carved = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(edits), vec![SdfElementEntry::from_promoted_mesh(pl, mesh_sdf)], 2)),
+    );
+    carved.sample(&[[32.0, 2.0, 46.0]], SIZES[0].1, &mut ans).unwrap();
+    assert!(ans[0].distance > 0.20, "carved notch in felled log must be open air: {:?}", ans[0]);
+
+    // Still obeys SDF laws (`never_too_long`, `surfaces_have_an_inside`) under full 3D quaternion + clipping!
+    let d = carved.describe().unwrap();
+    assert_eq!(laws::never_too_long(&mut carved, &d, 1, 200).unwrap(), Ok(()));
+    assert_eq!(laws::surfaces_have_an_inside(&mut carved, &d, 1, 200).unwrap(), Ok(()));
+}
+
+#[test]
+fn world_save_step_8c_round_trip_preserves_cuts_quaternions_and_backward_compat() {
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let tree = catalog.get_or_load("elements/modules/tree.wasm").unwrap();
+
+    // Step 8b save format (without `rot` or `clip`) still parses cleanly.
+    let old_8b = "plateau-world 1\narea The walled garden\nseed 7\n\
+                  element 1 elements/modules/tree.wasm seed 7 pos 32 0 48 yaw 0.5 scale 1 size 1.7 after 0\n\
+                  element 2 elements/modules/tree.wasm seed 9 pos 30 0 46 yaw 1.0 scale 1 size 1.7 after 0 promoted 1\n";
+    let parsed_8b = WorldSave::from_text(old_8b).unwrap();
+    assert_eq!(parsed_8b.elements.len(), 2);
+    assert_eq!(parsed_8b.elements[0].rot, None);
+    assert!(parsed_8b.elements[0].clips.is_empty());
+    assert_eq!(parsed_8b.elements[1].promoted, Some(1));
+
+    // Full Step 8c save: stump (1 clip) + horizontal felled log bridge (quaternion + 2 clips + promoted + carve).
+    let stump = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [28.0, 0.0, 48.0],
+        yaw: 0.3,
+        rot: None,
+        scale: 1.0,
+        stamp_size: 1.7,
+        after_edits: 0,
+        promoted: None,
+        clips: vec![ClipPlane::new([0.0, -1.0, 0.0], -0.7)],
+        local_edits: Vec::new(),
+    };
+    let bridge_log = PlacedElement {
+        id: 2,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 2.0, 44.0],
+        yaw: 0.0,
+        rot: Some(euler_quat(0.4, std::f32::consts::FRAC_PI_2, 0.0)),
+        scale: 1.0,
+        stamp_size: 1.7,
+        after_edits: 0,
+        promoted: Some(0),
+        clips: vec![ClipPlane::new([0.0, 1.0, 0.0], 0.7), ClipPlane::new([0.0, -1.0, 0.0], -3.6)],
+        local_edits: vec![Edit::carve(Shape::Sphere { radius: 0.12 }, [0.0, 1.8, 0.0], 0.02, Some(Material::Wood), 0.17)],
+    };
+    let edits = vec![Edit::carve(Shape::Sphere { radius: 0.35 }, [32.0, 2.0, 46.0], 0.02, Some(Material::Wood), 1.7)];
+    let save = WorldSave::with_elements("The walled garden", 7, edits, vec![stump, bridge_log.clone()]);
+
+    let text = save.to_text();
+    let reloaded = WorldSave::from_text(&text).unwrap();
+    assert_eq!(save, reloaded);
+
+    // Chunk mesh of the promoted, clipped, rotated felled log matches bit-for-bit after save/reload!
+    let sdf_a = catalog.get_or_build_mesh_sdf(&bridge_log.module, bridge_log.seed, &bridge_log.clips).unwrap().unwrap();
+    let rlog = &reloaded.elements[1];
+    let sdf_b = catalog.get_or_build_mesh_sdf(&rlog.module, rlog.seed, &rlog.clips).unwrap().unwrap();
+    let mut ca = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::from_edits(save.edits.clone()).unwrap()), vec![SdfElementEntry::from_promoted_mesh(bridge_log, sdf_a)], 1)),
+    );
+    let mut cb = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::from_edits(reloaded.edits).unwrap()), vec![SdfElementEntry::from_promoted_mesh(rlog.clone(), sdf_b)], 1)),
+    );
+    let key = chunk::Key { level: -5, at: [32, 2, 44], asked: -5 };
+    let ma = chunk::make(&mut ca, key).unwrap().mesh.expect("chunk has felled log surface");
+    let mb = chunk::make(&mut cb, key).unwrap().mesh.expect("reloaded chunk has felled log surface");
+    assert_eq!(ma.positions, mb.positions);
+    assert_eq!(ma.indices, mb.indices);
+    assert_eq!(ma.materials, mb.materials);
+}
+
+#[test]
+fn carved_trunk_stays_solid_at_giant_scale_and_tunnel_travels_when_chopped_and_relocated() {
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let tree = catalog.get_or_load("elements/modules/tree.wasm").unwrap();
+
+    // 1. Place standing OakTree at (32, 0, 48) and carve a tunnel through its trunk at y = 1.6 m.
+    let standing_tf = PlacementTransform::new([32.0, 0.0, 48.0], 0.0, 1.0);
+    let world_tunnel = Edit::carve(Shape::Sphere { radius: 0.22 }, [32.0, 1.6, 48.0], 0.02, Some(Material::Wood), SIZES[1].1);
+    let local_tunnel = world_edit_to_local(&world_tunnel, standing_tf);
+    let mut pl = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 0.0, 48.0],
+        yaw: 0.0,
+        rot: None,
+        scale: 1.0,
+        stamp_size: SIZES[1].1,
+        after_edits: 0,
+        promoted: Some(0),
+        clips: Vec::new(),
+        local_edits: vec![local_tunnel],
+    };
+
+    let mut world = SceneWorld::default();
+    let mut runtime = ElementRuntime::new();
+    runtime.spawn_for_size(pl.clone(), &tree, &mut world, SIZES[1].1).unwrap();
+
+    // At Person scale (1.7 m <= 1.0 * PROMOTED_SDF_MAX_SIZE_RATIO), solid trunk is rendered via SDF
+    // (skip_solid == true) so the carved tunnel is visible and open!
+    assert!(SIZES[1].1 <= pl.scale * PROMOTED_SDF_MAX_SIZE_RATIO);
+    assert!(runtime.should_skip_solid(1));
+    assert!(!world.dynamic.contains_key(&(1, 1)), "at person scale, promoted trunk lives in SDF");
+
+    // Switching to Giant scale (17.0 m > 1.0 * PROMOTED_SDF_MAX_SIZE_RATIO):
+    // - Macro proxy automatically activates in SceneWorld so the trunk stays 100% solid & clickable!
+    // - Coarse giant SDF chunks skip the sub-voxel PromotedMesh so zero broken giant-voxel slivers appear!
+    let flipped = runtime.sync_macro_proxies(SIZES[2].1, &mut world);
+    assert_eq!(flipped.len(), 1);
+    assert!(!flipped[0].2, "skip_solid must flip to false at giant scale");
+    assert!(world.dynamic.contains_key(&(1, 1)), "giant macro proxy must restore crisp trunk in SceneWorld");
+    let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips).unwrap().unwrap();
+    let mut composed_standing = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::from_promoted_mesh(pl.clone(), mesh_sdf.clone())], 1)),
+    );
+    let mut out = Vec::new();
+    // At giant chunk size (10 m > 6.5 m), SDF skips the sub-voxel trunk cleanly (air at (32, 2.2, 48))!
+    composed_standing.sample(&[[32.0, 2.2, 48.0]], 10.0, &mut out).unwrap();
+    assert!(out[0].distance > 1.0, "giant SDF must skip sub-voxel promoted trunk: {:?}", out[0]);
+    // At person scale (1.7 m), SDF has solid trunk at y=2.2 and open carved tunnel at y=1.6!
+    composed_standing.sample(&[[32.0, 2.2, 48.0], [32.0, 1.6, 48.0]], SIZES[1].1, &mut out).unwrap();
+    assert!(out[0].distance < -0.10, "person SDF must show solid wood at y=2.2: {:?}", out[0]);
+    assert!(out[1].distance > 0.15, "person SDF must show carved tunnel at y=1.6: {:?}", out[1]);
+
+    // 2. Now chop the tunneled tree at y = 0.7 m, relocate the felled upper trunk horizontally to
+    // (20, 2.0, 40) rotated +90° about X! The carved tunnel (local y = 1.6) must travel AND rotate
+    // to world (20, 2.0, 41.6)!
+    let cut = ClipPlane::new([0.0, 1.0, 0.0], 0.7);
+    pl.clips.push(cut);
+    let rot = euler_quat(0.0, std::f32::consts::FRAC_PI_2, 0.0);
+    pl.set_transform(PlacementTransform::with_rot([20.0, 2.0, 40.0], rot, 1.0));
+    let felled_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips).unwrap().unwrap();
+    let mut composed_moved = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::from_promoted_mesh(pl.clone(), felled_sdf)], 2)),
+    );
+    // World (20, 2.0, 42.2) is solid wood (local y = 2.2); world (20, 2.0, 41.6) is the moved tunnel (local y = 1.6)!
+    composed_moved.sample(&[[20.0, 2.0, 42.2], [20.0, 2.0, 41.6]], SIZES[1].1, &mut out).unwrap();
+    assert!(out[0].distance < -0.10 && out[0].material == Material::Wood, "relocated felled trunk must be solid Wood: {:?}", out[0]);
+    assert!(out[1].distance > 0.15, "carved tunnel must travel & rotate with felled trunk: {:?}", out[1]);
+
+    // Shrinking back to person scale hides the macro proxy again cleanly.
+    let back = runtime.sync_macro_proxies(SIZES[1].1, &mut world);
+    assert_eq!(back.len(), 1);
+    assert!(back[0].2, "skip_solid must flip back to true at person scale");
+}
+
+#[test]
+fn giant_tree_carved_by_person_has_no_coarse_pass_or_winding_distortions() {
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let tree = catalog.get_or_load("elements/modules/tree.wasm").unwrap();
+
+    // Giant-scale OakTree (10x, ~50 m tall, ~6 m trunk diameter) placed at (32, 0, 48).
+    let tf = PlacementTransform::new([32.0, 0.0, 48.0], 0.0, 10.0);
+    let carve = Edit::carve(Shape::Sphere { radius: 1.2 }, [32.0, 1.5, 50.0], 0.3, Some(Material::Wood), SIZES[1].1);
+    let local_carve = world_edit_to_local(&carve, tf);
+    let pl = PlacedElement {
+        id: 1,
+        module: tree.module.clone(),
+        seed: 7,
+        pos: [32.0, 0.0, 48.0],
+        yaw: 0.0,
+        rot: None,
+        scale: 10.0,
+        stamp_size: SIZES[2].1,
+        after_edits: 0,
+        promoted: Some(0),
+        clips: Vec::new(),
+        local_edits: vec![local_carve],
+    };
+    let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &[]).unwrap().unwrap();
+    let mut composed = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::from_promoted_mesh(pl, mesh_sdf.clone())], 1)),
+    );
+
+    // 1. Check MeshSdf inside/outside consistency AND absence of buried internal zero-crossings
+    // where OakTree's 4 buttress roots penetrate inside the main trunk!
+    let mut bad_inside = 0usize;
+    let mut buried_seams = 0usize;
+    let mut grazing_flips = 0usize;
+    for ix in -16..=16 {
+        for iy in 0..=20 {
+            for iz in -16..=16 {
+                let p = [ix as f32 * 0.04, iy as f32 * 0.04, iz as f32 * 0.04];
+                // Main trunk cylinder has radius >= 0.25 for y in [0.0, 0.8], centered near (0, y, 0).
+                let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+                let ans = mesh_sdf.sample(p, f32::INFINITY).unwrap();
+                if r < 0.20 && p[1] >= 0.02 && p[1] <= 0.78 && ans.distance >= 0.0 {
+                    if bad_inside < 10 {
+                        eprintln!("BAD SIGN inside core trunk at {p:?}: {ans:?}");
+                    }
+                    bad_inside += 1;
+                }
+                // Deep inside the trunk (r <= 0.16, y in [0.08, 0.50] — right where buttress roots overlap!),
+                // true union SDF must remain deeply negative (< -0.05) with zero buried root-wall seams!
+                if r <= 0.16 && p[1] >= 0.08 && p[1] <= 0.50 && ans.distance > -0.05 {
+                    if buried_seams < 10 {
+                        eprintln!("BURIED SEAM inside trunk at {p:?}: d={:.5}", ans.distance);
+                    }
+                    buried_seams += 1;
+                }
+                // Check sharp sign/distance jump vs tiny neighbor (2mm away)
+                let p2 = [p[0] + 0.002, p[1], p[2]];
+                let ans2 = mesh_sdf.sample(p2, f32::INFINITY).unwrap();
+                if (ans.distance - ans2.distance).abs() > 0.01 {
+                    if grazing_flips < 10 {
+                        eprintln!("DISCONTINUITY at {p:?}: d1={:.4} d2={:.4}", ans.distance, ans2.distance);
+                    }
+                    grazing_flips += 1;
+                }
+            }
+        }
+    }
+    eprintln!("bad_inside = {bad_inside}, buried_seams = {buried_seams}, grazing_flips = {grazing_flips}");
+
+    // 2. Compare coarse=true vs coarse=false chunks around the carved giant trunk!
+    let mut coarse_diffs = 0usize;
+    for cx in 14..=18 {
+        for cy in 0..=3 {
+            for cz in 22..=26 {
+                let key = chunk::Key { level: -4, at: [cx, cy, cz], asked: -4 };
+                let a = chunk::make_with(&mut composed, key, chunk::Making { coarse: true, ..Default::default() }).unwrap();
+                let b = chunk::make_with(&mut composed, key, chunk::Making { coarse: false, ..Default::default() }).unwrap();
+                if a.mesh != b.mesh {
+                    let na = a.mesh.as_ref().map_or(0, |m| m.indices.len() / 3);
+                    let nb = b.mesh.as_ref().map_or(0, |m| m.indices.len() / 3);
+                    eprintln!("COARSE DIFF at chunk {cx},{cy},{cz}: coarse_tris={na} exact_tris={nb}");
+                    coarse_diffs += 1;
+                }
+            }
+        }
+    }
+    eprintln!("coarse_diffs = {coarse_diffs}");
+
+    // 3. Check SDF distance laws on the carved giant trunk!
+    let d = composed.describe().unwrap();
+    let ntl = laws::never_too_long(&mut composed, &d, 1, 400).unwrap();
+    eprintln!("never_too_long = {ntl:?}");
+    let shai = laws::surfaces_have_an_inside(&mut composed, &d, 1, 400).unwrap();
+    eprintln!("surfaces_have_an_inside = {shai:?}");
+
+    assert_eq!(bad_inside, 0, "trunk core had positive (outside) points");
+    assert_eq!(buried_seams, 0, "overlapping buttress roots created internal zero-crossings inside trunk");
+    assert_eq!(grazing_flips, 0, "MeshSdf had sign discontinuities");
+    assert_eq!(coarse_diffs, 0, "coarse pass diverged from exact meshing");
+    assert_eq!(ntl, Ok(()));
+    assert_eq!(shai, Ok(()));
 }

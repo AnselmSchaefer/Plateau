@@ -23,43 +23,65 @@ use std::sync::Arc;
 
 use wasmtime::{bail, format_err};
 
-use crate::edit::EditLog;
+use crate::cut::{ClipPlane, ObjectPhysics, clip_scene};
+use crate::edit::{Edit, EditLog, Op};
 use crate::mesh_sdf::MeshSdf;
 use crate::scene::{Applied, SceneWorld};
 use crate::wasm::MAX_IMPULSE;
 use crate::{Answer, Command, Compiled, Description, ElementBounds, Instance, LARGEST, Light, Limits, PlayerState, Region, Result, SMALLEST, Scene, Wasm, chunk};
 
-/// World placement transform of a standalone element: position, yaw rotation about +Y, and uniform scale.
+/// Maximum number of clip planes stored on one `PlacedElement`.
+pub const MAX_CLIPS: usize = 16;
+
+/// Maximum `viewer_size / placed.scale` ratio at which a lazily promoted `Scene` `MeshSdf` is
+/// rendered in Surface Nets SDF chunks. Above this ratio (e.g., a 17 m giant viewing a 1x-scale
+/// carved oak trunk whose diameter is smaller than a 0.5–1.0 m giant voxel), coarse SDF chunks
+/// skip the sub-voxel `MeshSdf` while the element's crisp procedural `Scene` mesh takes over as a
+/// macro-scale proxy — preventing thin trunks/planks from disintegrating at giant LOD.
+pub const PROMOTED_SDF_MAX_SIZE_RATIO: f32 = 6.5;
+
+/// World placement transform of a standalone element: position, full 3D unit quaternion rotation,
+/// and uniform scale. Rigid rotation + uniform scale preserves exact SDF Lipschitz safety (`|grad d| <= 1`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacementTransform {
     pub pos: [f32; 3],
-    pub yaw: f32,
+    /// Unit quaternion `[x, y, z, w]`.
+    pub rot: [f32; 4],
     pub scale: f32,
 }
 
 impl PlacementTransform {
-    pub const IDENTITY: PlacementTransform = PlacementTransform { pos: [0.0; 3], yaw: 0.0, scale: 1.0 };
+    pub const IDENTITY: PlacementTransform = PlacementTransform { pos: [0.0; 3], rot: [0.0, 0.0, 0.0, 1.0], scale: 1.0 };
 
+    /// Upright placement rotated by `yaw` radians around +Y.
     pub fn new(pos: [f32; 3], yaw: f32, scale: f32) -> PlacementTransform {
-        PlacementTransform { pos, yaw, scale }
+        PlacementTransform { pos, rot: yaw_quat(yaw), scale }
     }
 
-    /// Unit quaternion for yaw rotation about +Y (matching `plateau_sdk::Quat::from_y` & Bevy).
+    /// Full 3D placement with normalized unit quaternion `rot`.
+    pub fn with_rot(pos: [f32; 3], rot: [f32; 4], scale: f32) -> PlacementTransform {
+        PlacementTransform { pos, rot: quat_normalize(rot), scale }
+    }
+
+    /// Placement from intrinsic YXZ Euler angles (`yaw` about +Y, `pitch` about +X, `roll` about +Z).
+    pub fn from_euler(pos: [f32; 3], yaw: f32, pitch: f32, roll: f32, scale: f32) -> PlacementTransform {
+        PlacementTransform { pos, rot: euler_quat(yaw, pitch, roll), scale }
+    }
+
+    /// Unit quaternion `[x, y, z, w]` of this placement.
+    #[inline]
     pub fn rot_quat(self) -> [f32; 4] {
-        let half = self.yaw * 0.5;
-        [0.0, sin_f32(half), 0.0, cos_f32(half)]
+        self.rot
     }
 
     #[inline]
     pub fn local_to_world_dir(self, d: [f32; 3]) -> [f32; 3] {
-        let (s, c) = (sin_f32(self.yaw), cos_f32(self.yaw));
-        [c * d[0] + s * d[2], d[1], -s * d[0] + c * d[2]]
+        quat_rotate(self.rot, d)
     }
 
     #[inline]
     pub fn world_to_local_dir(self, d: [f32; 3]) -> [f32; 3] {
-        let (s, c) = (sin_f32(self.yaw), cos_f32(self.yaw));
-        [c * d[0] - s * d[2], d[1], s * d[0] + c * d[2]]
+        quat_rotate(quat_conj(self.rot), d)
     }
 
     #[inline]
@@ -78,7 +100,7 @@ impl PlacementTransform {
 
     #[inline]
     pub fn local_to_world_rot(self, q: [f32; 4]) -> [f32; 4] {
-        quat_mul(self.rot_quat(), q)
+        quat_mul(self.rot, q)
     }
 
     /// Transforms an element-local `Instance` into world coordinates.
@@ -192,6 +214,8 @@ pub struct PlacedElement {
     pub seed: u64,
     pub pos: [f32; 3],
     pub yaw: f32,
+    /// Optional full 3D unit quaternion `[x, y, z, w]` overriding `yaw` (for felled/tilted objects).
+    pub rot: Option<[f32; 4]>,
     pub scale: f32,
     /// Player height in metres when placed.
     pub stamp_size: f32,
@@ -201,11 +225,32 @@ pub struct PlacedElement {
     /// When a pure-`Scene` element is lazily promoted to carvable SDF on first sculpt/carve, holds
     /// the chronological edit index before which its solid `MeshSdf` is inserted (`None` until carved).
     pub promoted: Option<usize>,
+    /// Optional local half-space clip planes created by chopping/cutting this element (Step 8c).
+    pub clips: Vec<ClipPlane>,
+    /// Optional element-local SDF edits (tunnels, notches, additions) sculpted directly onto this
+    /// promoted `Scene` element so they travel and rotate with the object when chopped or carried!
+    pub local_edits: Vec<Edit>,
 }
 
 impl PlacedElement {
     pub fn transform(&self) -> PlacementTransform {
-        PlacementTransform { pos: self.pos, yaw: self.yaw, scale: self.scale }
+        match self.rot {
+            Some(q) => PlacementTransform::with_rot(self.pos, q, self.scale),
+            None => PlacementTransform::new(self.pos, self.yaw, self.scale),
+        }
+    }
+
+    /// Updates `pos`, `scale`, and orientation (`yaw` / `rot`) from a world `PlacementTransform`.
+    pub fn set_transform(&mut self, tf: PlacementTransform) {
+        self.pos = tf.pos;
+        self.scale = tf.scale;
+        let q = quat_normalize(tf.rot);
+        if quat_is_yaw_only(q) {
+            self.yaw = 2.0 * q[1].atan2(q[3]);
+            self.rot = None;
+        } else {
+            self.rot = Some(q);
+        }
     }
 
     /// Chronological `EditLog` split index where this element enters the SDF timeline.
@@ -230,11 +275,29 @@ impl PlacedElement {
         if !self.yaw.is_finite() {
             bail!("placed element yaw must be finite, got {}", self.yaw);
         }
+        if let Some(q) = self.rot {
+            if !q.iter().all(|c| c.is_finite()) {
+                bail!("placed element rot must be finite, got {:?}", q);
+            }
+            let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            if !(0.95..=1.05).contains(&len) {
+                bail!("placed element rot must be a unit quaternion, got length {len}");
+            }
+        }
         if !self.scale.is_finite() || self.scale <= 0.0 || self.scale > 100.0 {
             bail!("placed element scale must be finite and in (0, 100], got {}", self.scale);
         }
         if !self.stamp_size.is_finite() || self.stamp_size <= 0.0 {
             bail!("placed element stamp_size must be finite and positive, got {}", self.stamp_size);
+        }
+        if self.clips.len() > MAX_CLIPS {
+            bail!("placed element has {} clip planes (max {MAX_CLIPS})", self.clips.len());
+        }
+        for c in &self.clips {
+            c.validate()?;
+        }
+        for e in &self.local_edits {
+            e.validate()?;
         }
         Ok(())
     }
@@ -266,12 +329,19 @@ impl CompiledElement {
     }
 
     /// Builds a deterministic element-local `MeshSdf` from all `solid: true` instances emitted by
-    /// this element for `seed`. Returns `Ok(None)` if the element has no solid scene triangles.
-    pub fn build_mesh_sdf(&self, seed: u64) -> Result<Option<Arc<MeshSdf>>> {
+    /// this element for `seed`, clipped by `clips`. Returns `Ok(None)` if no solid triangles remain.
+    pub fn build_mesh_sdf(&self, seed: u64, clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
         let mut inst = self.compiled.instantiate(seed)?;
-        let sc = inst.scene()?;
+        let raw = inst.scene()?;
+        let sc = clip_scene(&raw, clips);
         Ok(MeshSdf::from_solid_scene(&sc).map(Arc::new))
     }
+}
+
+type PromotedKey = (String, u64, Vec<[u32; 4]>);
+
+fn promoted_key(module: &str, seed: u64, clips: &[ClipPlane]) -> PromotedKey {
+    (module.to_string(), seed, clips.iter().map(|c| c.key_bits()).collect())
 }
 
 /// Caches compiled standalone element `.wasm` modules and lazily promoted `MeshSdf`s.
@@ -280,7 +350,7 @@ pub struct ElementCatalog {
     root: PathBuf,
     limits: Limits,
     entries: HashMap<String, Arc<CompiledElement>>,
-    promoted_sdfs: HashMap<(String, u64), Option<Arc<MeshSdf>>>,
+    promoted_sdfs: HashMap<PromotedKey, Option<Arc<MeshSdf>>>,
 }
 
 impl ElementCatalog {
@@ -289,20 +359,20 @@ impl ElementCatalog {
     }
 
     /// Builds (or retrieves from cache) the exact local `MeshSdf` for a lazily promoted `Scene`
-    /// element `(module, seed)`.
-    pub fn get_or_build_mesh_sdf(&mut self, module: &str, seed: u64) -> Result<Option<Arc<MeshSdf>>> {
-        let key = (module.to_string(), seed);
+    /// element `(module, seed, clips)`.
+    pub fn get_or_build_mesh_sdf(&mut self, module: &str, seed: u64, clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
+        let key = promoted_key(module, seed, clips);
         if let Some(cached) = self.promoted_sdfs.get(&key) {
             return Ok(cached.clone());
         }
         let el = self.get_or_load(module)?;
-        let sdf = el.build_mesh_sdf(seed)?;
+        let sdf = el.build_mesh_sdf(seed, clips)?;
         self.promoted_sdfs.insert(key, sdf.clone());
         Ok(sdf)
     }
 
-    pub fn cached_mesh_sdf(&self, module: &str, seed: u64) -> Option<&Arc<MeshSdf>> {
-        self.promoted_sdfs.get(&(module.to_string(), seed)).and_then(Option::as_ref)
+    pub fn cached_mesh_sdf(&self, module: &str, seed: u64, clips: &[ClipPlane]) -> Option<&Arc<MeshSdf>> {
+        self.promoted_sdfs.get(&promoted_key(module, seed, clips)).and_then(Option::as_ref)
     }
 
     pub fn root(&self) -> &Path {
@@ -389,6 +459,10 @@ pub struct SdfElementEntry {
     pub world_lo: [f32; 3],
     pub world_hi: [f32; 3],
     pub world_blend: f32,
+    /// Optional element-local SDF edits (tunnels, notches, additions) applied in local space.
+    pub local_edits: Arc<EditLog>,
+    /// True if `local_edits` contains at least one `Op::Add` (which can expand surface past `MeshSdf`).
+    pub has_local_add: bool,
 }
 
 impl SdfElementEntry {
@@ -396,14 +470,44 @@ impl SdfElementEntry {
         let tf = placed.transform();
         let (world_lo, world_hi) = tf.world_bounds(bounds);
         let world_blend = bounds.blend * placed.scale;
-        SdfElementEntry { placed, source: SdfSource::Wasm(compiled), bounds, world_lo, world_hi, world_blend }
+        SdfElementEntry {
+            placed,
+            source: SdfSource::Wasm(compiled),
+            bounds,
+            world_lo,
+            world_hi,
+            world_blend,
+            local_edits: Arc::new(EditLog::new()),
+            has_local_add: false,
+        }
     }
 
     pub fn from_promoted_mesh(placed: PlacedElement, mesh_sdf: Arc<MeshSdf>) -> SdfElementEntry {
-        let bounds = mesh_sdf.bounds();
+        let mut bounds = mesh_sdf.bounds();
+        let mut has_local_add = false;
+        for e in &placed.local_edits {
+            if e.op == Op::Add {
+                has_local_add = true;
+                let (elo, ehi) = e.influence_bounds();
+                for a in 0..3 {
+                    bounds.lo[a] = min_f32(bounds.lo[a], elo[a]);
+                    bounds.hi[a] = max_f32(bounds.hi[a], ehi[a]);
+                }
+            }
+        }
+        let local_edits = Arc::new(EditLog::from_edits(placed.local_edits.clone()).unwrap_or_default());
         let tf = placed.transform();
         let (world_lo, world_hi) = tf.world_bounds(bounds);
-        SdfElementEntry { placed, source: SdfSource::PromotedMesh(mesh_sdf), bounds, world_lo, world_hi, world_blend: 0.0 }
+        SdfElementEntry {
+            placed,
+            source: SdfSource::PromotedMesh(mesh_sdf),
+            bounds,
+            world_lo,
+            world_hi,
+            world_blend: 0.0,
+            local_edits,
+            has_local_add,
+        }
     }
 
     pub fn affects_chunk(&self, key: chunk::Key) -> bool {
@@ -522,7 +626,16 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
 
             match &entry.source {
                 SdfSource::PromotedMesh(mesh_sdf) => {
+                    // Macro-LOD guard: when the chunk/viewer scale is far coarser than the promoted
+                    // element (e.g., giant 0.5–1.0 m voxels over a 1x-scale tree trunk), skip the
+                    // sub-voxel `PromotedMesh` so thin trunks never disintegrate into floating shards;
+                    // the crisp procedural `Scene` proxy renders & collides at macro scale instead.
+                    if size > scale * PROMOTED_SDF_MAX_SIZE_RATIO {
+                        continue;
+                    }
                     let inv_scale = 1.0 / scale;
+                    let has_local_edits = !entry.local_edits.is_empty();
+                    let has_local_add = entry.has_local_add;
                     for (&p, cur) in points.iter().zip(out.iter_mut()) {
                         let pd = point_to_aabb_distance(p, entry.world_lo, entry.world_hi);
                         if pd > 0.0 && cur.distance <= pd {
@@ -530,13 +643,21 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
                         }
                         let local_p = tf.world_to_local_point(p);
                         // Tight upper bound: only care about triangles closer than `cur.distance`
-                        // when outside, or any distance when inside the mesh AABB (`pd == 0`).
-                        let max_local = if pd > 0.0 { cur.distance * inv_scale } else { f32::INFINITY };
-                        if let Some(ans_e) = mesh_sdf.sample(local_p, max_local) {
-                            let d_world = ans_e.distance * scale;
-                            if d_world < cur.distance {
-                                *cur = Answer { distance: d_world, material: ans_e.material };
-                            }
+                        // when outside, or any distance when inside the element AABB (`pd == 0`).
+                        let max_local = if pd > 0.0 && !has_local_add { cur.distance * inv_scale } else { f32::INFINITY };
+                        let mut ans_local = match mesh_sdf.sample(local_p, max_local) {
+                            Some(a) => a,
+                            None if has_local_add => Answer { distance: 1e4, material: cur.material },
+                            None => continue,
+                        };
+                        if has_local_edits {
+                            let mut one = [ans_local];
+                            entry.local_edits.apply_batch(&[local_p], &mut one);
+                            ans_local = one[0];
+                        }
+                        let d_world = ans_local.distance * scale;
+                        if d_world < cur.distance {
+                            *cur = Answer { distance: d_world, material: ans_local.material };
                         }
                     }
                 }
@@ -614,7 +735,18 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
 struct LiveElement {
     placed: PlacedElement,
     local_scene: Scene,
+    physics: ObjectPhysics,
     wasm: Wasm,
+    held: bool,
+    /// When true for a promoted element (viewer size > `scale * PROMOTED_SDF_MAX_SIZE_RATIO`),
+    /// keeps the crisp procedural solid mesh visible & collidable as a macro-scale LOD proxy.
+    solid_proxy: bool,
+}
+
+impl LiveElement {
+    fn skip_solid(&self) -> bool {
+        self.placed.is_promoted() && !self.solid_proxy
+    }
 }
 
 /// Owns live per-placement sandboxed Wasmtime instances for runtime `tick` / `interact` and
@@ -645,18 +777,93 @@ impl ElementRuntime {
         self.live.iter().find(|l| l.placed.id == id).map(|l| &l.placed)
     }
 
-    /// Instantiates a placed element, registers its `Scene` layer in `world` (omitting `solid: true`
-    /// instances when `placed.is_promoted()`), and returns the world-transformed `Scene` ready for
-    /// GPU upload.
+    /// Returns the deterministic physical summary (local bounds, world mass, span, rooted state)
+    /// of a live placed element.
+    pub fn physics_of(&self, id: u32) -> Option<ObjectPhysics> {
+        self.live.iter().find(|l| l.placed.id == id).map(|l| l.physics)
+    }
+
+    /// Returns the element-local (already clipped) `Scene` of a live placed element, useful for
+    /// rendering in-hand carry previews and drop ghosts.
+    pub fn local_scene_of(&self, id: u32) -> Option<&Scene> {
+        self.live.iter().find(|l| l.placed.id == id).map(|l| &l.local_scene)
+    }
+
+    /// Whether `id` should currently omit its solid meshes from `SceneWorld` / Bevy rendering.
+    pub fn should_skip_solid(&self, id: u32) -> bool {
+        self.live.iter().find(|l| l.placed.id == id).is_some_and(LiveElement::skip_solid)
+    }
+
+    /// Instantiates a placed element, applies any `placed.clips` deterministically, registers its
+    /// `Scene` layer in `world` (omitting `solid: true` instances when promoted at fine scale),
+    /// and returns the world-transformed `Scene` ready for GPU upload.
     pub fn spawn(&mut self, placed: PlacedElement, compiled: &CompiledElement, world: &mut SceneWorld) -> Result<Scene> {
+        self.spawn_for_size(placed, compiled, world, SIZES_PERSON)
+    }
+
+    /// Like `spawn`, initializing the macro-LOD solid proxy state for `viewer_size`.
+    pub fn spawn_for_size(&mut self, placed: PlacedElement, compiled: &CompiledElement, world: &mut SceneWorld, viewer_size: f32) -> Result<Scene> {
         placed.validate()?;
         let mut wasm = compiled.compiled.instantiate(placed.seed)?;
-        let local_scene = wasm.scene()?;
+        let raw_scene = wasm.scene()?;
+        let local_scene = clip_scene(&raw_scene, &placed.clips);
+        let physics = ObjectPhysics::compute(&local_scene, placed.scale);
+        let solid_proxy = placed.is_promoted() && viewer_size > placed.scale * PROMOTED_SDF_MAX_SIZE_RATIO;
+        let skip_solid = placed.is_promoted() && !solid_proxy;
         let tf = placed.transform();
-        world.add_layer_filtered(placed.id, &local_scene, Some(tf), placed.is_promoted());
+        world.add_layer_filtered(placed.id, &local_scene, Some(tf), skip_solid);
         let world_scene = transform_scene(&local_scene, tf);
-        self.live.push(LiveElement { placed, local_scene, wasm });
+        self.live.push(LiveElement { placed, local_scene, physics, wasm, held: false, solid_proxy });
         Ok(world_scene)
+    }
+
+    /// Syncs macro-LOD solid proxies for all promoted elements against `viewer_size`.
+    /// Returns `(id, world_scene, skip_solid)` for any element whose proxy visibility flipped.
+    pub fn sync_macro_proxies(&mut self, viewer_size: f32, world: &mut SceneWorld) -> Vec<(u32, Scene, bool)> {
+        let mut changed = Vec::new();
+        for l in &mut self.live {
+            if !l.placed.is_promoted() || l.held {
+                continue;
+            }
+            let want_proxy = viewer_size > l.placed.scale * PROMOTED_SDF_MAX_SIZE_RATIO;
+            if want_proxy != l.solid_proxy {
+                l.solid_proxy = want_proxy;
+                let tf = l.placed.transform();
+                let skip = l.skip_solid();
+                world.add_layer_filtered(l.placed.id, &l.local_scene, Some(tf), skip);
+                changed.push((l.placed.id, transform_scene(&l.local_scene, tf), skip));
+            }
+        }
+        changed
+    }
+
+    /// Moves and/or rotates a live placed element to `tf` without resetting its WASM instance,
+    /// refreshing its `SceneWorld` layer (unless currently held) and returning the updated
+    /// world-transformed `Scene` for GPU refresh.
+    pub fn relocate(&mut self, id: u32, tf: PlacementTransform, world: &mut SceneWorld) -> Option<Scene> {
+        let l = self.live.iter_mut().find(|l| l.placed.id == id)?;
+        l.placed.set_transform(tf);
+        let tf = l.placed.transform();
+        l.physics = ObjectPhysics::compute(&l.local_scene, l.placed.scale);
+        if !l.held {
+            world.add_layer_filtered(id, &l.local_scene, Some(tf), l.skip_solid());
+        }
+        Some(transform_scene(&l.local_scene, tf))
+    }
+
+    /// Marks a live element as carried in-hand (`held = true`, removing its solid collision from
+    /// `SceneWorld` and pausing its `tick`/`interact`) or sets it back down into the world
+    /// (`held = false`, restoring solid collision and returning its world `Scene`).
+    pub fn set_held(&mut self, id: u32, held: bool, world: &mut SceneWorld) -> Option<Scene> {
+        let l = self.live.iter_mut().find(|l| l.placed.id == id)?;
+        l.held = held;
+        let tf = l.placed.transform();
+        if held {
+            world.remove_layer(id);
+        } else {
+            world.add_layer_filtered(id, &l.local_scene, Some(tf), l.skip_solid());
+        }
+        Some(transform_scene(&l.local_scene, tf))
     }
 
     /// Updates a live element's promotion state (`promoted: Option<usize>`), refreshing its
@@ -666,8 +873,13 @@ impl ElementRuntime {
     pub fn set_promoted(&mut self, id: u32, promoted: Option<usize>, world: &mut SceneWorld) -> Option<Scene> {
         let l = self.live.iter_mut().find(|l| l.placed.id == id)?;
         l.placed.promoted = promoted;
+        if promoted.is_none() {
+            l.solid_proxy = false;
+        }
         let tf = l.placed.transform();
-        world.add_layer_filtered(id, &l.local_scene, Some(tf), promoted.is_some());
+        if !l.held {
+            world.add_layer_filtered(id, &l.local_scene, Some(tf), l.skip_solid());
+        }
         Some(transform_scene(&l.local_scene, tf))
     }
 
@@ -691,6 +903,9 @@ impl ElementRuntime {
     pub fn tick_all(&mut self, dt: f32, player: &PlayerState, hit_owner: u32, hit_id: u32, world: &mut SceneWorld) -> Vec<Applied> {
         let mut results = Vec::new();
         for l in &mut self.live {
+            if l.held {
+                continue;
+            }
             let tf = l.placed.transform();
             let local_ps = tf.world_to_local_player(player, l.placed.id, hit_owner, hit_id);
             match l.wasm.tick(dt, &local_ps) {
@@ -710,6 +925,9 @@ impl ElementRuntime {
     pub fn interact(&mut self, player: &PlayerState, hit_owner: u32, hit_id: u32, world: &mut SceneWorld) -> Vec<Applied> {
         let mut results = Vec::new();
         for l in &mut self.live {
+            if l.held {
+                continue;
+            }
             let targeted = hit_owner == l.placed.id;
             let nearby = if hit_owner == 0 {
                 let d2: f32 = (0..3).map(|a| (player.feet[a] - l.placed.pos[a]).powi(2)).sum();
@@ -744,10 +962,66 @@ pub fn transform_scene(scene: &Scene, tf: PlacementTransform) -> Scene {
     }
 }
 
-// Deterministic math helpers (matching `plateau-sdk` and `edit.rs`).
+// Deterministic math & quaternion helpers (matching `plateau-sdk` and `edit.rs`).
 
 const PI: f32 = std::f32::consts::PI;
 const TAU: f32 = std::f32::consts::TAU;
+const SIZES_PERSON: f32 = 1.7;
+
+/// Deterministic unit quaternion for rotation by `yaw` radians around +Y.
+#[inline]
+pub fn yaw_quat(yaw: f32) -> [f32; 4] {
+    let half = yaw * 0.5;
+    [0.0, sin_f32(half), 0.0, cos_f32(half)]
+}
+
+/// Deterministic unit quaternion from YXZ Euler angles (`yaw` about +Y, `pitch` about +X, `roll` about +Z).
+#[inline]
+pub fn euler_quat(yaw: f32, pitch: f32, roll: f32) -> [f32; 4] {
+    let qy = yaw_quat(yaw);
+    let qx = [sin_f32(pitch * 0.5), 0.0, 0.0, cos_f32(pitch * 0.5)];
+    let qz = [0.0, 0.0, sin_f32(roll * 0.5), cos_f32(roll * 0.5)];
+    quat_mul(qy, quat_mul(qx, qz))
+}
+
+#[inline]
+pub fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
+    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if len > 1e-8 { [q[0] / len, q[1] / len, q[2] / len, q[3] / len] } else { [0.0, 0.0, 0.0, 1.0] }
+}
+
+#[inline]
+pub fn quat_is_yaw_only(q: [f32; 4]) -> bool {
+    abs_f32(q[0]) < 1e-5 && abs_f32(q[2]) < 1e-5
+}
+
+#[inline]
+pub fn quat_conj(q: [f32; 4]) -> [f32; 4] {
+    [-q[0], -q[1], -q[2], q[3]]
+}
+
+#[inline]
+pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+#[inline]
+pub fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let [qx, qy, qz, qw] = q;
+    let tx = 2.0 * (qy * v[2] - qz * v[1]);
+    let ty = 2.0 * (qz * v[0] - qx * v[2]);
+    let tz = 2.0 * (qx * v[1] - qy * v[0]);
+    [
+        v[0] + qw * tx + (qy * tz - qz * ty),
+        v[1] + qw * ty + (qz * tx - qx * tz),
+        v[2] + qw * tz + (qx * ty - qy * tx),
+    ]
+}
 
 #[inline]
 fn min_f32(a: f32, b: f32) -> f32 {
@@ -780,16 +1054,6 @@ fn sin_f32(x: f32) -> f32 {
 #[inline]
 fn cos_f32(x: f32) -> f32 {
     sin_f32(x + PI / 2.0)
-}
-
-#[inline]
-fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    [
-        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-    ]
 }
 
 #[inline]

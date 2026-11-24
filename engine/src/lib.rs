@@ -13,6 +13,7 @@ pub mod body;
 pub mod check;
 pub mod chunk;
 pub mod compose;
+pub mod cut;
 pub mod edit;
 pub mod laws;
 pub mod mesh_sdf;
@@ -24,6 +25,7 @@ pub mod sketch;
 pub mod wasm;
 
 pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, SdfSource};
+pub use cut::{CarryDecision, ClipPlane, ObjectPhysics};
 pub use edit::{Edit, EditLog, Edited, Op, Shape, WorldSave};
 pub use mesh_sdf::MeshSdf;
 pub use wasm::{Compiled, Limits, Wasm};

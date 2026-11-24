@@ -16,7 +16,7 @@ use std::sync::Arc;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use plateau_engine::compose::{CompiledElement, ComposedLog, ElementCatalog, PlacedElement, SdfElementEntry};
+use plateau_engine::compose::{CompiledElement, ComposedLog, ElementCatalog, PlacedElement, PlacementTransform, SdfElementEntry};
 use plateau_engine::edit::Edit;
 use plateau_engine::{ElementBounds, Limits, Region, SIZES};
 
@@ -25,7 +25,8 @@ use crate::scene::build_merged_mesh;
 /// Person height in metres (default scale = `player_size / PERSON_HEIGHT`).
 const PERSON_HEIGHT: f32 = SIZES[1].1;
 
-/// Unified undoable world action across both SDF sculpting (8a) and element placement (8b).
+/// Unified undoable world action across SDF sculpting (8a), element placement (8b),
+/// and cutting/relocating discrete procedural objects (8c).
 #[derive(Clone, Debug)]
 pub enum WorldAction {
     SdfEdit {
@@ -33,8 +34,24 @@ pub enum WorldAction {
         /// Placed `Scene` elements lazily promoted to carvable SDF by this edit (demoted on undo).
         promoted_ids: Vec<(u32, usize)>,
     },
+    /// Local SDF edit sculpted directly onto a discrete `Scene` element (travels with it when cut/carried).
+    ElementSdfEdit {
+        id: u32,
+        edit: Edit,
+        newly_promoted: Option<usize>,
+    },
     PlaceElement(PlacedElement),
     RemoveElement(PlacedElement),
+    CutElement {
+        original: PlacedElement,
+        lower: PlacedElement,
+        upper: PlacedElement,
+    },
+    RelocateElement {
+        id: u32,
+        before: PlacementTransform,
+        after: PlacementTransform,
+    },
 }
 
 #[derive(Resource)]
@@ -134,16 +151,24 @@ impl PlaceMode {
     }
 
     /// Rebuilds an immutable `ComposedLog` snapshot from `edits` + all currently placed SDF
-    /// elements (both native SDF landforms and lazily promoted `Scene` meshes).
+    /// elements (both native SDF landforms and lazily promoted `Scene` meshes), optionally
+    /// excluding element ids that are currently carried in-hand or mid-fall.
     pub fn build_composed(&mut self, edits: Arc<plateau_engine::EditLog>) -> Arc<ComposedLog> {
+        self.build_composed_excluding(edits, &[])
+    }
+
+    pub fn build_composed_excluding(&mut self, edits: Arc<plateau_engine::EditLog>, exclude_ids: &[u32]) -> Arc<ComposedLog> {
         self.revision += 1;
         let mut sdf_elements = Vec::new();
         for pl in &self.placed {
+            if exclude_ids.contains(&pl.id) {
+                continue;
+            }
             if let Ok(compiled) = self.catalog.get_or_load(&pl.module) {
                 if let Some(bounds) = compiled.sdf_bounds {
                     sdf_elements.push(SdfElementEntry::new(pl.clone(), compiled.compiled.clone(), bounds));
                 } else if pl.is_promoted()
-                    && let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed)
+                    && let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)
                 {
                     sdf_elements.push(SdfElementEntry::from_promoted_mesh(pl.clone(), mesh_sdf));
                 }
@@ -153,7 +178,7 @@ impl PlaceMode {
     }
 
     /// Returns the local SDF bounds of a placed element if it is currently represented in the SDF
-    /// layer (either natively or via lazy Scene→SDF promotion).
+    /// layer (either natively or via lazy Scene→SDF promotion, expanded for any local `Op::Add`).
     pub fn sdf_bounds_of(&self, pl: &PlacedElement) -> Option<ElementBounds> {
         if let Some(el) = self.catalog.get(&pl.module)
             && let Some(bounds) = el.sdf_bounds
@@ -161,9 +186,19 @@ impl PlaceMode {
             return Some(bounds);
         }
         if pl.is_promoted()
-            && let Some(mesh_sdf) = self.catalog.cached_mesh_sdf(&pl.module, pl.seed)
+            && let Some(mesh_sdf) = self.catalog.cached_mesh_sdf(&pl.module, pl.seed, &pl.clips)
         {
-            return Some(mesh_sdf.bounds());
+            let mut b = mesh_sdf.bounds();
+            for e in &pl.local_edits {
+                if e.op == plateau_engine::edit::Op::Add {
+                    let (elo, ehi) = e.influence_bounds();
+                    for a in 0..3 {
+                        b.lo[a] = b.lo[a].min(elo[a]);
+                        b.hi[a] = b.hi[a].max(ehi[a]);
+                    }
+                }
+            }
+            return Some(b);
         }
         None
     }

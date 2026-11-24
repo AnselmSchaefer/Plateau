@@ -21,6 +21,7 @@ use std::sync::Arc;
 use wasmtime::bail;
 
 use crate::compose::PlacedElement;
+use crate::cut::ClipPlane;
 use crate::{Answer, Command, Description, ElementBounds, Material, PlayerState, Region, Result, Scene, chunk};
 
 /// Whether an SDF edit adds material or carves space away.
@@ -567,67 +568,26 @@ impl WorldSave {
         s.push_str(&format!("area {}\n", self.area.replace(['\n', '\r'], " ")));
         s.push_str(&format!("seed {}\n", self.seed));
         for e in &self.edits {
-            let mat = e.material.map_or("none", Material::name);
-            let [cx, cy, cz] = e.center;
-            match e.shape {
-                Shape::Sphere { radius } => {
-                    s.push_str(&format!(
-                        "sdf {} sphere {} {} {} {} blend {} mat {} size {}\n",
-                        e.op.name(),
-                        cx,
-                        cy,
-                        cz,
-                        radius,
-                        e.blend,
-                        mat,
-                        e.stamp_size
-                    ));
-                }
-                Shape::Box { half: [hx, hy, hz], round } => {
-                    s.push_str(&format!(
-                        "sdf {} box {} {} {} {} {} {} round {} blend {} mat {} size {}\n",
-                        e.op.name(),
-                        cx,
-                        cy,
-                        cz,
-                        hx,
-                        hy,
-                        hz,
-                        round,
-                        e.blend,
-                        mat,
-                        e.stamp_size
-                    ));
-                }
-                Shape::Cylinder { radius, half_height, round } => {
-                    s.push_str(&format!(
-                        "sdf {} cyl {} {} {} {} {} round {} blend {} mat {} size {}\n",
-                        e.op.name(),
-                        cx,
-                        cy,
-                        cz,
-                        radius,
-                        half_height,
-                        round,
-                        e.blend,
-                        mat,
-                        e.stamp_size
-                    ));
-                }
-            }
+            write_sdf_record(&mut s, "sdf", e);
         }
         for el in &self.elements {
             let [px, py, pz] = el.pos;
+            s.push_str(&format!(
+                "element {} {} seed {} pos {} {} {} yaw {} scale {} size {} after {}",
+                el.id, el.module, el.seed, px, py, pz, el.yaw, el.scale, el.stamp_size, el.after_edits
+            ));
+            if let Some([qx, qy, qz, qw]) = el.rot {
+                s.push_str(&format!(" rot {qx} {qy} {qz} {qw}"));
+            }
             if let Some(p) = el.promoted {
-                s.push_str(&format!(
-                    "element {} {} seed {} pos {} {} {} yaw {} scale {} size {} after {} promoted {}\n",
-                    el.id, el.module, el.seed, px, py, pz, el.yaw, el.scale, el.stamp_size, el.after_edits, p
-                ));
-            } else {
-                s.push_str(&format!(
-                    "element {} {} seed {} pos {} {} {} yaw {} scale {} size {} after {}\n",
-                    el.id, el.module, el.seed, px, py, pz, el.yaw, el.scale, el.stamp_size, el.after_edits
-                ));
+                s.push_str(&format!(" promoted {p}"));
+            }
+            for c in &el.clips {
+                s.push_str(&format!(" clip {} {} {} {}", c.normal[0], c.normal[1], c.normal[2], c.offset));
+            }
+            s.push('\n');
+            for le in &el.local_edits {
+                write_sdf_record(&mut s, &format!("el-sdf {}", el.id), le);
             }
         }
         s
@@ -639,7 +599,7 @@ impl WorldSave {
         let mut area = String::new();
         let mut seed = None;
         let mut edits = Vec::new();
-        let mut elements = Vec::new();
+        let mut elements: Vec<PlacedElement> = Vec::new();
         for (line_no, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -663,6 +623,18 @@ impl WorldSave {
                 let el = parse_element_line(line, line_no + 1)?;
                 el.validate()?;
                 elements.push(el);
+            } else if let Some(rest) = line.strip_prefix("el-sdf ") {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let id_str = parts.next().ok_or_else(|| wasmtime::format_err!("line {}: missing element id", line_no + 1))?;
+                let id: u32 = id_str.parse().map_err(|e| wasmtime::format_err!("line {}: bad element id: {e}", line_no + 1))?;
+                let sdf_tail = parts.next().ok_or_else(|| wasmtime::format_err!("line {}: missing el-sdf payload", line_no + 1))?.trim();
+                let edit = parse_sdf_line(&format!("sdf {sdf_tail}"), line_no + 1)?;
+                edit.validate()?;
+                let target = elements
+                    .iter_mut()
+                    .find(|e| e.id == id)
+                    .ok_or_else(|| wasmtime::format_err!("line {}: el-sdf references unknown element {id}", line_no + 1))?;
+                target.local_edits.push(edit);
             } else {
                 bail!("line {}: unknown record `{line}`", line_no + 1);
             }
@@ -688,6 +660,57 @@ impl WorldSave {
     pub fn load(path: &Path) -> Result<WorldSave> {
         let text = std::fs::read_to_string(path)?;
         WorldSave::from_text(&text)
+    }
+}
+
+fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit) {
+    let mat = e.material.map_or("none", Material::name);
+    let [cx, cy, cz] = e.center;
+    match e.shape {
+        Shape::Sphere { radius } => {
+            s.push_str(&format!(
+                "{prefix} {} sphere {} {} {} {} blend {} mat {} size {}\n",
+                e.op.name(),
+                cx,
+                cy,
+                cz,
+                radius,
+                e.blend,
+                mat,
+                e.stamp_size
+            ));
+        }
+        Shape::Box { half: [hx, hy, hz], round } => {
+            s.push_str(&format!(
+                "{prefix} {} box {} {} {} {} {} {} round {} blend {} mat {} size {}\n",
+                e.op.name(),
+                cx,
+                cy,
+                cz,
+                hx,
+                hy,
+                hz,
+                round,
+                e.blend,
+                mat,
+                e.stamp_size
+            ));
+        }
+        Shape::Cylinder { radius, half_height, round } => {
+            s.push_str(&format!(
+                "{prefix} {} cyl {} {} {} {} {} round {} blend {} mat {} size {}\n",
+                e.op.name(),
+                cx,
+                cy,
+                cz,
+                radius,
+                half_height,
+                round,
+                e.blend,
+                mat,
+                e.stamp_size
+            ));
+        }
     }
 }
 
@@ -749,8 +772,8 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<Edit> {
 
 fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
     let tok: Vec<&str> = line.split_whitespace().collect();
-    if tok.len() != 17 && tok.len() != 19 {
-        bail!("line {line_no}: expected 17 or 19 tokens in element record, got {}", tok.len());
+    if tok.len() < 17 {
+        bail!("line {line_no}: expected at least 17 tokens in element record, got {}", tok.len());
     }
     let expect = |i: usize, kw: &str| -> Result<()> {
         match tok.get(i) {
@@ -759,7 +782,10 @@ fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
         }
     };
     let pf = |i: usize| -> Result<f32> {
-        tok[i].parse::<f32>().map_err(|e| wasmtime::format_err!("line {line_no}: bad float at token {i}: {e}"))
+        tok.get(i)
+            .ok_or_else(|| wasmtime::format_err!("line {line_no}: unexpected end of element record at token {i}"))?
+            .parse::<f32>()
+            .map_err(|e| wasmtime::format_err!("line {line_no}: bad float at token {i}: {e}"))
     };
     let id = tok[1].parse::<u32>().map_err(|e| wasmtime::format_err!("line {line_no}: bad element id: {e}"))?;
     let module = tok[2].to_string();
@@ -775,13 +801,36 @@ fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
     let stamp_size = pf(14)?;
     expect(15, "after")?;
     let after_edits = tok[16].parse::<usize>().map_err(|e| wasmtime::format_err!("line {line_no}: bad after_edits: {e}"))?;
-    let promoted = if tok.len() == 19 {
-        expect(17, "promoted")?;
-        Some(tok[18].parse::<usize>().map_err(|e| wasmtime::format_err!("line {line_no}: bad promoted index: {e}"))?)
-    } else {
-        None
-    };
-    Ok(PlacedElement { id, module, seed, pos, yaw, scale, stamp_size, after_edits, promoted })
+
+    let mut rot = None;
+    let mut promoted = None;
+    let mut clips = Vec::new();
+    let mut idx = 17;
+    while idx < tok.len() {
+        match tok[idx] {
+            "rot" => {
+                rot = Some([pf(idx + 1)?, pf(idx + 2)?, pf(idx + 3)?, pf(idx + 4)?]);
+                idx += 5;
+            }
+            "promoted" => {
+                let p = tok
+                    .get(idx + 1)
+                    .ok_or_else(|| wasmtime::format_err!("line {line_no}: missing promoted index"))?
+                    .parse::<usize>()
+                    .map_err(|e| wasmtime::format_err!("line {line_no}: bad promoted index: {e}"))?;
+                promoted = Some(p);
+                idx += 2;
+            }
+            "clip" => {
+                let normal = [pf(idx + 1)?, pf(idx + 2)?, pf(idx + 3)?];
+                let offset = pf(idx + 4)?;
+                clips.push(ClipPlane { normal, offset });
+                idx += 5;
+            }
+            other => bail!("line {line_no}: unknown element field `{other}`"),
+        }
+    }
+    Ok(PlacedElement { id, module, seed, pos, yaw, rot, scale, stamp_size, after_edits, promoted, clips, local_edits: Vec::new() })
 }
 
 fn material_from_name(name: &str) -> Option<Material> {

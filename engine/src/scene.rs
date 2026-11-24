@@ -142,6 +142,9 @@ impl SceneWorld {
                 continue;
             }
             let Some(b) = bounds.get(raw.mesh as usize) else { continue };
+            if b.tris.is_empty() {
+                continue;
+            }
             let inst = match transform {
                 Some(tf) => tf.transform_instance(raw),
                 None => raw,
@@ -394,6 +397,65 @@ impl SceneWorld {
         }
         best_owner.map(|o| (o, best_t))
     }
+
+    /// Exact ray-triangle hit against any visible static or dynamic instance belonging to a placed
+    /// element (`owner > 0`), returning `(placement_id, hit_t, hit_world_point)`.
+    /// Prefers solid triangles when a solid hit exists at or near the ray, falling back to
+    /// non-solid triangles so both cutting trunks and grabbing decorative items work cleanly.
+    pub fn raycast_placed_surface(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32, [f32; 3])> {
+        let mut best_solid: Option<(u32, f32)> = None;
+        let mut best_any: Option<(u32, f32)> = None;
+
+        let mut test_live = |owner: u32, live: &LiveInstance| {
+            let max_t = best_any.map_or(max_dist, |(_, t)| t);
+            if ray_aabb(origin, dir, live.world_lo, live.world_hi, max_dist).is_none() {
+                return;
+            }
+            let Some(b) = self.bounds.get(&owner).and_then(|v| v.get(live.instance.mesh as usize)) else {
+                return;
+            };
+            // Transform ray into the instance's mesh-local space for exact Möller–Trumbore hit.
+            let ro = world_to_local(origin, &live.instance);
+            let rd = world_dir_to_local(dir, &live.instance);
+            let mut local_best = max_dist;
+            let mut hit_any = false;
+            for &(ta, tb, tc, _) in &b.tris {
+                if let Some(t) = ray_triangle(ro, rd, ta, tb, tc, local_best) {
+                    local_best = t;
+                    hit_any = true;
+                }
+            }
+            if hit_any {
+                if live.instance.solid && best_solid.is_none_or(|(_, bt)| local_best < bt) {
+                    best_solid = Some((owner, local_best));
+                }
+                if local_best < max_t {
+                    best_any = Some((owner, local_best));
+                }
+            }
+        };
+
+        for (&owner, list) in self.solid_static.iter().chain(self.placed_static.iter()) {
+            if owner == BASE_OWNER {
+                continue;
+            }
+            for live in list {
+                test_live(owner, live);
+            }
+        }
+        for (&(owner, _), live) in &self.dynamic {
+            if owner == BASE_OWNER || !live.visible {
+                continue;
+            }
+            test_live(owner, live);
+        }
+
+        // Prefer a solid surface hit (e.g., oak trunk behind outer canopy leaves) over a non-solid hit.
+        let chosen = best_solid.or(best_any)?;
+        let (owner, t) = chosen;
+        let p = [origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t];
+        Some((owner, t, p))
+    }
 }
 
 /// Combines an SDF `Region` with `SceneWorld`'s solid procedural instances so `Body::step` and
@@ -449,6 +511,43 @@ fn world_to_local(p: [f32; 3], inst: &Instance) -> [f32; 3] {
         r[1] / inst.scale[1].abs().max(1e-5).copysign(inst.scale[1]),
         r[2] / inst.scale[2].abs().max(1e-5).copysign(inst.scale[2]),
     ]
+}
+
+fn world_dir_to_local(d: [f32; 3], inst: &Instance) -> [f32; 3] {
+    let inv_q = [-inst.rot[0], -inst.rot[1], -inst.rot[2], inst.rot[3]];
+    let r = quat_rotate(inv_q, d);
+    [
+        r[0] / inst.scale[0].abs().max(1e-5).copysign(inst.scale[0]),
+        r[1] / inst.scale[1].abs().max(1e-5).copysign(inst.scale[1]),
+        r[2] / inst.scale[2].abs().max(1e-5).copysign(inst.scale[2]),
+    ]
+}
+
+/// Möller–Trumbore ray-triangle intersection (both faces), returning ray parameter `t` in `(0, max_t]`.
+fn ray_triangle(ro: [f32; 3], rd: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3], max_t: f32) -> Option<f32> {
+    let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let cross = |u: [f32; 3], v: [f32; 3]| [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    let e1 = sub(b, a);
+    let e2 = sub(c, a);
+    let h = cross(rd, e2);
+    let det = dot(e1, h);
+    if det.abs() < 1e-8 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = sub(ro, a);
+    let u = dot(s, h) * inv_det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = cross(s, e1);
+    let v = dot(rd, q) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = dot(e2, q) * inv_det;
+    if t > 1e-5 && t <= max_t { Some(t) } else { None }
 }
 
 fn aabb_distance(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> f32 {
