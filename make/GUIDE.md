@@ -141,7 +141,7 @@ tool from scratch:
   - `let m = s.add_mesh(mb.build());` (up to 256 meshes, 200,000 vertices / 600,000 indices total)
   - `s.place(m, pos, rot, scale, solid)` — static GPU-batched instance (`id = 0`)
   - `s.spawn(id, m, pos, rot, scale, solid)` — dynamic instanced object (`id > 0`) that `tick` / `interact` can animate or toggle
-  - `s.light(id, pos, [r, g, b], intensity, radius)` — point light (`id > 0`, up to 64 lights)
+  - `s.light(id, pos, [r, g, b], intensity, radius)` — point light (`id > 0`, up to 64 lights; `intensity` is in lumens: ~30–100 for a tiny cave glow, ~600–2500 for a person-sized lantern)
 - Set `solid = true` on procedural bridges, rafts, stairs, doors, or moving platforms so players
   automatically collide with and walk on their triangles in `plateau-play`. (Keep the main terrain
   and `reach` gate geometry in `sample()` so the reachability laws see it.)

@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Plateau Architecture — Authoring, Sandboxed WASM Runtime, and GPU Presenter</title>
+<style>
+  :root {
+    --background: #0d0f12;
+    --foreground: #eceef2;
+    --muted-foreground: #969da8;
+    --card: #14171c;
+    --secondary: #1b1f26;
+    --border: #2a303b;
+    --code-background: #232832;
+    --chart-1: #5b8def;
+    --chart-2: #2dd4bf;
+    --chart-3: #eab308;
+    --chart-4: #c084fc;
+    --success: #34d399;
+    --radius: 10px;
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --background: #f6f7f9;
+      --foreground: #14171c;
+      --muted-foreground: #545d6b;
+      --card: #ffffff;
+      --secondary: #f1f3f7;
+      --border: #dce1ea;
+      --code-background: #e7ebf2;
+      --chart-1: #2563eb;
+      --chart-2: #0d9488;
+      --chart-3: #ca8a04;
+      --chart-4: #9333ea;
+      --success: #059669;
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--background);
+    font-family: var(--font-sans);
+    color: var(--foreground);
+    font-size: 13px;
+    line-height: 1.42;
+    padding: 28px 18px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .diagram {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    width: 100%;
+    max-width: 820px;
+  }
+
+  .page-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 2px 4px;
+  }
+
+  .page-header h1 {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  .page-header span {
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+
+  .band {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .band-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .band-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 650;
+    font-size: 12.5px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--foreground);
+  }
+
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 999px;
+    flex-shrink: 0;
+  }
+  .dot-author { background: var(--chart-2); }
+  .dot-runtime { background: var(--chart-1); }
+  .dot-gpu { background: var(--chart-3); }
+
+  .pill-group {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .pill {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 2.5px 8px;
+    border-radius: 999px;
+    background: var(--secondary);
+    color: var(--muted-foreground);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  .pill-safe {
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    color: var(--success);
+    border-color: color-mix(in srgb, var(--success) 35%, transparent);
+  }
+
+  .pill-cpu {
+    background: color-mix(in srgb, var(--chart-1) 14%, transparent);
+    color: var(--chart-1);
+    border-color: color-mix(in srgb, var(--chart-1) 35%, transparent);
+  }
+
+  .pill-gpu {
+    background: color-mix(in srgb, var(--chart-3) 14%, transparent);
+    color: var(--chart-3);
+    border-color: color-mix(in srgb, var(--chart-3) 35%, transparent);
+  }
+
+  .pipe-row {
+    display: grid;
+    grid-template-columns: 1fr 20px 1fr 20px 1fr 20px 1.15fr;
+    align-items: stretch;
+    gap: 4px;
+  }
+
+  .node {
+    background: var(--secondary);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) - 2px);
+    padding: 10px 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .node-accent-claude { border-top: 2px solid var(--chart-2); }
+  .node-accent-rust   { border-top: 2px solid var(--chart-4); }
+  .node-accent-wasm   { border-top: 2px solid var(--chart-1); }
+  .node-accent-gpu    { border-top: 2px solid var(--chart-3); }
+  .node-accent-safe   { border-top: 2px solid var(--success); }
+
+  .node-label {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted-foreground);
+  }
+
+  .node-title {
+    font-weight: 650;
+    font-size: 12.5px;
+    color: var(--foreground);
+  }
+
+  .node-desc {
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+  }
+
+  code {
+    font-family: var(--font-mono);
+    font-size: 10.8px;
+    background: var(--code-background);
+    padding: 0.5px 3.5px;
+    border-radius: 3.5px;
+    color: var(--foreground);
+  }
+
+  .arrow-h {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted-foreground);
+  }
+
+  .feedback-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 11px;
+    border-radius: calc(var(--radius) - 3px);
+    border: 1px dashed color-mix(in srgb, var(--chart-2) 55%, var(--border));
+    background: color-mix(in srgb, var(--chart-2) 7%, transparent);
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+  }
+
+  .feedback-bar strong {
+    color: var(--chart-2);
+    font-weight: 600;
+  }
+
+  .bridge {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin: -4px 0;
+  }
+
+  .bridge-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 13px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--chart-1) 14%, var(--card));
+    border: 1px solid color-mix(in srgb, var(--chart-1) 45%, var(--border));
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--foreground);
+  }
+
+  .sandbox {
+    border: 1.5px dashed color-mix(in srgb, var(--success) 55%, var(--border));
+    border-radius: calc(var(--radius) - 1px);
+    background: color-mix(in srgb, var(--success) 5%, var(--secondary));
+    padding: 11px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .sandbox-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .sandbox-title {
+    font-weight: 650;
+    font-size: 12.5px;
+    color: var(--foreground);
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .caps-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+
+  .cap {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--muted-foreground);
+  }
+
+  .lanes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+
+  .lane {
+    background: var(--secondary);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) - 2px);
+    padding: 11px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .lane-head {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .lane-cadence {
+    align-self: flex-start;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 1.5px 6px;
+    border-radius: 4px;
+    background: var(--card);
+    color: var(--chart-1);
+    border: 1px solid color-mix(in srgb, var(--chart-1) 30%, var(--border));
+    white-space: nowrap;
+  }
+
+  .lane-fn {
+    font-family: var(--font-mono);
+    font-weight: 650;
+    font-size: 12px;
+    color: var(--foreground);
+  }
+
+  .lane-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4.5px;
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+  }
+
+  .lane-list li {
+    padding-left: 11px;
+    position: relative;
+  }
+
+  .lane-list li::before {
+    content: "•";
+    position: absolute;
+    left: 0;
+    color: var(--chart-1);
+    font-weight: 700;
+  }
+
+  .converge {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin: -4px 0;
+  }
+
+  .converge-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+
+  .gpu-band {
+    background: color-mix(in srgb, var(--chart-3) 7%, var(--card));
+    border: 1px solid color-mix(in srgb, var(--chart-3) 35%, var(--border));
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .gpu-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+
+  .gpu-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) - 3px);
+    padding: 9px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .gpu-card-title {
+    font-weight: 650;
+    font-size: 12px;
+    color: var(--foreground);
+  }
+
+  .gpu-card-sub {
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+
+  .scale-strip {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 7px 11px;
+    border-radius: calc(var(--radius) - 3px);
+    background: var(--secondary);
+    border: 1px solid var(--border);
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+  }
+
+  .scale-strip strong {
+    color: var(--foreground);
+  }
+
+  .scale-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .scale-chip {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--foreground);
+  }
+
+  .crates {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+
+  .crate {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 11px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .crate-name {
+    font-family: var(--font-mono);
+    font-weight: 650;
+    font-size: 12px;
+    color: var(--foreground);
+  }
+
+  .crate-tech {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--chart-4);
+  }
+
+  .crate-role {
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+
+  @media (max-width: 640px) {
+    .pipe-row {
+      grid-template-columns: 1fr;
+    }
+    .arrow-h {
+      transform: rotate(90deg);
+      height: 16px;
+    }
+    .lanes, .gpu-grid, .crates {
+      grid-template-columns: 1fr;
+    }
+    .converge {
+      display: none;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="diagram">
+
+  <div class="page-header">
+    <h1>Plateau — System Architecture</h1>
+    <span>Claude → Rust → Sandboxed WASM → Multi-threaded CPU → Bevy/wgpu GPU</span>
+  </div>
+
+  <!-- 1. AUTHORING LOOP -->
+  <section class="band">
+    <div class="band-head">
+      <div class="band-title"><span class="dot dot-author"></span>1. Authoring Pipeline (Offline Creation)</div>
+      <span class="pill">Claude + rustc + Engine Judge</span>
+    </div>
+
+    <div class="pipe-row">
+      <div class="node node-accent-claude">
+        <span class="node-label">Input</span>
+        <span class="node-title">Prompt &amp; Sketch</span>
+        <span class="node-desc">Natural language + optional <code>sketch.png</code> color map</span>
+      </div>
+
+      <div class="arrow-h" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8h11m0 0-4-4m4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+
+      <div class="node node-accent-claude">
+        <span class="node-label">LLM Author</span>
+        <span class="node-title">Claude (<code>make</code>)</span>
+        <span class="node-desc">Writes 1 pure Rust file <code>area.rs</code> against <code>plateau-sdk</code></span>
+      </div>
+
+      <div class="arrow-h" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8h11m0 0-4-4m4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+
+      <div class="node node-accent-rust">
+        <span class="node-label">Compiler</span>
+        <span class="node-title"><code>rustc</code> → WASM</span>
+        <span class="node-desc"><code>wasm32</code> + WIT ABI (~40–120 KB portable binary)</span>
+      </div>
+
+      <div class="arrow-h" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8h11m0 0-4-4m4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+
+      <div class="node node-accent-safe">
+        <span class="node-label">Verification</span>
+        <span class="node-title">Gate &amp; 7 Laws</span>
+        <span class="node-desc"><code>wasmparser</code> static gate, reachability, no traps, NaN determinism, views</span>
+      </div>
+    </div>
+
+    <div class="feedback-bar">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" style="flex-shrink:0;color:var(--chart-2)"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span><strong>Automated Feedback Loop (≤ 3 fixes + 1 visual look):</strong> compiler errors, exact failing law coordinates, and rendered reach maps + views return to Claude until every law holds.</span>
+    </div>
+  </section>
+
+  <!-- BRIDGE -->
+  <div class="bridge">
+    <svg width="14" height="18" viewBox="0 0 14 18" fill="none" style="color:var(--chart-1)"><path d="M7 1v15m0 0-4.5-4.5M7 16l4.5-4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="bridge-badge">Verified single-file area.wasm (shareable, untrusted-safe)</span>
+    <svg width="14" height="18" viewBox="0 0 14 18" fill="none" style="color:var(--chart-1)"><path d="M7 1v15m0 0-4.5-4.5M7 16l4.5-4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </div>
+
+  <!-- 2. RUNTIME CPU + SANDBOX -->
+  <section class="band">
+    <div class="band-head">
+      <div class="band-title"><span class="dot dot-runtime"></span>2. CPU Runtime &amp; Sandbox</div>
+      <div class="pill-group">
+        <span class="pill pill-safe">Zero Host Capabilities</span>
+        <span class="pill pill-cpu">Wasmtime 51 (Cranelift JIT)</span>
+      </div>
+    </div>
+
+    <div class="sandbox">
+      <div class="sandbox-head">
+        <span class="sandbox-title">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="color:var(--success)"><path d="M8 1.5 2.5 3.8v4c0 3.3 2.3 5.8 5.5 6.7 3.2-.9 5.5-3.4 5.5-6.7v-4L8 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          Wasmtime Sandbox Boundary (<code>region.wit</code>)
+        </span>
+        <span style="font-size:11px;color:var(--muted-foreground);">No FS • No Net • No Clock • No Threads</span>
+      </div>
+      <div class="caps-row">
+        <span class="cap">Fuel cap / call</span>
+        <span class="cap">Memory ceiling</span>
+        <span class="cap">≤ 256 meshes / 200k verts</span>
+        <span class="cap">≤ 16,384 instances</span>
+        <span class="cap">≤ 64 lights</span>
+        <span class="cap">≤ 256 cmds/tick</span>
+        <span class="cap">Impulse ≤ 25 m/s</span>
+      </div>
+    </div>
+
+    <div class="lanes">
+      <div class="lane node-accent-wasm">
+        <div class="lane-head">
+          <span class="lane-cadence">On Load</span>
+          <span class="lane-fn">describe() &amp; scene()</span>
+        </div>
+        <ul class="lane-list">
+          <li><code>MeshBuilder</code> raw geometry: <code>sweep_tube</code>, <code>ribbon</code>, <code>lathe</code>, <code>extrude</code>, vertex tints</li>
+          <li><code>SceneBuilder</code> registers reusable meshes, static/dynamic instances &amp; lights</li>
+          <li><code>SceneWorld</code> indexes solid triangles &amp; AABBs for physics + raycast</li>
+        </ul>
+      </div>
+
+      <div class="lane node-accent-wasm">
+        <div class="lane-head">
+          <span class="lane-cadence">N−2 Worker Threads</span>
+          <span class="lane-fn">sample(points, size)</span>
+        </div>
+        <ul class="lane-list">
+          <li>1 Wasmtime instance per worker thread evaluates batched SDF queries</li>
+          <li>View-directed <code>6×4×6</code> LOD rings shifted ahead of eye &amp; velocity</li>
+          <li>Surface Nets mesher outputs crisp organic terrain, caves, arches, water</li>
+        </ul>
+      </div>
+
+      <div class="lane node-accent-wasm">
+        <div class="lane-head">
+          <span class="lane-cadence">Frame / 120 Hz</span>
+          <span class="lane-fn">tick() &amp; interact()</span>
+        </div>
+        <ul class="lane-list">
+          <li>Returns orthogonal verbs: <code>SetTransform</code>, <code>SetVisible</code>, <code>SetSolid</code>, <code>ApplyImpulse</code>, <code>SetLight</code>, <code>Say</code></li>
+          <li><code>Combined</code> physics steps capsule on SDF terrain + <code>solid: true</code> meshes</li>
+          <li>Crosshair raycasts dynamic IDs for <code>F</code> / right-click use</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONVERGE TO GPU -->
+  <div class="converge" aria-hidden="true">
+    <div class="converge-col">
+      <span>static batch + handles</span>
+      <svg width="14" height="16" viewBox="0 0 14 16" fill="none"><path d="M7 1v13m0 0-4-4m4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="converge-col">
+      <span>streamed chunk meshes</span>
+      <svg width="14" height="16" viewBox="0 0 14 16" fill="none"><path d="M7 1v13m0 0-4-4m4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="converge-col">
+      <span>transforms + light updates</span>
+      <svg width="14" height="16" viewBox="0 0 14 16" fill="none"><path d="M7 1v13m0 0-4-4m4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+  </div>
+
+  <!-- 3. GPU PRESENTER -->
+  <section class="gpu-band">
+    <div class="band-head">
+      <div class="band-title"><span class="dot dot-gpu"></span>3. GPU Presenter — Bevy 0.20.1 + wgpu / Vulkan</div>
+      <span class="pill pill-gpu">60–150+ FPS • 0 Holes</span>
+    </div>
+
+    <div class="gpu-grid">
+      <div class="gpu-card node-accent-gpu">
+        <span class="gpu-card-title">Terrain Chunks</span>
+        <span class="gpu-card-sub"><code>surface.wesl</code>: 4×4 Bayer LOD cross-fade, world-locked micro-grain, rippled glossy water</span>
+      </div>
+      <div class="gpu-card node-accent-gpu">
+        <span class="gpu-card-title">Static Scene Batch</span>
+        <span class="gpu-card-sub">All <code>id == 0</code> procedural instances merged into 1 draw call sharing <code>SurfaceMaterial</code></span>
+      </div>
+      <div class="gpu-card node-accent-gpu">
+        <span class="gpu-card-title">Dynamic Instancing</span>
+        <span class="gpu-card-sub"><code>id &gt; 0</code> reeds, rafts, creatures share uploaded <code>Handle&lt;Mesh&gt;</code> &amp; update live</span>
+      </div>
+      <div class="gpu-card node-accent-gpu">
+        <span class="gpu-card-title">Lights &amp; Shadows</span>
+        <span class="gpu-card-sub">4-cascade sun shadows + dynamic <code>PointLight</code>s scaled by <code>intensity × scale²</code></span>
+      </div>
+    </div>
+
+    <div class="scale-strip">
+      <span><strong>Eye-Centred World Scaling:</strong> the world scales around the player's eye so precision, near plane, haze &amp; shadows hold identically across 1,000× scale</span>
+      <div class="scale-chips">
+        <span class="scale-chip">Tiny 1.7 cm</span>
+        <span class="scale-chip">Person 1.7 m</span>
+        <span class="scale-chip">Giant 17 m</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. WORKSPACE CRATES -->
+  <section class="crates">
+    <div class="crate">
+      <span class="crate-name">plateau-sdk</span>
+      <span class="crate-tech">wit-bindgen • core Rust</span>
+      <span class="crate-role">WIT contract, deterministic math/SDFs, <code>MeshBuilder</code> &amp; <code>SceneBuilder</code></span>
+    </div>
+    <div class="crate">
+      <span class="crate-name">plateau-engine</span>
+      <span class="crate-tech">wasmtime • wasmparser</span>
+      <span class="crate-role">Bevy-free core: sandbox, Surface Nets, physics, <code>SceneWorld</code>, 7 laws</span>
+    </div>
+    <div class="crate">
+      <span class="crate-name">plateau-play</span>
+      <span class="crate-tech">Bevy 0.20.1 • wgpu/WESL</span>
+      <span class="crate-role">Window, chunk streaming, GPU batching/instancing, shader, figure &amp; HUD</span>
+    </div>
+    <div class="crate">
+      <span class="crate-name">plateau-make</span>
+      <span class="crate-tech">claude -p • png</span>
+      <span class="crate-role">Authoring loop: feeds <code>GUIDE.md</code> + SDK + sketch, compiles, judges, iterates</span>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

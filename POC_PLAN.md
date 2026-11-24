@@ -635,15 +635,20 @@ triangles in 1 draw call):
 - **Tiny**: **69–80 FPS** standing (`898k–1.08M` tris), **66 FPS** sprinting (**0 of 263 frames with holes**).
 - **Giant**: **155–159 FPS** (`182k` tris, **0 of 469 frames with holes**).
 
-### 8. Building (three days)
+### 8. Building & Modifiable Worlds (three days)
 
-- Placing and taking away material at the player's size (a block as big as the size's detail),
-  kept as edits laid over the area's world, saved to a file.
+- Placing and taking away material at the player's size (carving a cave in a hill for the tiny
+  person, raising a hill, or building a room), kept as scale-stamped SDF edits laid over the
+  area's world (`Edited<R>`), saved to a file.
 - **Made again equals played**: the area made again from its seed and its saved edits gives the
   same chunks.
 - A tiny person's building is tiny; a giant's is huge; both are in the same world.
+- **Keep save format & engine layer composable for future world modification** (recorded in
+  `AGENTS.md`): adding new `.wasm` elements (trees, hills, structures) onto existing maps without
+  recompiling them, and cutting/carrying/relocating discrete procedural `Scene` objects (e.g.
+  felling a tree and carrying it elsewhere, aware of player size).
 
-**Done when** a tiny person can build a room inside the cave and a giant can see it as a speck.
+**Done when** a tiny person can dig a cave in a hill or build a room inside the cave and a giant can see it as a speck.
 
 ### 9. Two areas side by side (three or four days, if there is time)
 
