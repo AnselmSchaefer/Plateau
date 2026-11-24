@@ -1,6 +1,7 @@
-//! The area's surface about the player, made off the frame (POC_PLAN.md, steps 2 and 7): view-
-//! directed `6×4×6` rings shifted forward along the look direction, frustum-prioritized chunk
-//! streaming, and complementary 4×4 Bayer dithered LOD cross-fades.
+//! The area's surface about the player, made off the frame (POC_PLAN.md, steps 2, 7, and 8):
+//! view-directed `6×4×6` rings shifted forward along the look direction, frustum-prioritized chunk
+//! streaming, complementary 4×4 Bayer dithered LOD cross-fades, and live targeted chunk
+//! invalidation for scale-stamped SDF edits with zero-flicker in-place mesh swaps.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -11,6 +12,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::chunk::{self, Key, Made};
+use plateau_engine::edit::{Edit, EditLog, Edited};
 use plateau_engine::picture::colour;
 use plateau_engine::{Compiled, rings};
 
@@ -20,13 +22,22 @@ const MOST_KEPT: usize = 12_000;
 const MOST_A_FRAME: usize = 64;
 
 enum Known {
-    Empty,
-    Shown { entity: Entity, triangles: usize, wanted: u64 },
+    Empty { revision: u64 },
+    Shown { entity: Entity, triangles: usize, wanted: u64, revision: u64 },
+}
+
+impl Known {
+    fn revision(&self) -> u64 {
+        match *self {
+            Known::Empty { revision } | Known::Shown { revision, .. } => revision,
+        }
+    }
 }
 
 struct Jobs {
     todo: Vec<Key>,
-    making: HashSet<Key>,
+    making: HashMap<Key, u64>,
+    edits: Arc<EditLog>,
     stop: bool,
 }
 
@@ -37,6 +48,7 @@ struct Queue {
 
 struct Done {
     key: Key,
+    revision: u64,
     made: Result<Made, String>,
     took: Duration,
 }
@@ -60,6 +72,9 @@ pub struct Chunks {
     queue: Arc<Queue>,
     done: Mutex<Receiver<Done>>,
     known: HashMap<Key, Known>,
+    /// Cached chunks invalidated by SDF edits that need rebuilding to at least `min_revision`.
+    /// Their old mesh stays visible until the rebuilt mesh arrives, preventing sculpting flicker.
+    stale: HashMap<Key, u64>,
     rings: rings::Rings,
     wanted: HashSet<Key>,
     shown: HashSet<Key>,
@@ -71,8 +86,11 @@ pub struct Chunks {
 }
 
 impl Chunks {
-    pub fn new(compiled: Arc<Compiled>, seed: u64, materials: Materials) -> Chunks {
-        let queue = Arc::new(Queue { jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashSet::new(), stop: false }), more: Condvar::new() });
+    pub fn new(compiled: Arc<Compiled>, seed: u64, edits: Arc<EditLog>, materials: Materials) -> Chunks {
+        let queue = Arc::new(Queue {
+            jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashMap::new(), edits, stop: false }),
+            more: Condvar::new(),
+        });
         let (tell, done) = channel();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(2).max(1);
         for k in 0..threads {
@@ -83,6 +101,7 @@ impl Chunks {
             queue,
             done: Mutex::new(done),
             known: HashMap::new(),
+            stale: HashMap::new(),
             rings: rings::Rings::default(),
             wanted: HashSet::new(),
             shown: HashSet::new(),
@@ -92,6 +111,25 @@ impl Chunks {
             materials,
             counts: Counts::default(),
         }
+    }
+
+    /// Publishes an updated `EditLog` snapshot to worker threads and invalidates affected chunks.
+    /// Pass `Some(edit)` for targeted invalidation of a single added/undone edit, or `None` to
+    /// invalidate all cached chunks (e.g., on full reload/clear).
+    pub fn set_edits(&mut self, edits: Arc<EditLog>, changed: Option<&Edit>) {
+        let rev = edits.revision();
+        {
+            let mut jobs = self.queue.jobs.lock().unwrap();
+            jobs.edits = edits;
+        }
+        for (&key, known) in &self.known {
+            if known.revision() < rev && changed.is_none_or(|e| e.affects_chunk(key)) {
+                self.stale.insert(key, rev);
+            }
+        }
+        // Any in-flight worker job on an affected chunk is now outdated; `update()` will re-queue it
+        // immediately at top priority. Wake workers once `update()` populates `todo`.
+        self.queue.more.notify_all();
     }
 
     pub fn update(
@@ -141,8 +179,26 @@ impl Chunks {
             let mut jobs = self.queue.jobs.lock().unwrap();
             let making = &jobs.making;
             let mut seen = HashSet::new();
-            let todo: Vec<Key> =
-                wanted.iter().chain(&later).filter(|k| !self.known.contains_key(k) && !making.contains(k) && seen.insert(**k)).copied().collect();
+            let needs = |k: &Key| -> bool {
+                if let Some(&need_rev) = self.stale.get(k) {
+                    making.get(k).is_none_or(|&r| r < need_rev)
+                } else {
+                    !self.known.contains_key(k) && !making.contains_key(k)
+                }
+            };
+            // Prioritize invalidated wanted chunks first so live sculpting responds immediately,
+            // then missing wanted chunks, then ahead chunks.
+            let mut todo: Vec<Key> = Vec::new();
+            for k in &wanted {
+                if self.stale.contains_key(k) && needs(k) && seen.insert(*k) {
+                    todo.push(*k);
+                }
+            }
+            for k in wanted.iter().chain(&later) {
+                if needs(k) && seen.insert(*k) {
+                    todo.push(*k);
+                }
+            }
             jobs.todo = todo.into_iter().rev().collect();
             if !jobs.todo.is_empty() {
                 self.queue.more.notify_all();
@@ -151,10 +207,25 @@ impl Chunks {
         let mut fresh = HashSet::new();
         let made: Vec<Done> = self.done.lock().unwrap().try_iter().take(MOST_A_FRAME).collect();
         for done in made {
-            self.queue.jobs.lock().unwrap().making.remove(&done.key);
+            {
+                let mut jobs = self.queue.jobs.lock().unwrap();
+                if jobs.making.get(&done.key).is_some_and(|&r| r <= done.revision) {
+                    jobs.making.remove(&done.key);
+                }
+            }
             self.counts.made += 1;
             self.counts.slowest = self.counts.slowest.max(done.took);
             self.counts.total += done.took;
+
+            // Ignore out-of-order older revisions for a chunk we already have newer data for.
+            if self.known.get(&done.key).is_some_and(|k| k.revision() > done.revision) {
+                continue;
+            }
+            if self.stale.get(&done.key).is_some_and(|&need| done.revision >= need) {
+                self.stale.remove(&done.key);
+            }
+
+            let was_known = self.known.contains_key(&done.key);
             let known = match done.made {
                 Ok(Made { mesh: Some(mesh), .. }) => {
                     let triangles = mesh.indices.len() / 3;
@@ -166,16 +237,25 @@ impl Chunks {
                             Visibility::Hidden,
                         ))
                         .id();
-                    fresh.insert(done.key);
-                    Known::Shown { entity, triangles, wanted: self.frame }
+                    if !was_known {
+                        fresh.insert(done.key);
+                    }
+                    Known::Shown { entity, triangles, wanted: self.frame, revision: done.revision }
                 }
-                Ok(Made { mesh: None, .. }) => Known::Empty,
+                Ok(Made { mesh: None, .. }) => Known::Empty { revision: done.revision },
                 Err(why) => {
                     error!("chunk {:?} could not be made: {why}", done.key);
-                    Known::Empty
+                    Known::Empty { revision: done.revision }
                 }
             };
-            self.known.insert(done.key, known);
+            if let Some(Known::Shown { entity: old_entity, .. }) = self.known.insert(done.key, known) {
+                commands.entity(old_entity).despawn();
+            }
+            if was_known {
+                // In-place sculpted update: cancel any fade on this key so the new mesh shows crisply.
+                self.fading_in.remove(&done.key);
+                self.fading_out.remove(&done.key);
+            }
         }
         let prev_shown = std::mem::take(&mut self.shown);
         let (shown, holes) = rings::shown(&wanted, &|k| self.known.contains_key(&k) && !fresh.contains(&k));
@@ -219,6 +299,7 @@ impl Chunks {
                 .collect();
             old.sort_unstable();
             for (_, key) in old.into_iter().take(self.known.len() - MOST_KEPT / 2) {
+                self.stale.remove(&key);
                 if let Some(Known::Shown { entity, .. }) = self.known.remove(&key) {
                     commands.entity(entity).despawn();
                 }
@@ -228,12 +309,12 @@ impl Chunks {
         let mut counts = Counts { made: c.made, slowest: c.slowest, total: c.total, longest: c.longest, holes, ..Counts::default() };
         for key in &self.wanted {
             match self.known.get(key) {
-                Some(Known::Shown { .. }) => counts.shown += 1,
-                Some(Known::Empty) => counts.empty += 1,
-                None => counts.waiting += 1,
+                Some(Known::Shown { .. }) if !self.stale.contains_key(key) => counts.shown += 1,
+                Some(Known::Empty { .. }) if !self.stale.contains_key(key) => counts.empty += 1,
+                _ => counts.waiting += 1,
             }
         }
-        counts.ahead = later.iter().filter(|k| !self.known.contains_key(k)).count();
+        counts.ahead = later.iter().filter(|k| !self.known.contains_key(k) || self.stale.contains_key(k)).count();
         for key in self.shown.iter().chain(&later) {
             if let Some(Known::Shown { triangles, wanted, .. }) = self.known.get_mut(key) {
                 *wanted = self.frame;
@@ -293,29 +374,34 @@ impl Drop for Chunks {
 fn work(queue: &Queue, tell: &Sender<Done>, compiled: &Compiled, seed: u64) {
     let mut area = None;
     loop {
-        let key = {
+        let (key, edits) = {
             let mut jobs = queue.jobs.lock().unwrap();
             loop {
                 if jobs.stop {
                     return;
                 }
                 if let Some(key) = jobs.todo.pop() {
-                    jobs.making.insert(key);
-                    break key;
+                    let edits = jobs.edits.clone();
+                    jobs.making.insert(key, edits.revision());
+                    break (key, edits);
                 }
                 jobs = queue.more.wait(jobs).unwrap();
             }
         };
+        let revision = edits.revision();
         let started = Instant::now();
         let made = match area.as_mut() {
             Some(a) => Ok(a),
             None => compiled.instantiate(seed).map(|a| area.insert(a)),
         }
-        .and_then(|a| chunk::make(a, key));
+        .and_then(|a| {
+            let mut edited = Edited::new(a, &*edits);
+            chunk::make(&mut edited, key)
+        });
         if made.is_err() {
             area = None;
         }
-        if tell.send(Done { key, made: made.map_err(|e| format!("{e:#}")), took: started.elapsed() }).is_err() {
+        if tell.send(Done { key, revision, made: made.map_err(|e| format!("{e:#}")), took: started.elapsed() }).is_err() {
             return;
         }
     }

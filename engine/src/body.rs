@@ -328,7 +328,7 @@ impl Body {
         for (k, f) in found.iter_mut().enumerate() {
             if let Some((t, way)) = f {
                 let l = weights[k].0.iter().map(|c| c * c).sum::<f64>().sqrt();
-                *way = if l > 0.0 { weights[k].0.map(|c| c / l) } else { UP };
+                *way = if l > 1e-6 * reach { weights[k].0.map(|c| c / l) } else { UP };
                 *t = (*t).min(reach);
             }
         }
@@ -457,6 +457,41 @@ impl Body {
     /// Whether the spheres above the step are clear of anything solid within most of their radius.
     fn room(&self, area: &mut dyn Region) -> Result<bool> {
         Ok(self.touching(area, &self.spheres(), 0.7 * self.radius() as f64)?.iter().all(Option::is_none))
+    }
+
+    /// If the body is embedded inside solid geometry (for example after raising terrain where the
+    /// player stands), lifts `feet[1]` straight up to the first clear surface above `(feet[0],
+    /// feet[2])` within `max_lift`, zeroing velocity so the player rises smoothly onto the new
+    /// surface instead of being pushed sideways or catapulted.
+    pub fn surface_from_solid(&mut self, area: &mut dyn Region, max_lift: f64) -> Result<bool> {
+        let r = self.radius() as f64;
+        if self.touching(area, &self.spheres(), r)?.iter().all(Option::is_none) {
+            return Ok(false);
+        }
+        let h = self.size as f64;
+        let step = (0.15 * h).max(1e-4);
+        let limit = max_lift.max(h);
+        let orig_y = self.feet[1];
+        let mut y = orig_y + step;
+        while y <= orig_y + limit {
+            let candidate = [self.feet[0], y, self.feet[2]];
+            let clear = self.touching(area, &self.spheres_at(candidate), r)?.iter().all(Option::is_none);
+            if clear {
+                let probe_from = [candidate[0], y + STEP as f64 * h, candidate[2]];
+                if let Hit::At(t, m) = self.cast(area, &[Ray { from: probe_from, along: DOWN, length: (y - orig_y) + STEP as f64 * h }])?[0] {
+                    self.feet[1] = probe_from[1] - t - sinks(m, self.size) as f64;
+                    self.on = Some(m);
+                } else {
+                    self.feet[1] = y;
+                    self.on = None;
+                }
+                self.velocity = [0.0; 3];
+                self.seat = None;
+                return Ok(true);
+            }
+            y += step;
+        }
+        Ok(false)
     }
 
     /// A change of size carried on: growing or shrinking evenly in proportion, eased in and out;

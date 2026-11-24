@@ -650,6 +650,31 @@ triangles in 1 draw call):
 
 **Done when** a tiny person can dig a cave in a hill or build a room inside the cave and a giant can see it as a speck.
 
+*Step 8a done (2026-11-24): scale-stamped SDF sculpting & digging with live chunk invalidation and save/load.*
+
+- **SDF edit overlay & exact chronological BVH** (`engine/src/edit.rs`, `engine/src/lib.rs`):
+  `Edit` (`Op::Add` / `Op::Carve`, exact Euclidean `Sphere` / `Box` / `Cylinder` primitives with
+  optional smooth blend, material, and `stamp_size`), `EditLog` (revision tracking, undo `pop`, and
+  a chronological interval BVH that prunes unaffected batches/points while matching brute-force
+  evaluation bit-for-bit), and `Edited<R, E>` implementing `Region` so chunk meshing, `Body::step`,
+  `body::look`, `rings::open`, `reach`, `picture`, and `laws` all see edits automatically.
+- **Composable world save format** (`WorldSave`): versioned line-oriented `.plateau` format
+  (`plateau-world 1`, `area`, `seed`, `sdf ...`) with exact `f32` round-trip precision and atomic
+  save/load, structured to extend cleanly with standalone `.wasm` elements and relocated `Scene`
+  objects in Steps 8b/8c.
+- **Zero-flicker live chunk invalidation & sculpting UI** (`play/src/chunks.rs`,
+  `play/src/sculpt.rs`, `play/src/main.rs`): worker threads snapshot `Arc<EditLog>` per chunk;
+  `Chunks::set_edits` invalidates only chunks overlapping `edit.affects_chunk(key)` at top priority
+  while keeping the prior mesh visible until the rebuilt mesh swaps in cleanly. `B` toggles sculpt
+  mode with a translucent 3D brush ghost sized to the player's current scale (`LMB` add, `RMB`/`X`
+  carve — click or hold to stroke, `Tab` shape, `R` material, scroll/`[`/`]` size, `Z`/`Y` undo/redo,
+  `Ctrl+S`/`F5` save, `Ctrl+L`/`F9` reload, `--save <path>` CLI).
+- **Verified** (`engine/tests/edits.rs`): 6 tests passing — BVH bit-exactness vs brute force across
+  60 mixed multi-scale edits, raising a person-scale hill + digging a tiny cave + walking inside it
+  while blocking growth + coarse/full chunk agreement, save/reload bit-exact chunk determinism
+  ("made again equals played"), targeted chunk invalidation soundness, `never_too_long` and
+  `surfaces_have_an_inside` laws on edited terrain, and undo/validation.
+
 ### 9. Two areas side by side (three or four days, if there is time)
 
 - Two areas made one after the other, the second told the first's border.

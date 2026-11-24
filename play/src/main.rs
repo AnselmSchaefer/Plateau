@@ -22,6 +22,7 @@ mod chunks;
 mod figure;
 mod flags;
 mod scene;
+mod sculpt;
 mod surface;
 
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use bevy::asset::embedded_asset;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::{CascadeShadowConfigBuilder, GlobalAmbientLight};
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
@@ -38,9 +39,11 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 use chunks::Chunks;
 use plateau_engine::body::{self, Body, Intent};
+use plateau_engine::edit::{EditLog, Edited, Op, WorldSave, surface_normal};
 use plateau_engine::scene::{Combined, SceneWorld};
 use plateau_engine::{Command, Compiled, Limits, PlayerState, Region, SIZES, START, Scene, Wasm, rings};
 use scene::SceneVisuals;
+use sculpt::{BrushGhost, Sculpt};
 use surface::{Materials, SurfaceMaterial};
 
 /// The physics' steps a second.
@@ -61,18 +64,39 @@ const SKY: Color = Color::srgb(0.62, 0.72, 0.84);
 fn main() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut args = std::env::args().skip(1);
-    let (mut module, mut seed, mut tour, mut behind) = (here.join("areas/modules/garden.wasm"), 7u64, None, false);
+    let (mut module, mut seed, mut tour, mut behind, mut save_arg) = (here.join("areas/modules/garden.wasm"), 7u64, None, false, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
             "--tour" => tour = Some(PathBuf::from(args.next().expect("--tour takes a folder"))),
             "--behind" => behind = true,
+            "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
             _ => module = PathBuf::from(arg),
         }
     }
     let bytes = std::fs::read(&module).unwrap_or_else(|e| panic!("{}: {e} (areas/build.sh builds the areas)", module.display()));
     let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", module.display())));
-    let mut physics = compiled.instantiate(seed).expect("the area made");
+    let initial_edits = match &save_arg {
+        Some(path) if path.exists() => {
+            let loaded = WorldSave::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if loaded.seed != seed {
+                eprintln!("note: save {} uses seed {} (overriding --seed {seed})", path.display(), loaded.seed);
+                seed = loaded.seed;
+            }
+            Arc::new(EditLog::from_edits(loaded.edits).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+        }
+        _ => Arc::new(EditLog::new()),
+    };
+    let stem = module
+        .parent()
+        .and_then(|p| p.file_name())
+        .filter(|n| *n != "modules")
+        .or_else(|| module.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("area");
+    let save_path = save_arg.unwrap_or_else(|| here.join("target/saves").join(format!("{stem}-seed{seed}.plateau")));
+
+    let mut physics = Edited::new(compiled.instantiate(seed).expect("the area made"), initial_edits.clone());
     let described = physics.describe().expect("the area described");
     let initial_scene = physics.scene().expect("the area's scene");
     let world = SceneWorld::from_scene(&initial_scene);
@@ -106,6 +130,7 @@ fn main() {
             flags,
             initial_scene: Some(initial_scene),
         })
+        .insert_resource(Sculpt::new(initial_edits, save_path, described.name.clone(), seed))
         .insert_resource(LiveScene { world, elapsed: 0.0, interact_pressed: false, holding_use: false })
         .insert_resource(Player {
             body,
@@ -123,12 +148,12 @@ fn main() {
         .insert_resource(figure::Gait::default())
         .insert_non_send(Physics(physics))
         .add_systems(Startup, setup)
-        .add_systems(Update, (look_and_ask, step, frame, draw, figure::animate, flags::place, hud).chain());
+        .add_systems(Update, (look_and_ask, step, frame, draw, sculpt::place_ghost, figure::animate, flags::place, hud).chain());
     if let Some(folder) = tour {
         std::fs::create_dir_all(&folder).expect("the tour's folder");
         app.insert_resource(Tour::new(folder)).add_systems(Update, go_on_tour.before(step));
     } else {
-        app.add_systems(Update, (grab_the_mouse, screenshot));
+        app.add_systems(Update, (grab_the_mouse.after(look_and_ask), screenshot));
     }
     app.run();
 }
@@ -154,8 +179,8 @@ struct LiveScene {
     holding_use: bool,
 }
 
-/// The instance the player's body is moved through.
-struct Physics(Wasm);
+/// The instance the player's body is moved through (base WASM area wrapped with live SDF edits).
+struct Physics(Edited<Wasm, Arc<EditLog>>);
 
 #[derive(Resource)]
 struct Player {
@@ -207,6 +232,7 @@ fn setup(
     mut commands: Commands,
     mut area: ResMut<Area>,
     live: Res<LiveScene>,
+    sculpt: Res<Sculpt>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
@@ -215,9 +241,10 @@ fn setup(
     let initial = area.initial_scene.take().unwrap_or_default();
     let visuals = scene::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &initial, &live.world);
     commands.insert_resource(visuals);
-    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, surface));
+    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, sculpt.edits.clone(), surface));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
     flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
+    sculpt::spawn_ghost(&mut commands, &mut meshes, &mut materials);
     let sun = Vec3::new(0.48, 0.70, 0.53).normalize();
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
@@ -234,8 +261,8 @@ fn setup(
     let text = |size: f32| TextFont { font_size: bevy::text::FontSize::Px(size), ..default() };
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
-        Text::new("W A S D walk  /  Shift run  /  Space jump  /  F or right-click interact  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  V from behind or through the eyes  /  M flags  /  F12 screenshot"),
-        text(15.0),
+        Text::new("W A S D walk  /  Shift run  /  Space jump  /  F interact  /  B sculpt (LMB add, RMB/X dig, Tab shape, R mat, Wheel size, Z/Y undo, Ctrl+S save)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit  /  V view  /  M flags  /  F12 shot  /  mouse look (click; Esc frees)"),
+        text(14.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         Node { position_type: PositionType::Absolute, bottom: px(10.0), left: px(12.0), ..default() },
     ));
@@ -260,15 +287,20 @@ fn sizes() -> [f32; 3] {
     SIZES.map(|(_, h)| h)
 }
 
-/// The mouse turns the view; the keys say where to go, and change size, sit, or interact.
+/// The mouse turns the view; the keys say where to go, and change size, sit, sculpt, or interact.
+#[allow(clippy::too_many_arguments)]
 fn look_and_ask(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     tour: Option<Res<Tour>>,
     mut player: ResMut<Player>,
     mut live: ResMut<LiveScene>,
+    mut sculpt: ResMut<Sculpt>,
+    mut chunks: ResMut<Chunks>,
     mut physics: NonSendMut<Physics>,
 ) {
     if tour.is_some() {
@@ -279,17 +311,170 @@ fn look_and_ask(
         player.body.yaw -= motion.delta.x * 0.0025;
         player.pitch = (player.pitch - motion.delta.y * 0.0025).clamp(-1.55, 1.55);
     }
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
     player.intent = Intent {
-        forward: held(KeyCode::KeyW) - held(KeyCode::KeyS),
+        forward: if ctrl { 0.0 } else { held(KeyCode::KeyW) - held(KeyCode::KeyS) },
         right: held(KeyCode::KeyD) - held(KeyCode::KeyA),
         run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
         jump: keys.pressed(KeyCode::Space),
     };
-    if keys.just_pressed(KeyCode::KeyF) || buttons.just_pressed(MouseButton::Right) {
+    if keys.just_pressed(KeyCode::KeyB) {
+        sculpt.active = !sculpt.active;
+        sculpt.hold_timer = 0.0;
+        sculpt.last_stamp = None;
+        if sculpt.active {
+            player.say(format!("sculpt mode: {} / {}", sculpt.preset.name(), sculpt.material().name()));
+        } else {
+            sculpt.aim = None;
+            player.say("sculpt mode off");
+        }
+    }
+    if keys.just_pressed(KeyCode::KeyF) || (!sculpt.active && buttons.just_pressed(MouseButton::Right)) {
         live.interact_pressed = true;
     }
-    live.holding_use = keys.pressed(KeyCode::KeyF) || buttons.pressed(MouseButton::Right);
+    live.holding_use = keys.pressed(KeyCode::KeyF) || (!sculpt.active && buttons.pressed(MouseButton::Right));
+
+    // Sculpting controls (scale-stamped SDF edits, undo/redo, save/reload).
+    if sculpt.active {
+        if keys.just_pressed(KeyCode::Tab) {
+            sculpt.preset = sculpt.preset.next();
+            player.say(format!("brush: {}", sculpt.preset.name()));
+        }
+        if keys.just_pressed(KeyCode::KeyR) {
+            sculpt.next_material();
+            player.say(format!("material: {}", sculpt.material().name()));
+        }
+        if scroll.delta.y > 0.0 || keys.just_pressed(KeyCode::BracketRight) {
+            sculpt.adjust_radius(1.18);
+        } else if scroll.delta.y < 0.0 || keys.just_pressed(KeyCode::BracketLeft) {
+            sculpt.adjust_radius(1.0 / 1.18);
+        }
+        // Cast ray from the camera pivot along the look direction (collinear with the `+` crosshair
+        // in both first- and third-person views) against the edited SDF.
+        let eye = player.eye.unwrap_or(player.body.eye());
+        let dir = player.looking().to_array();
+        let psize = player.body.size;
+        let pivot = if player.third {
+            let per = (psize / DRAWN_AS) as f64;
+            [eye[0], eye[1] + player.lift as f64 * per, eye[2]]
+        } else {
+            eye
+        };
+        let reach = psize * 40.0;
+        let hit = body::look(&mut physics.0, pivot, dir, psize, reach).ok().flatten();
+        sculpt.aim = hit.map(|h| {
+            let n = surface_normal(&mut physics.0, h, psize).unwrap_or([0.0, 1.0, 0.0]);
+            (h, n)
+        });
+        let add_just = buttons.just_pressed(MouseButton::Left);
+        let carve_just = buttons.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::KeyX);
+        let add_held = buttons.pressed(MouseButton::Left);
+        let carve_held = buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::KeyX);
+        if !add_held && !carve_held {
+            sculpt.hold_timer = 0.0;
+            sculpt.last_stamp = None;
+        } else {
+            sculpt.hold_timer = (sculpt.hold_timer - time.delta_secs()).max(0.0);
+        }
+        if grabbed && let Some((h, n)) = sculpt.aim {
+            let click_op = if add_just {
+                Some(Op::Add)
+            } else if carve_just {
+                Some(Op::Carve)
+            } else {
+                None
+            };
+            let hold_op = if click_op.is_none() && sculpt.hold_timer <= 0.0 {
+                if add_held {
+                    Some(Op::Add)
+                } else if carve_held {
+                    Some(Op::Carve)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(op) = click_op.or(hold_op) {
+                let edit = sculpt.make_edit(op, psize, h, n);
+                let spacing_ok = click_op.is_some()
+                    || sculpt.last_stamp.is_none_or(|prev| {
+                        let d2 = (0..3).map(|a| (edit.center[a] - prev[a]).powi(2)).sum::<f32>();
+                        let min_step = sculpt.radius(psize) * 0.45;
+                        d2 >= min_step * min_step
+                    });
+                if spacing_ok {
+                    match sculpt.push_edit(edit, &mut chunks) {
+                        Ok(()) => {
+                            physics.0.edits = sculpt.edits.clone();
+                            if edit.op == Op::Add {
+                                let (_, hi) = edit.influence_bounds();
+                                let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
+                                let mut combined = Combined { region: &mut physics.0, world: &live.world };
+                                let _ = player.body.surface_from_solid(&mut combined, max_lift);
+                            }
+                            sculpt.last_stamp = Some(edit.center);
+                            sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
+                        }
+                        Err(e) => player.say(format!("sculpt error: {e}")),
+                    }
+                }
+            }
+        }
+    }
+    if (sculpt.active && keys.just_pressed(KeyCode::KeyZ)) || (ctrl && keys.just_pressed(KeyCode::KeyZ)) {
+        if sculpt.undo(&mut chunks).is_some() {
+            physics.0.edits = sculpt.edits.clone();
+            player.say(format!("undo ({} edits)", sculpt.edits.len()));
+        } else {
+            player.say("nothing to undo");
+        }
+    }
+    if (sculpt.active && keys.just_pressed(KeyCode::KeyY)) || (ctrl && keys.just_pressed(KeyCode::KeyY)) {
+        if let Some(edit) = sculpt.redo(&mut chunks) {
+            physics.0.edits = sculpt.edits.clone();
+            if edit.op == Op::Add {
+                let (_, hi) = edit.influence_bounds();
+                let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
+                let mut combined = Combined { region: &mut physics.0, world: &live.world };
+                let _ = player.body.surface_from_solid(&mut combined, max_lift);
+            }
+            player.say(format!("redo ({} edits)", sculpt.edits.len()));
+        } else {
+            player.say("nothing to redo");
+        }
+    }
+    if keys.just_pressed(KeyCode::F5) || (ctrl && keys.just_pressed(KeyCode::KeyS)) {
+        match sculpt.save() {
+            Ok(()) => {
+                let msg = format!("saved {} edits to {}", sculpt.edits.len(), sculpt.save_path.display());
+                println!("{msg}");
+                player.say(msg);
+            }
+            Err(e) => {
+                let msg = format!("save failed: {e}");
+                eprintln!("{msg}");
+                player.say(msg);
+            }
+        }
+    }
+    if keys.just_pressed(KeyCode::F9) || (ctrl && keys.just_pressed(KeyCode::KeyL)) {
+        match sculpt.reload(&mut chunks) {
+            Ok(n) => {
+                physics.0.edits = sculpt.edits.clone();
+                let msg = format!("reloaded {n} edits from {}", sculpt.save_path.display());
+                println!("{msg}");
+                player.say(msg);
+            }
+            Err(e) => {
+                let msg = format!("reload failed: {e}");
+                eprintln!("{msg}");
+                player.say(msg);
+            }
+        }
+    }
+
     let size = player.body.change.map_or(player.body.size, |c| c.to);
     let [tiny, person, giant] = sizes();
     let to = if keys.just_pressed(KeyCode::Digit1) {
@@ -469,12 +654,12 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, live: Res<LiveScene>, mut 
     player.back = if target < player.back { target } else { player.back + (target - player.back) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
 }
 
-/// Where the chunks are drawn, and whether: everything but the camera, the sun, and the procedural scene.
+/// Where the chunks are drawn, and whether: everything but the camera, the sun, the brush ghost, and the procedural scene.
 type Placed<'w, 's> = Query<
     'w,
     's,
     (&'static mut Transform, &'static mut Visibility, Option<&'static mut MeshMaterial3d<SurfaceMaterial>>),
-    (Without<Camera3d>, Without<Sun>, Without<scene::SceneNode>),
+    (Without<Camera3d>, Without<Sun>, Without<BrushGhost>, Without<scene::SceneNode>),
 >;
 
 /// The chunks asked for and placed about the eye, the procedural scene synced, the camera turned.
@@ -551,9 +736,11 @@ fn size_name(size: f32) -> String {
 
 fn hud(
     mut text: Query<&mut Text, With<Hud>>,
+    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     player: Res<Player>,
     chunks: Res<Chunks>,
     visuals: Res<SceneVisuals>,
+    sculpt: Res<Sculpt>,
     diagnostics: Res<DiagnosticsStore>,
     area: Res<Area>,
 ) {
@@ -573,8 +760,13 @@ fn hud(
     let c = chunks.counts;
     let feet = b.seat.map_or(b.feet, |s| s.at);
     let holes = if c.holes > 0 { format!(", {} not yet stood in for", c.holes) } else { String::new() };
+    let edits_note = if !sculpt.edits.is_empty() || sculpt.dirty {
+        format!("  /  {} edits{}", sculpt.edits.len(), if sculpt.dirty { "*" } else { "" })
+    } else {
+        String::new()
+    };
     let mut s = format!(
-        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}{edits_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         c.shown,
         c.waiting,
@@ -585,6 +777,29 @@ fn hud(
         feet[1],
         feet[2]
     );
+    if sculpt.active {
+        let r = sculpt.radius(b.size);
+        let r_str = if r < 0.1 {
+            format!("{:.1} mm", r * 1000.0)
+        } else if r < 1.0 {
+            format!("{:.1} cm", r * 100.0)
+        } else {
+            format!("{r:.2} m")
+        };
+        let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
+        let hint = if !grabbed {
+            "  [click window to lock mouse]"
+        } else if sculpt.aim.is_none() {
+            "  [aim at a surface within reach]"
+        } else {
+            ""
+        };
+        s += &format!(
+            "\nSCULPT: {}  /  {}  /  radius {r_str}{hint}  (LMB add, RMB/X carve, Tab shape, R mat, Wheel size, Ctrl+S save)",
+            sculpt.preset.name(),
+            sculpt.material().name()
+        );
+    }
     // The area's places: when at one (within twice the smaller of the player and whom it is
     // for), so; and with the flags shown, how far each is and which way.
     for (name, size, at) in &area.places {

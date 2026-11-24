@@ -12,6 +12,7 @@
 pub mod body;
 pub mod check;
 pub mod chunk;
+pub mod edit;
 pub mod laws;
 pub mod picture;
 pub mod reach;
@@ -20,6 +21,7 @@ pub mod scene;
 pub mod sketch;
 pub mod wasm;
 
+pub use edit::{Edit, EditLog, Edited, Op, Shape, WorldSave};
 pub use wasm::{Compiled, Limits, Wasm};
 pub use wasmtime::{Error, Result};
 
@@ -41,6 +43,28 @@ pub trait Region {
     /// Sandboxed runtime interaction called when the player presses interact (`F` / right-click).
     fn interact(&mut self, _player: &PlayerState) -> Result<Vec<Command>> {
         Ok(Vec::new())
+    }
+}
+
+impl<R: Region + ?Sized> Region for &mut R {
+    fn sample(&mut self, points: &[[f32; 3]], size: f32, out: &mut Vec<Answer>) -> Result<()> {
+        (**self).sample(points, size, out)
+    }
+
+    fn describe(&mut self) -> Result<Description> {
+        (**self).describe()
+    }
+
+    fn scene(&mut self) -> Result<Scene> {
+        (**self).scene()
+    }
+
+    fn tick(&mut self, dt: f32, player: &PlayerState) -> Result<Vec<Command>> {
+        (**self).tick(dt, player)
+    }
+
+    fn interact(&mut self, player: &PlayerState) -> Result<Vec<Command>> {
+        (**self).interact(player)
     }
 }
 
