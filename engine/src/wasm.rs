@@ -8,7 +8,7 @@ use wasmtime::error::Context;
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc, format_err};
 
 use crate::check::{self, HOST, MOST_MEMORY};
-use crate::{Answer, Borders, Description, Edge, LARGEST, Material, Place, Prop, PropKind, Region, Result, SMALLEST, Size};
+use crate::{Answer, Borders, Command, Description, Edge, Instance, LARGEST, Light, Material, MeshData, Place, PlayerState, Region, Result, SMALLEST, Scene, Size, Vertex};
 
 /// How a module is run.
 #[derive(Clone, Copy, Debug)]
@@ -22,11 +22,19 @@ pub struct Limits {
     pub canonical_nans: bool,
 }
 
-/// Fuel for a batch besides its points', and for `describe` / `props`.
+/// Fuel for a batch besides its points', for `describe` / `scene`, and per runtime `tick` / `interact`.
 pub const FUEL_PER_CALL: u64 = 1_000_000;
 pub const FUEL_TO_DESCRIBE: u64 = 100_000_000;
-/// The most smooth GPU props an area may emit.
-pub const MOST_PROPS: usize = 16_384;
+pub const FUEL_PER_TICK: u64 = 2_000_000;
+/// Security caps for procedural scenes & runtime commands emitted by an untrusted `.wasm`.
+pub const MOST_MESHES: usize = 256;
+pub const MOST_VERTICES: usize = 200_000;
+pub const MOST_INDICES: usize = 600_000;
+pub const MOST_INSTANCES: usize = 16_384;
+pub const MOST_LIGHTS: usize = 64;
+pub const MOST_COMMANDS: usize = 256;
+/// Maximum clamped magnitude for an `ApplyImpulse` verb (m/s).
+pub const MAX_IMPULSE: f32 = 25.0;
 /// The most points in a batch: what a chunk's corner asks at once is well within it.
 pub const MOST_POINTS: usize = 1 << 16;
 /// The most places an area may name, and the longest name.
@@ -82,7 +90,15 @@ impl Compiled {
         linker.func_wrap(HOST, "seed", |caller: Caller<'_, Ctx>| caller.data().seed as i64)?;
         let instance = linker.instantiate(&mut store, &self.module)?;
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| format_err!("the area has no memory"))?;
-        let props = match (instance.get_typed_func(&mut store, "props"), instance.get_typed_func(&mut store, "cabi_post_props")) {
+        let scene = match (instance.get_typed_func(&mut store, "scene"), instance.get_typed_func(&mut store, "cabi_post_scene")) {
+            (Ok(f), Ok(p)) => Some((f, p)),
+            _ => None,
+        };
+        let tick = match (instance.get_typed_func(&mut store, "tick"), instance.get_typed_func(&mut store, "cabi_post_tick")) {
+            (Ok(f), Ok(p)) => Some((f, p)),
+            _ => None,
+        };
+        let interact = match (instance.get_typed_func(&mut store, "interact"), instance.get_typed_func(&mut store, "cabi_post_interact")) {
             (Ok(f), Ok(p)) => Some((f, p)),
             _ => None,
         };
@@ -92,7 +108,9 @@ impl Compiled {
             post_sample: instance.get_typed_func(&mut store, "cabi_post_sample").context("the area's cabi_post_sample")?,
             describe: instance.get_typed_func(&mut store, "describe").context("the area's describe")?,
             post_describe: instance.get_typed_func(&mut store, "cabi_post_describe").context("the area's cabi_post_describe")?,
-            props,
+            scene,
+            tick,
+            interact,
             store,
             memory,
             fuel_per_sample: self.limits.fuel_per_sample,
@@ -115,7 +133,9 @@ pub struct Wasm {
     post_sample: TypedFunc<u32, ()>,
     describe: TypedFunc<(), u32>,
     post_describe: TypedFunc<u32, ()>,
-    props: Option<(TypedFunc<(), u32>, TypedFunc<u32, ()>)>,
+    scene: Option<(TypedFunc<(), u32>, TypedFunc<u32, ()>)>,
+    tick: Option<(TypedFunc<u32, u32>, TypedFunc<u32, ()>)>,
+    interact: Option<(TypedFunc<u32, u32>, TypedFunc<u32, ()>)>,
     fuel_per_sample: Option<u64>,
 }
 
@@ -221,36 +241,246 @@ impl Region for Wasm {
         Ok(description)
     }
 
-    fn props(&mut self) -> Result<Vec<Prop>> {
-        let Some((call_props, post_props)) = self.props.clone() else {
-            return Ok(Vec::new());
+    fn scene(&mut self) -> Result<Scene> {
+        let Some((call_scene, post_scene)) = self.scene.clone() else {
+            return Ok(Scene::default());
         };
         self.fuel(|_| FUEL_TO_DESCRIBE)?;
-        let ret = call_props.call(&mut self.store, ())?;
+        let ret = call_scene.call(&mut self.store, ())?;
         let d = Bytes(self.memory.data(&self.store));
-        let (list, len) = (d.u32(ret)?, d.u32(ret + 4)? as usize);
-        if len > MOST_PROPS {
-            return Err(format_err!("the area gave {len} props, more than the {MOST_PROPS} it may"));
+        let (meshes_ptr, meshes_len) = (d.u32(ret)?, d.u32(ret + 4)? as usize);
+        let (inst_ptr, inst_len) = (d.u32(ret + 8)?, d.u32(ret + 12)? as usize);
+        let (lights_ptr, lights_len) = (d.u32(ret + 16)?, d.u32(ret + 20)? as usize);
+        if meshes_len > MOST_MESHES {
+            return Err(format_err!("the area gave {meshes_len} meshes, more than the {MOST_MESHES} it may"));
         }
-        // `prop`: kind (u8, 0), material (u8, 1), pad (2), a (12, 4..16), b (12, 16..28), r (4, 28..32), yaw (4, 32..36).
-        let raw = d.slice(list, len, 36)?;
-        let mut out = Vec::with_capacity(len);
-        for chunk in raw.as_chunks::<36>().0 {
-            let kind = PropKind::from_number(chunk[0]).ok_or_else(|| format_err!("prop kind {} is not one of the engine's", chunk[0]))?;
-            let material = Material::from_number(chunk[1]).ok_or_else(|| format_err!("prop material {} is not one of the engine's", chunk[1]))?;
-            let f = |off: usize| f32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
-            let a = [f(4), f(8), f(12)];
-            let b = [f(16), f(20), f(24)];
-            let r = f(28);
-            let yaw = f(32);
-            if !a.iter().chain(&b).chain(&[r, yaw]).all(|v| v.is_finite()) || r < 0.0 || r > 32.0 {
-                return Err(format_err!("a prop has an out-of-range or non-finite value"));
+        if inst_len > MOST_INSTANCES {
+            return Err(format_err!("the area gave {inst_len} instances, more than the {MOST_INSTANCES} it may"));
+        }
+        if lights_len > MOST_LIGHTS {
+            return Err(format_err!("the area gave {lights_len} lights, more than the {MOST_LIGHTS} it may"));
+        }
+
+        let mut total_verts = 0usize;
+        let mut total_indices = 0usize;
+        let mut meshes = Vec::with_capacity(meshes_len);
+        for m in 0..meshes_len as u32 {
+            let base = meshes_ptr + m * 16;
+            let (vptr, vlen) = (d.u32(base)?, d.u32(base + 4)? as usize);
+            let (iptr, ilen) = (d.u32(base + 8)?, d.u32(base + 12)? as usize);
+            total_verts = total_verts.saturating_add(vlen);
+            total_indices = total_indices.saturating_add(ilen);
+            if total_verts > MOST_VERTICES {
+                return Err(format_err!("the area's meshes exceed {MOST_VERTICES} total vertices"));
             }
-            out.push(Prop { kind, material, a, b, r, yaw });
+            if total_indices > MOST_INDICES || !ilen.is_multiple_of(3) {
+                return Err(format_err!("the area's mesh indices are invalid or exceed {MOST_INDICES}"));
+            }
+            let raw_v = d.slice(vptr, vlen, 28)?;
+            let mut vertices = Vec::with_capacity(vlen);
+            for b in raw_v.as_chunks::<28>().0 {
+                let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                let pos = [f(0), f(4), f(8)];
+                let normal = [f(12), f(16), f(20)];
+                let material = Material::from_number(b[24]).ok_or_else(|| format_err!("vertex material {} is invalid", b[24]))?;
+                if !pos.iter().chain(&normal).all(|v| v.is_finite() && v.abs() <= 256.0) {
+                    return Err(format_err!("a mesh vertex has a non-finite or out-of-range coordinate"));
+                }
+                vertices.push(Vertex { pos, normal, material, tint: [b[25], b[26], b[27]] });
+            }
+            let raw_i = d.slice(iptr, ilen, 4)?;
+            let mut indices = Vec::with_capacity(ilen);
+            for b in raw_i.as_chunks::<4>().0 {
+                let idx = u32::from_le_bytes(*b);
+                if idx as usize >= vlen {
+                    return Err(format_err!("mesh {m} has out-of-bounds vertex index {idx} (vertices: {vlen})"));
+                }
+                indices.push(idx);
+            }
+            meshes.push(MeshData { vertices, indices });
         }
-        post_props.call(&mut self.store, ret)?;
-        Ok(out)
+
+        let raw_inst = d.slice(inst_ptr, inst_len, 52)?;
+        let mut instances = Vec::with_capacity(inst_len);
+        for b in raw_inst.as_chunks::<52>().0 {
+            let inst = read_instance(b, meshes_len)?;
+            instances.push(inst);
+        }
+
+        let raw_lights = d.slice(lights_ptr, lights_len, 36)?;
+        let mut lights = Vec::with_capacity(lights_len);
+        for b in raw_lights.as_chunks::<36>().0 {
+            lights.push(read_light(b)?);
+        }
+
+        post_scene.call(&mut self.store, ret)?;
+        Ok(Scene { meshes, instances, lights })
     }
+
+    fn tick(&mut self, dt: f32, player: &PlayerState) -> Result<Vec<Command>> {
+        let Some((call_tick, post_tick)) = self.tick.clone() else {
+            return Ok(Vec::new());
+        };
+        self.fuel(|_| FUEL_PER_TICK)?;
+        let arg = self.realloc.call(&mut self.store, (0, 0, 4, 80))?;
+        {
+            let data = self.memory.data_mut(&mut self.store);
+            let room = data.get_mut(arg as usize..arg as usize + 80).ok_or_else(|| format_err!("the area gave room outside its memory"))?;
+            room[0..4].copy_from_slice(&dt.to_le_bytes());
+            write_player_state(&mut room[4..80], player);
+        }
+        let ret = call_tick.call(&mut self.store, arg)?;
+        let cmds = read_commands(Bytes(self.memory.data(&self.store)), ret)?;
+        post_tick.call(&mut self.store, ret)?;
+        Ok(cmds)
+    }
+
+    fn interact(&mut self, player: &PlayerState) -> Result<Vec<Command>> {
+        let Some((call_interact, post_interact)) = self.interact.clone() else {
+            return Ok(Vec::new());
+        };
+        self.fuel(|_| FUEL_PER_TICK)?;
+        let arg = self.realloc.call(&mut self.store, (0, 0, 4, 76))?;
+        {
+            let data = self.memory.data_mut(&mut self.store);
+            let room = data.get_mut(arg as usize..arg as usize + 76).ok_or_else(|| format_err!("the area gave room outside its memory"))?;
+            write_player_state(room, player);
+        }
+        let ret = call_interact.call(&mut self.store, arg)?;
+        let cmds = read_commands(Bytes(self.memory.data(&self.store)), ret)?;
+        post_interact.call(&mut self.store, ret)?;
+        Ok(cmds)
+    }
+}
+
+fn read_instance(b: &[u8; 52], meshes_len: usize) -> Result<Instance> {
+    let u = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let id = u(0);
+    let mesh = u(4);
+    if meshes_len > 0 && mesh as usize >= meshes_len {
+        return Err(format_err!("instance references mesh {mesh}, only {meshes_len} exist"));
+    }
+    let pos = [f(8), f(12), f(16)];
+    let mut rot = [f(20), f(24), f(28), f(32)];
+    let scale = [f(36), f(40), f(44)];
+    let solid = match b[48] {
+        0 => false,
+        1 => true,
+        n => return Err(format_err!("instance solid bool was {n}")),
+    };
+    if !pos.iter().all(|v| v.is_finite() && (-128.0..=192.0).contains(v))
+        || !rot.iter().all(|v| v.is_finite())
+        || !scale.iter().all(|v| v.is_finite() && v.abs() <= 64.0)
+    {
+        return Err(format_err!("an instance has an out-of-range or non-finite transform"));
+    }
+    let rlen = (rot[0] * rot[0] + rot[1] * rot[1] + rot[2] * rot[2] + rot[3] * rot[3]).sqrt();
+    if rlen > 1e-5 {
+        for c in &mut rot {
+            *c /= rlen;
+        }
+    } else {
+        rot = [0.0, 0.0, 0.0, 1.0];
+    }
+    Ok(Instance { id, mesh, pos, rot, scale, solid })
+}
+
+fn read_light(b: &[u8; 36]) -> Result<Light> {
+    let u = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let id = u(0);
+    let pos = [f(4), f(8), f(12)];
+    let color = [f(16).clamp(0.0, 1.0), f(20).clamp(0.0, 1.0), f(24).clamp(0.0, 1.0)];
+    let intensity = f(28).clamp(0.0, 100_000.0);
+    let radius = f(32).clamp(0.01, 64.0);
+    if !pos.iter().all(|v| v.is_finite() && (-128.0..=192.0).contains(v)) || !f(28).is_finite() || !f(32).is_finite() {
+        return Err(format_err!("a light has a non-finite or out-of-range value"));
+    }
+    Ok(Light { id, pos, color, intensity, radius })
+}
+
+fn write_player_state(buf: &mut [u8], p: &PlayerState) {
+    let put_f = |buf: &mut [u8], o: usize, v: f32| buf[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    put_f(buf, 0, p.feet[0]);
+    put_f(buf, 4, p.feet[1]);
+    put_f(buf, 8, p.feet[2]);
+    put_f(buf, 12, p.eye[0]);
+    put_f(buf, 16, p.eye[1]);
+    put_f(buf, 20, p.eye[2]);
+    put_f(buf, 24, p.look[0]);
+    put_f(buf, 28, p.look[1]);
+    put_f(buf, 32, p.look[2]);
+    put_f(buf, 36, p.velocity[0]);
+    put_f(buf, 40, p.velocity[1]);
+    put_f(buf, 44, p.velocity[2]);
+    put_f(buf, 48, p.size);
+    buf[52] = p.grounded as u8;
+    buf[53] = p.holding_use as u8;
+    buf[54] = 0;
+    buf[55] = 0;
+    buf[56..60].copy_from_slice(&p.target.to_le_bytes());
+    put_f(buf, 60, p.aim[0]);
+    put_f(buf, 64, p.aim[1]);
+    put_f(buf, 68, p.aim[2]);
+    put_f(buf, 72, p.time);
+}
+
+fn read_commands(d: Bytes<'_>, ret: u32) -> Result<Vec<Command>> {
+    let (ptr, len) = (d.u32(ret)?, d.u32(ret + 4)? as usize);
+    if len > MOST_COMMANDS {
+        return Err(format_err!("the area emitted {len} commands in one step, more than the {MOST_COMMANDS} allowed"));
+    }
+    let raw = d.slice(ptr, len, 56)?;
+    let mut out = Vec::with_capacity(len);
+    for (idx, b) in raw.as_chunks::<56>().0.iter().enumerate() {
+        let base = ptr + idx as u32 * 56;
+        let cmd = match b[0] {
+            0 => {
+                let slice: &[u8; 52] = b[4..56].try_into().unwrap();
+                Command::SetTransform(read_instance(slice, 0)?)
+            }
+            1 => {
+                let id = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let vis = match b[8] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format_err!("set-visible bool was {n}")),
+                };
+                Command::SetVisible(id, vis)
+            }
+            2 => {
+                let id = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let sol = match b[8] {
+                    0 => false,
+                    1 => true,
+                    n => return Err(format_err!("set-solid bool was {n}")),
+                };
+                Command::SetSolid(id, sol)
+            }
+            3 => {
+                let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                let mut dv = [f(4), f(8), f(12)];
+                if !dv.iter().all(|v| v.is_finite()) {
+                    return Err(format_err!("apply-impulse had a non-finite value"));
+                }
+                let mag = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
+                if mag > MAX_IMPULSE {
+                    let s = MAX_IMPULSE / mag;
+                    dv = [dv[0] * s, dv[1] * s, dv[2] * s];
+                }
+                Command::ApplyImpulse(dv)
+            }
+            4 => {
+                let slice: &[u8; 36] = b[4..40].try_into().unwrap();
+                Command::SetLight(read_light(slice)?)
+            }
+            5 => Command::Say(d.name(base + 4)?),
+            tag => return Err(format_err!("unknown command tag {tag}")),
+        };
+        out.push(cmd);
+    }
+    Ok(out)
 }
 
 /// An area's memory, read with every pointer and length checked.

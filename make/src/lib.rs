@@ -68,10 +68,11 @@ impl Default for Settings {
 pub fn guide(repo: &Path) -> Result<String, String> {
     let read = |p: &str| std::fs::read_to_string(repo.join(p)).map_err(|e| format!("{p}: {e}"));
     Ok(format!(
-        "{}\n\n# The SDK: `sdk/src/lib.rs`\n\n```rust\n{}```\n\n# The world's interface: `sdk/wit/region.wit`\n\n```wit\n{}```\n\n\
+        "{}\n\n# The SDK: `sdk/src/lib.rs`\n\n```rust\n{}```\n\n# The procedural mesh & scene workshop: `sdk/src/mesh.rs`\n\n```rust\n{}```\n\n# The world's interface: `sdk/wit/region.wit`\n\n```wit\n{}```\n\n\
          # The walled garden: `areas/garden/area.rs`\n\n```rust\n{}```\n",
         read("make/GUIDE.md")?,
         read("sdk/src/lib.rs")?,
+        read("sdk/src/mesh.rs")?,
         read("sdk/wit/region.wit")?,
         read("areas/garden/area.rs")?
     ))

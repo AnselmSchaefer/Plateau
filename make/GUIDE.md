@@ -116,23 +116,49 @@ Anything a size should see and stand on must be **at least a tenth of that size'
 **overlap**, not just touch: two planks that only touch have a surface inside the seat where the
 distance is nought.
 
-## Smooth props (`props()`) for thin and repeating details
+## Procedural scene (`scene()`) and runtime physics verbs (`tick()`, `interact()`)
 
-Solid landforms, caves, arches, water, boulders, buildings, and anything a player walks or stands on
-belong in `sample()`. **Thin or repeating decorative details** — reeds, cattails, meadow tussocks,
-flower stems and buds, sticks, fallen twigs, tiny mushrooms, stalagmites, or thin limbs (anything
-thinner than ~10 cm that would alias or swell across voxel LOD rings) — belong in
-`fn props(&self) -> Vec<Prop>` instead:
+Solid landforms, caves, arches, water, boulders, and the walkable landscape belong in `sample()`
+(which drives the multi-scale SDF terrain and `reach` checks). Everything thin, repeating,
+architectural, delicate, animated, or interactive belongs in the **open procedural scene builder
+and sandboxed runtime plugin**:
 
-- `Prop::capsule(a, b, r, material)` — stalks, cattail heads, flower stems, sticks, thin legs/beaks
-- `Prop::ellipsoid(center, radii, yaw, material)` — tussock mounds, flower buds, mushroom caps, pebbles
-- `Prop::cylinder(center, r, half_h, notch, material)` — discs, shelves, notched lily pads
-- `Prop::cone(foot, height, r, material)` — stalagmites (`height > 0`), stalactites (`height < 0`), spires
+### 1. Building custom meshes and instancing (`fn scene(&self) -> Scene`)
 
-Props are emitted once on load (up to 16,384, deterministic from `self.seed`) and rendered directly
-as smooth GPU geometry with zero voxel morphing at any distance. Do **not** put floors, bridges,
-walls, or stepping stones that a player needs to walk on *only* in `props()` — physics and `reach`
-read `sample()` alone.
+Nothing is restricted to fixed prefabs: `MeshBuilder` emits raw vertices & triangles, with
+mathematical workshop tools so you can invent any plant, architecture, bridge, boat, creature, or
+tool from scratch:
+
+- Raw geometry: `.tint(r, g, b)` / `.clear_tint()`, `.vertex(pos, normal, mat)`, `.tri(a, b, c)`,
+  `.quad(a, b, c, d)`, `.flat_tri(a, b, c, mat)`.
+- Procedural workshop tools:
+  - `.sweep_tube(&[(point, r)], sides, cap_ends, mat)` — curved reed stalks, branches, vines, arches, horns
+  - `.ribbon(&[(center, half_width, normal_hint)], mat)` — curved grass blades, reed leaves, petals, wings, sails
+  - `.lathe(origin, &[(r, y)], sides, mat)` — mushroom caps, pottery, lanterns, domes, pillars, bells
+  - `.extrude(&[(x, z)], y0, y1, mat)` — custom planks, stone slabs, stairs, roofs
+  - `.capsule(...)`, `.ellipsoid(...)`, `.cone(...)`, `.cuboid(...)`
+- Register each reusable mesh once via `SceneBuilder`:
+  - `let m = s.add_mesh(mb.build());` (up to 256 meshes, 200,000 vertices / 600,000 indices total)
+  - `s.place(m, pos, rot, scale, solid)` — static GPU-batched instance (`id = 0`)
+  - `s.spawn(id, m, pos, rot, scale, solid)` — dynamic instanced object (`id > 0`) that `tick` / `interact` can animate or toggle
+  - `s.light(id, pos, [r, g, b], intensity, radius)` — point light (`id > 0`, up to 64 lights)
+- Set `solid = true` on procedural bridges, rafts, stairs, doors, or moving platforms so players
+  automatically collide with and walk on their triangles in `plateau-play`. (Keep the main terrain
+  and `reach` gate geometry in `sample()` so the reachability laws see it.)
+
+### 2. Sandboxed runtime behaviour (`tick` and `interact`)
+
+Because `Area` holds mutable state inside the sandbox, you can bring the area to life by
+implementing `fn tick(&mut self, dt: f32, player: &PlayerState) -> Vec<Command>` and
+`fn interact(&mut self, player: &PlayerState) -> Vec<Command>` (triggered when the player presses
+`F` or right-click). Both run under strict per-step fuel limits and return orthogonal,
+engine-validated `Command` verbs:
+
+- `Command::SetTransform(instance(id, mesh, pos, rot, scale, solid))` — sway foliage, fly creatures, move platforms/rafts, open doors, swap meshes
+- `Command::SetVisible(id, visible)` / `Command::SetSolid(id, solid)` — hide/reveal or toggle collision
+- `Command::ApplyImpulse(dv)` — gusts of wind, updrafts, jump pads, currents (engine-clamped)
+- `Command::SetLight(light(id, pos, [r, g, b], intensity, radius))` — light/snuff lanterns, fireflies (`intensity = 0.0` turns a light off)
+- `Command::Say(text)` — brief poetic feedback shown on the player's HUD
 
 ## Distances
 

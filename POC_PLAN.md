@@ -600,23 +600,33 @@ sandbox"` with best quality at 200+ FPS):
 mid-distance features (reeds, tussocks, rocks, entrances) clearly without distracting pop-in or
 morphing, at 60 frames a second on this machine.
 
-*Done (2026-11-23).* Implemented across `sdk`, `engine`, `play`, and `make`:
+*Done (2026-11-23), upgraded (2026-11-24) to an open procedural scene builder + runtime WASM plugin.* Implemented across `sdk`, `engine`, `play`, and `make`:
 
-- **WASM `props()` export** (`sdk/wit/region.wit`, `sdk/src/lib.rs`, `engine/src/wasm.rs`,
-  `engine/src/check.rs`): optional export (`Capsule`, `Ellipsoid`, `Cylinder`, `Cone`, up to
-  `16,384` props validated for finite bounds and radii under Wasmtime fuel/memory limits; checked
-  for determinism in `laws::nans_unseen` and tested in `engine/tests/region.rs`). Earlier `.wasm`
-  modules without `props` continue to load unchanged.
-- **1-draw-call merged GPU prop mesh** (`play/src/props.rs`): tessellates all emitted props once
-  on load into a single Bevy `Mesh` sharing `SurfaceMaterial` and directional shadows, keeping
-  reeds, cattails, meadow tussocks, flowers, nest sticks, heron legs/beak, and grotto
-  stalagmites/mushrooms completely crisp from 1 cm to 64 m with zero LOD morphing.
+- **Open procedural mesh & scene workshop + runtime WASM plugin** (`sdk/wit/region.wit`,
+  `sdk/src/mesh.rs`, `sdk/src/lib.rs`, `engine/src/wasm.rs`, `engine/src/check.rs`,
+  `engine/src/scene.rs`): replaces the fixed 4-shape `props()` list with optional `scene()`,
+  `tick(dt, player)`, and `interact(player)` exports. Areas build arbitrary custom meshes via
+  `MeshBuilder` (raw vertices/triangles + `sweep_tube`, `ribbon`, `lathe`, `extrude`, `capsule`,
+  `ellipsoid`, `cone`, `cuboid`, per-vertex RGB tint) and instance them via `SceneBuilder`
+  (`place` static batches, `spawn` dynamic instanced entities, `light` dynamic point lights).
+  `tick` and `interact` return validated, engine-clamped orthogonal physical verbs
+  (`SetTransform`, `SetVisible`, `SetSolid`, `ApplyImpulse`, `SetLight`, `Say`) under Wasmtime
+  fuel/memory/vertex/instance/command/impulse caps. `SceneWorld` + `Combined` provide real triangle
+  collision for `solid: true` procedural meshes and crosshair raycasting for dynamic instances.
+  Earlier `.wasm` modules without `scene`/`tick`/`interact` continue to load unchanged.
+- **Batched + GPU-instanced scene renderer & scale-aware lights** (`play/src/scene.rs`,
+  `play/src/main.rs`): merges all static instances (`id = 0`) into 1 draw call, renders dynamic
+  instances (`id > 0`) via shared `Handle<Mesh>` GPU instancing, syncs scale-aware Bevy
+  `PointLight`s (`intensity * scale²`), and wires `F` / right-click to `interact`.
 - **1A landform upgrades** (`engine/src/rings.rs`, `play/src/chunks.rs`, `play/src/surface.rs`,
   `play/src/surface.wesl`): view-directed `6×4×6` rings (~4 chunks ahead per level),
   frustum-prioritized chunk streaming, complementary 4×4 Bayer dithered LOD cross-fades (`0.22 s`),
   and world-locked 3D procedural micro-grain + glossy rippled water.
-- **Guide updated** (`make/GUIDE.md`) so Claude puts thin/repeating details in `props()` and solid
-  landforms/walkable surfaces in `sample()`.
+- **Guide & showcase updated** (`make/GUIDE.md`, `made/pond-sketched/area.rs`): `pond-sketched`
+  now builds curved `sweep_tube`+`ribbon` swaying reed clumps, multi-petal lotus flowers, meadow
+  wildflowers, `lathe` grotto mushrooms, a patrolling dragonfly, interactive willow & grotto
+  lanterns (`SetLight`), dandelion breeze updrafts (`ApplyImpulse`), and a ridable `solid: true`
+  wooden pond raft (`SetTransform`).
 
 Measured on `made/pond-sketched/area.wasm` (`--tour --behind`, GTX 1650, `1600×900`, `96k` prop
 triangles in 1 draw call):

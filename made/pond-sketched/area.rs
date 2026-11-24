@@ -97,16 +97,6 @@ struct Pad {
     flower: bool,
 }
 
-struct Stalk {
-    foot: Point,
-    tip: Point,
-    head: bool,
-}
-
-struct Clump {
-    stalks: Vec<Stalk>,
-}
-
 struct Stick {
     a: Point,
     b: Point,
@@ -117,7 +107,7 @@ struct Pond {
     seed: u32,
     corners: Vec<(f32, f32)>,
     pads: Vec<Pad>,
-    clumps: Vec<Clump>,
+    clump_spots: Vec<(Point, f32, u32)>,
     sticks: Vec<Stick>,
     /// The nest's great branches, which a giant sees too.
     boughs: Vec<Stick>,
@@ -125,7 +115,30 @@ struct Pond {
     ring: Vec<(f32, f32)>,
     nest_ground: f32,
     willow_ground: f32,
+    dandelions: [(f32, f32, f32); 3],
+    // Mutable runtime plugin state (`tick` / `interact`).
+    raft_t: f32,
+    raft_dir: f32,
+    raft_moving: bool,
+    willow_lit: bool,
+    grotto_lit: bool,
 }
+
+const ID_REED_BASE: u32 = 1;
+const ID_RAFT: u32 = 100;
+const ID_DRAGONFLY: u32 = 101;
+const ID_WILLOW_LANTERN: u32 = 200;
+const ID_GROTTO_LANTERN: u32 = 201;
+
+const LIGHT_WILLOW: u32 = 1;
+const LIGHT_GROTTO: u32 = 2;
+
+const MESH_REED_0: u32 = 0;
+const MESH_RAFT: u32 = 3;
+const MESH_DRAGONFLY: u32 = 4;
+
+const RAFT_A: Point = point(33.2, LEVEL + 0.04, 41.6);
+const RAFT_B: Point = point(36.8, LEVEL + 0.04, 30.8);
 
 /// How the land lies at a point: the distance to the pond's smooth outline (negative inside), the
 /// same with its shore's wobble, and the ground's height.
@@ -152,16 +165,26 @@ impl Area for Pond {
             seed: short,
             corners,
             pads: pads(seed),
-            clumps: clumps(seed),
+            clump_spots: clump_spots(seed),
             sticks: sticks(seed, 37, 44, (-0.6, 0.26), (0.65, 1.15), (0.075, 0.13)),
             boughs: sticks(seed, 41, 10, (-0.45, 0.1), (0.95, 1.3), (0.2, 0.26)),
             spokes,
             ring,
             nest_ground: 0.0,
             willow_ground: 0.0,
+            dandelions: [(28.0, 0.0, 49.2), (35.8, 0.0, 50.6), (44.0, 0.0, 46.8)],
+            raft_t: 0.0,
+            raft_dir: 1.0,
+            raft_moving: false,
+            willow_lit: false,
+            grotto_lit: true,
         };
         pond.nest_ground = pond.lie(NEST.x, NEST.z).height;
         pond.willow_ground = pond.lie(WILLOW.x, WILLOW.z).height;
+        for i in 0..3 {
+            let (dx, _, dz) = pond.dandelions[i];
+            pond.dandelions[i].1 = pond.lie(dx, dz).height;
+        }
         pond
     }
 
@@ -187,27 +210,71 @@ impl Area for Pond {
         solid.or(water).or(self.lilies(p, view, lie.raw))
     }
 
-    fn props(&self) -> Vec<Prop> {
-        let mut out = Vec::new();
-        // 1. All 24 reed clumps (168 crisp stalks + brown cattail heads, zero LOD fattening!)
-        for c in &self.clumps {
-            for k in &c.stalks {
-                out.push(Prop::capsule(k.foot, k.tip, 0.015, Material::Leaf));
-                if k.head {
-                    let way = k.tip - k.foot;
-                    out.push(Prop::capsule(k.foot + way * 0.86, k.foot + way * 0.97, 0.036, Material::Wood));
-                }
-            }
+    fn scene(&self) -> Scene {
+        let mut s = SceneBuilder::new();
+
+        // 0..3: Three organic curved reed-clump variations (`sweep_tube` stalks + `ribbon` leaf blades + cattails).
+        for variant in 0..3u32 {
+            let mesh_id = s.add_mesh(build_reed_clump(self.seed as u64, variant));
+            debug_assert_eq!(mesh_id, MESH_REED_0 + variant);
         }
-        // 2. Meadow tussocks, thin stems, and flower buds across the entire 64 m meadow
+        // 3: Solid wooden pond raft (`solid: true`, players stand on and ride it!).
+        let m_raft = s.add_mesh(build_raft());
+        debug_assert_eq!(m_raft, MESH_RAFT);
+        // 4: Dynamic dragonfly (`sweep_tube` body + 4 `ribbon` wings).
+        let m_dragonfly = s.add_mesh(build_dragonfly());
+        debug_assert_eq!(m_dragonfly, MESH_DRAGONFLY);
+
+        // 5: Curved multi-petal water-lily lotus flower (`ribbon` petals + golden center).
+        let m_lotus = s.add_mesh(build_lotus());
+        // 6: Meadow grass tussock (`ellipsoid` mound + curved `ribbon` grass blades).
+        let m_tussock = s.add_mesh(build_tussock());
+        // 7: Meadow wildflower (`sweep_tube` curved stem + 5 `ribbon` petals).
+        let m_flower = s.add_mesh(build_wildflower());
+        // 8: Dandelion tuft (`sweep_tube` stem + fluffy `ellipsoid` seed head + basal `ribbon` leaves).
+        let m_dandelion = s.add_mesh(build_dandelion());
+        // 9: Hanging hollow-willow cage lantern (`lathe` cap + struts + warm core).
+        let m_willow_lantern = s.add_mesh(build_willow_lantern());
+        // 10: Tiny glowing grotto lantern-mushroom (`lathe` stem + bell cap).
+        let m_grotto_lantern = s.add_mesh(build_grotto_lantern());
+        // 11: Area-specific static details (heron legs/beak/crest, nest rim sticks, grotto stalagmites/mushrooms).
+        let m_details = s.add_mesh(self.build_static_details());
+
+        // Dynamic swaying reed clumps along the pond shore (`id = 1..=24`).
+        for (i, &(pos, yaw, variant)) in self.clump_spots.iter().enumerate() {
+            s.spawn(ID_REED_BASE + i as u32, MESH_REED_0 + variant, pos, Quat::from_y(yaw), point(1.0, 1.0, 1.0), false);
+        }
+
+        // Dynamic solid wooden raft moored off the south beach (`id = 100`, `solid = true`).
+        s.spawn(ID_RAFT, MESH_RAFT, RAFT_A, Quat::from_y(-0.2), point(1.0, 1.0, 1.0), true);
+
+        // Dynamic dragonfly patrolling over the water lilies (`id = 101`).
+        s.spawn(ID_DRAGONFLY, MESH_DRAGONFLY, point(29.0, LEVEL + 0.55, 34.0), Quat::IDENTITY, point(1.0, 1.0, 1.0), false);
+
+        // Dynamic interactive lanterns: hollow willow + tiny grotto.
+        let willow_lantern_pos = point(WILLOW.x - 0.1, self.willow_ground + 2.1, WILLOW.z - 0.1);
+        s.spawn(ID_WILLOW_LANTERN, m_willow_lantern, willow_lantern_pos, Quat::IDENTITY, point(1.0, 1.0, 1.0), false);
+        let grotto_lantern_pos = ROOM + point(0.06, 0.0, -0.05);
+        s.spawn(ID_GROTTO_LANTERN, m_grotto_lantern, grotto_lantern_pos, Quat::IDENTITY, point(1.0, 1.0, 1.0), false);
+        // Grotto lantern starts warmly lit so the tiny cavern glows right away.
+        s.light(LIGHT_GROTTO, grotto_lantern_pos + point(0.0, 0.045, 0.0), [1.0, 0.85, 0.55], 32.0, 0.95);
+
+        // Static instanced lotus flowers on flowering lily pads.
+        for (i, k) in self.pads.iter().enumerate() {
+            if !k.flower {
+                continue;
+            }
+            let sc = 0.85 + 0.3 * ((hash(i as i32, 0, 0, self.seed ^ 0x51) & 0xffff) as f32 / 65535.0);
+            s.place(m_lotus, point(k.x, LEVEL + 0.006, k.z), Quat::from_y(i as f32 * 1.9), point(sc, sc, sc), false);
+        }
+
+        // Static instanced meadow tussocks & curved wildflowers across the 64 m meadow.
         let mut tseeds = Seeds::of(self.seed as u64, 71);
         for iz in 0..29 {
             for ix in 0..29 {
                 let cx = (ix as f32 + 0.5) * 2.2;
                 let cz = (iz as f32 + 0.5) * 2.2;
-                let ox = tseeds.next(-0.7, 0.7);
-                let oz = tseeds.next(-0.7, 0.7);
-                let (x, z) = (cx + ox, cz + oz);
+                let (x, z) = (cx + tseeds.next(-0.7, 0.7), cz + tseeds.next(-0.7, 0.7));
                 if x < 1.5 || x > 62.5 || z < 1.5 || z > 62.5 {
                     continue;
                 }
@@ -216,72 +283,177 @@ impl Area for Pond {
                 let from_path = abs(x - (31.6 + 0.7 * sin(z * 0.45)));
                 let south = between(z, 44.0, 46.0);
                 let here = between(lie.s, 1.0, 4.0) * (1.0 - between(from_path, 3.2, 0.8) * south) * between(dw, 3.0, 6.0);
-                let r_mound = tseeds.next(0.2, 0.35) * here;
+                let r_mound = tseeds.next(0.75, 1.35) * here;
                 let has_mound = tseeds.next(0.0, 1.0) <= 0.6;
                 let has_flower = tseeds.next(0.0, 1.0) < 0.5;
-                let stem_h = tseeds.next(0.22, 0.34) * here;
+                let yaw = tseeds.next(0.0, TAU);
                 if here < 0.25 || !has_mound {
                     continue;
                 }
-                out.push(Prop::ellipsoid(point(x, lie.height - r_mound * 0.55, z), point(r_mound, r_mound * 0.85, r_mound), 0.0, Material::Grass));
+                s.place(m_tussock, point(x, lie.height, z), Quat::from_y(yaw), point(r_mound, r_mound, r_mound), false);
                 if has_flower {
-                    out.push(Prop::capsule(point(x, lie.height - 0.1, z), point(x, lie.height + stem_h, z), 0.011, Material::Grass));
-                    out.push(Prop::ellipsoid(point(x, lie.height + stem_h, z), point(0.032, 0.032, 0.032), 0.0, Material::Sand));
+                    let fh = 0.8 + 0.45 * here;
+                    s.place(m_flower, point(x, lie.height, z), Quat::from_y(yaw + 0.9), point(fh, fh, fh), false);
                 }
             }
         }
-        // 3. Crisp 6-petal lily pad flowers (walkable pads remain in SDF for tiny physics!)
-        for k in &self.pads {
-            if !k.flower {
-                continue;
+
+        // Static meadow dandelions (interactive updraft spots!).
+        for (i, &(dx, dy, dz)) in self.dandelions.iter().enumerate() {
+            s.place(m_dandelion, point(dx, dy, dz), Quat::from_y(i as f32 * 2.1), point(1.0, 1.0, 1.0), false);
+        }
+
+        // Static world-space details (heron legs/beak/crest, nest twigs, grotto stalagmites & lathe mushrooms).
+        s.place(m_details, point(0.0, 0.0, 0.0), Quat::IDENTITY, point(1.0, 1.0, 1.0), false);
+
+        s.build()
+    }
+
+    fn tick(&mut self, dt: f32, player: &PlayerState) -> Vec<Command> {
+        let mut cmds = Vec::with_capacity(32);
+        let t = player.time;
+
+        // 1. Gentle breeze swaying all 24 shoreline reed clumps.
+        for (i, &(pos, yaw, variant)) in self.clump_spots.iter().enumerate() {
+            let phase = t * 1.45 + pos.x * 0.23 + pos.z * 0.19;
+            let gust = 0.045 * sin(phase) + 0.02 * sin(phase * 2.3 + 0.7);
+            let tilt = 0.025 * cos(phase * 0.85);
+            let rot = Quat::from_euler(yaw, tilt, gust);
+            cmds.push(Command::SetTransform(instance(
+                ID_REED_BASE + i as u32,
+                MESH_REED_0 + variant,
+                pos,
+                rot,
+                point(1.0, 1.0, 1.0),
+                false,
+            )));
+        }
+
+        // 2. Dragonfly hovering and darting in a lazy figure-8 above the lily pads.
+        let a = t * 0.55;
+        let dx = 28.5 + 4.8 * sin(a);
+        let dz = 33.5 + 3.2 * sin(a * 2.0);
+        let dy = LEVEL + 0.58 + 0.14 * sin(t * 2.4);
+        let vx = 4.8 * 0.55 * cos(a);
+        let vz = 3.2 * 1.1 * cos(a * 2.0);
+        let heading = atan2(vx, vz);
+        let bank = 0.25 * cos(a * 2.0);
+        cmds.push(Command::SetTransform(instance(
+            ID_DRAGONFLY,
+            MESH_DRAGONFLY,
+            point(dx, dy, dz),
+            Quat::from_euler(heading, 0.06 * sin(t * 5.0), bank),
+            point(1.0, 1.0, 1.0),
+            false,
+        )));
+
+        // 3. Solid wooden raft bobbing on the water (and gliding smoothly when triggered).
+        if self.raft_moving {
+            self.raft_t += self.raft_dir * dt * 0.14;
+            if self.raft_t >= 1.0 {
+                self.raft_t = 1.0;
+                self.raft_dir = -1.0;
+                self.raft_moving = false;
+            } else if self.raft_t <= 0.0 {
+                self.raft_t = 0.0;
+                self.raft_dir = 1.0;
+                self.raft_moving = false;
             }
-            let c = point(k.x, LEVEL, k.z);
-            out.push(Prop::capsule(c, c + point(0.0, 0.10, 0.0), 0.04, Material::Sand));
-            for i in 0..6 {
-                let a = i as f32 * TAU / 6.0;
-                let (ca, sa) = (cos(a), sin(a));
-                out.push(Prop::capsule(c + point(0.02 * ca, 0.01, 0.02 * sa), c + point(0.13 * ca, 0.10, 0.13 * sa), 0.034, Material::Sand));
+        }
+        let u = ease(self.raft_t);
+        let raft_pos = point(
+            mix(RAFT_A.x, RAFT_B.x, u),
+            RAFT_A.y + 0.015 * sin(t * 1.8),
+            mix(RAFT_A.z, RAFT_B.z, u),
+        );
+        let raft_rot = Quat::from_euler(-0.2 + 0.22 * u, 0.014 * sin(t * 1.5), 0.016 * cos(t * 1.2));
+        cmds.push(Command::SetTransform(instance(
+            ID_RAFT,
+            MESH_RAFT,
+            raft_pos,
+            raft_rot,
+            point(1.0, 1.0, 1.0),
+            true,
+        )));
+
+        cmds
+    }
+
+    fn interact(&mut self, player: &PlayerState) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        let reach = max(player.size * 3.0, 0.4);
+
+        // 1. Hollow willow lantern toggle.
+        let willow_pos = point(WILLOW.x - 0.1, self.willow_ground + 2.1, WILLOW.z - 0.1);
+        if player.target == ID_WILLOW_LANTERN || (player.eye - willow_pos).length() < max(reach, 3.2) {
+            self.willow_lit = !self.willow_lit;
+            let intensity = if self.willow_lit { 900.0 } else { 0.0 };
+            cmds.push(Command::SetLight(light(
+                LIGHT_WILLOW,
+                willow_pos - point(0.0, 0.12, 0.0),
+                [1.0, 0.78, 0.42],
+                intensity,
+                8.0,
+            )));
+            cmds.push(Command::Say(if self.willow_lit {
+                "the willow lantern glows warmly".into()
+            } else {
+                "you snuff the willow lantern".into()
+            }));
+            return cmds;
+        }
+
+        // 2. Tiny grotto glowing mushroom lantern toggle.
+        let grotto_pos = ROOM + point(0.06, 0.045, -0.05);
+        if player.target == ID_GROTTO_LANTERN || (player.eye - grotto_pos).length() < 0.45 {
+            self.grotto_lit = !self.grotto_lit;
+            let intensity = if self.grotto_lit { 32.0 } else { 0.0 };
+            cmds.push(Command::SetLight(light(
+                LIGHT_GROTTO,
+                grotto_pos,
+                [1.0, 0.85, 0.55],
+                intensity,
+                0.95,
+            )));
+            cmds.push(Command::Say(if self.grotto_lit {
+                "the tiny grotto mushroom shines".into()
+            } else {
+                "the grotto settles into cool shadow".into()
+            }));
+            return cmds;
+        }
+
+        // 3. Wooden pond raft: push off or recall across the pond!
+        let u = ease(self.raft_t);
+        let raft_pos = point(mix(RAFT_A.x, RAFT_B.x, u), RAFT_A.y, mix(RAFT_A.z, RAFT_B.z, u));
+        if player.target == ID_RAFT || (player.feet - raft_pos).flat_length() < max(reach, 3.2) {
+            self.raft_moving = !self.raft_moving;
+            cmds.push(Command::Say(if self.raft_moving {
+                if self.raft_dir > 0.0 {
+                    "the wooden raft drifts out toward the heron".into()
+                } else {
+                    "the wooden raft glides back to the beach".into()
+                }
+            } else {
+                "you steady the wooden raft".into()
+            }));
+            return cmds;
+        }
+
+        // 4. Meadow dandelion breeze updraft!
+        for &(dx, dy, dz) in &self.dandelions {
+            let dp = point(dx, dy + 0.35, dz);
+            if (player.feet - dp).flat_length() < max(reach, 2.0) {
+                let lift = clamp(player.size * 3.8, 0.35, 16.0);
+                let push = clamp(player.size * 1.4, 0.12, 6.0);
+                cmds.push(Command::ApplyImpulse(point(player.look.x * push, lift, player.look.z * push)));
+                cmds.push(Command::Say("a puff of dandelion breeze lifts you up!".into()));
+                return cmds;
             }
         }
-        // 4. Heron's thin legs, crest, and sharp beak (razor-sharp from 40 m away!)
-        let (cy, sy) = (cos(-2.498), sin(-2.498));
-        let heron_world = |lp: Point| point(HERON.x + lp.x * cy - lp.z * sy, HERON.y + lp.y, HERON.z + lp.x * sy + lp.z * cy);
-        for sgn in [-1.0f32, 1.0] {
-            out.push(Prop::capsule(heron_world(point(-0.1, -1.5, sgn * 0.28)), heron_world(point(0.05, 0.9, sgn * 0.27)), 0.072, Material::Wood));
-            out.push(Prop::capsule(heron_world(point(0.05, 0.9, sgn * 0.27)), heron_world(point(-0.1, 2.0, sgn * 0.25)), 0.086, Material::Wood));
-        }
-        out.push(Prop::capsule(heron_world(point(1.2, 4.66, 0.0)), heron_world(point(0.45, 4.5, 0.0)), 0.072, Material::Soil));
-        out.push(Prop::capsule(heron_world(point(1.5, 4.46, 0.0)), heron_world(point(2.4, 4.3, 0.0)), 0.072, Material::Wood));
-        // 5. Heron's nest rim sticks (crisp individual twigs!)
-        let nest_base = point(NEST.x, self.nest_ground, NEST.z);
-        for k in &self.sticks {
-            out.push(Prop::capsule(nest_base + k.a, nest_base + k.b, k.r, Material::Wood));
-        }
-        // 6. Grotto stalagmites, stalactites, columns, and tiny mushrooms!
-        for &(x, z, h, r) in &[
-            (0.34, -0.22, 0.12, 0.014),
-            (0.42, -0.04, 0.16, 0.018),
-            (0.37, 0.06, 0.07, 0.008),
-            (-0.37, -0.22, 0.1, 0.012),
-            (-0.2, -0.27, 0.14, 0.016),
-            (-0.02, -0.23, 0.06, 0.007),
-            (0.27, -0.28, 0.07, 0.008),
-        ] {
-            out.push(Prop::cone(ROOM + point(x, 0.0, z), h, r, Material::Stone));
-            out.push(Prop::cone(ROOM + point(x - 0.01, 0.35, z), -(0.03 + h * 0.7), r, Material::Stone));
-        }
-        for &(x, z, h, r) in &[(0.1, 0.14, 0.17, 0.02), (0.03, -0.1, 0.11, 0.013), (-0.22, 0.12, 0.2, 0.02), (-0.12, 0.2, 0.09, 0.01), (0.2, 0.0, 0.1, 0.012)] {
-            out.push(Prop::cone(ROOM + point(x, 0.35, z), -h, r, Material::Stone));
-        }
-        for &(x, z, r) in &[(0.16, -0.19, 0.026), (-0.34, -0.05, 0.02)] {
-            out.push(Prop::capsule(ROOM + point(x, 0.0, z), ROOM + point(x, 0.35, z), r, Material::Stone));
-        }
-        for &(x, z, h) in &[(0.21, 0.1, 0.05), (0.26, 0.13, 0.032), (0.17, 0.15, 0.026), (-0.43, -0.15, 0.045), (-0.1, -0.25, 0.04)] {
-            let at = ROOM + point(x, 0.0, z);
-            out.push(Prop::capsule(at + point(0.0, -0.01, 0.0), at + point(0.0, h - 0.004, 0.0), 0.003 + h * 0.03, Material::Sand));
-            out.push(Prop::ellipsoid(at + point(0.0, h - 0.002, 0.0), point(h * 0.42, h * 0.18, h * 0.42), 0.0, Material::Wood));
-        }
-        out
+
+        cmds.push(Command::Say("nothing nearby to interact with (try the raft, lanterns, or meadow dandelions)".into()));
+        cmds
     }
 }
 
@@ -327,11 +499,11 @@ fn pads(seed: u64) -> Vec<Pad> {
     pads
 }
 
-/// Clumps of reeds along the shore, away from the rock and the beach.
-fn clumps(seed: u64) -> Vec<Clump> {
+/// Clump anchor spots along the shore, away from the rock and the beach.
+fn clump_spots(seed: u64) -> Vec<(Point, f32, u32)> {
     let mut seeds = Seeds::of(seed, 23);
     let edges = [0usize, 0, 1, 1, 6, 7, 7, 8, 9, 9, 10, 10, 11, 14];
-    let mut clumps = Vec::new();
+    let mut spots = Vec::with_capacity(24);
     for k in 0..24 {
         let e = edges[k % edges.len()];
         let ((ax, az), (bx, bz)) = (OUTLINE[e], OUTLINE[(e + 1) % OUTLINE.len()]);
@@ -341,16 +513,284 @@ fn clumps(seed: u64) -> Vec<Clump> {
         let l = (dx * dx + dz * dz).sqrt();
         let inward = seeds.next(0.2, 1.1);
         let (x, z) = (x + dx / l * inward, z + dz / l * inward);
-        let mut stalks = Vec::new();
-        for _ in 0..7 {
-            let (a, r) = (seeds.next(0.0, TAU), seeds.next(0.05, 0.6));
-            let foot = point(x + r * cos(a), LEVEL - 1.0, z + r * sin(a));
-            let tip = point(foot.x + seeds.next(-0.2, 0.2), LEVEL + seeds.next(1.0, 1.85), foot.z + seeds.next(-0.2, 0.2));
-            stalks.push(Stalk { foot, tip, head: seeds.next(0.0, 1.0) < 0.5 });
-        }
-        clumps.push(Clump { stalks });
+        let yaw = seeds.next(0.0, TAU);
+        spots.push((point(x, LEVEL, z), yaw, (k % 3) as u32));
     }
-    clumps
+    spots
+}
+
+/// Builds one organic reed clump: curved `sweep_tube` stalks, arching `ribbon` leaf blades, and
+/// velvety cattail heads.
+fn build_reed_clump(seed: u64, variant: u32) -> MeshData {
+    let mut m = MeshBuilder::new();
+    let mut s = Seeds::of(seed, 101 + variant as usize);
+    for _ in 0..7 {
+        let a = s.next(0.0, TAU);
+        let rad = s.next(0.05, 0.55);
+        let (bx, bz) = (rad * cos(a), rad * sin(a));
+        let h = s.next(1.05, 1.85);
+        let lean_a = s.next(0.0, TAU);
+        let lean = s.next(0.12, 0.34);
+        let (lx, lz) = (cos(lean_a) * lean, sin(lean_a) * lean);
+        let knots = [
+            (point(bx, -0.85, bz), 0.017),
+            (point(bx + lx * 0.12, h * 0.25, bz + lz * 0.12), 0.015),
+            (point(bx + lx * 0.45, h * 0.65, bz + lz * 0.45), 0.012),
+            (point(bx + lx, h, bz + lz), 0.006),
+        ];
+        m.tint(210, 235, 195);
+        m.sweep_tube(&knots, 6, true, Material::Leaf);
+        if s.next(0.0, 1.0) < 0.52 {
+            let p0 = point(bx + lx * 0.72, h * 0.80, bz + lz * 0.72);
+            let p1 = point(bx + lx * 0.90, h * 0.94, bz + lz * 0.90);
+            m.tint(150, 115, 85);
+            m.capsule(p0, p1, 0.032, 7, Material::Wood);
+        }
+        // Two arching ribbon leaf blades rising from the stalk base.
+        m.tint(225, 250, 200);
+        for _ in 0..2 {
+            let ba = s.next(0.0, TAU);
+            let (bc, bs) = (cos(ba), sin(ba));
+            let bh = s.next(0.65, 1.25);
+            let reach = s.next(0.28, 0.55);
+            let n_hint = point(bc, 0.35, bs);
+            let blade = [
+                (point(bx, -0.15, bz), 0.022, n_hint),
+                (point(bx + bc * reach * 0.28, bh * 0.45, bz + bs * reach * 0.28), 0.024, n_hint),
+                (point(bx + bc * reach * 0.72, bh * 0.85, bz + bs * reach * 0.72), 0.015, n_hint),
+                (point(bx + bc * reach, bh * 0.72, bz + bs * reach), 0.002, n_hint),
+            ];
+            m.ribbon(&blade, Material::Grass);
+        }
+    }
+    m.build()
+}
+
+/// Curved multi-petal water-lily lotus flower (`ribbon` petals + golden stamen cup).
+fn build_lotus() -> MeshData {
+    let mut m = MeshBuilder::new();
+    m.tint(255, 225, 115);
+    m.ellipsoid(point(0.0, 0.045, 0.0), point(0.04, 0.038, 0.04), 8, 4, Material::Sand);
+    for ring in 0..2 {
+        let count = if ring == 0 { 8 } else { 6 };
+        let offset = if ring == 0 { 0.0 } else { PI / 6.0 };
+        let reach = if ring == 0 { 0.14 } else { 0.10 };
+        let lift = if ring == 0 { 0.07 } else { 0.105 };
+        if ring == 0 {
+            m.tint(255, 238, 232);
+        } else {
+            m.tint(255, 218, 222);
+        }
+        for i in 0..count {
+            let a = i as f32 * TAU / count as f32 + offset;
+            let (c, s) = (cos(a), sin(a));
+            let n = point(-c * 0.35, 1.0, -s * 0.35);
+            let knots = [
+                (point(c * 0.02, 0.01, s * 0.02), 0.018, n),
+                (point(c * reach * 0.55, lift * 0.45, s * reach * 0.55), 0.032, n),
+                (point(c * reach, lift, s * reach), 0.004, n),
+            ];
+            m.ribbon(&knots, Material::Sand);
+        }
+    }
+    m.build()
+}
+
+/// Meadow grass tussock (`ellipsoid` mound + 9 arching `ribbon` grass blades).
+fn build_tussock() -> MeshData {
+    let mut m = MeshBuilder::new();
+    m.tint(225, 240, 210);
+    m.ellipsoid(point(0.0, -0.10, 0.0), point(0.24, 0.19, 0.24), 8, 4, Material::Grass);
+    m.tint(240, 255, 220);
+    for i in 0..9 {
+        let a = i as f32 * TAU / 9.0 + 0.17 * (i % 3) as f32;
+        let (c, s) = (cos(a), sin(a));
+        let h = 0.20 + 0.08 * ((i % 3) as f32);
+        let r = 0.15 + 0.06 * ((i % 2) as f32);
+        let n = point(c, 0.5, s);
+        m.ribbon(
+            &[
+                (point(c * 0.05, 0.0, s * 0.05), 0.018, n),
+                (point(c * r * 0.65, h * 0.72, s * r * 0.65), 0.014, n),
+                (point(c * r, h * 0.88, s * r), 0.002, n),
+            ],
+            Material::Grass,
+        );
+    }
+    m.build()
+}
+
+/// Meadow wildflower (`sweep_tube` curved stem + 5 curved golden petals).
+fn build_wildflower() -> MeshData {
+    let mut m = MeshBuilder::new();
+    m.tint(220, 245, 200);
+    m.sweep_tube(
+        &[
+            (point(0.0, -0.05, 0.0), 0.010),
+            (point(0.02, 0.14, 0.01), 0.008),
+            (point(0.05, 0.29, 0.02), 0.006),
+        ],
+        5,
+        false,
+        Material::Grass,
+    );
+    let head = point(0.05, 0.30, 0.02);
+    m.tint(245, 195, 75);
+    m.ellipsoid(head, point(0.022, 0.018, 0.022), 6, 4, Material::Sand);
+    m.tint(255, 232, 130);
+    for i in 0..5 {
+        let a = i as f32 * TAU / 5.0;
+        let (c, s) = (cos(a), sin(a));
+        let n = point(-c * 0.2, 1.0, -s * 0.2);
+        m.ribbon(
+            &[
+                (head + point(c * 0.015, 0.0, s * 0.015), 0.010, n),
+                (head + point(c * 0.045, 0.012, s * 0.045), 0.018, n),
+                (head + point(c * 0.068, 0.006, s * 0.068), 0.004, n),
+            ],
+            Material::Sand,
+        );
+    }
+    m.build()
+}
+
+/// Tall interactive meadow dandelion tuft (`sweep_tube` curved stems + fluffy white seed puffs).
+fn build_dandelion() -> MeshData {
+    let mut m = MeshBuilder::new();
+    // Basal rosette of curved leaves.
+    m.tint(200, 235, 185);
+    for i in 0..6 {
+        let a = i as f32 * TAU / 6.0;
+        let (c, s) = (cos(a), sin(a));
+        let n = point(c * 0.3, 1.0, s * 0.3);
+        m.ribbon(
+            &[
+                (point(c * 0.03, 0.02, s * 0.03), 0.03, n),
+                (point(c * 0.20, 0.09, s * 0.20), 0.045, n),
+                (point(c * 0.34, 0.04, s * 0.34), 0.008, n),
+            ],
+            Material::Leaf,
+        );
+    }
+    // Three tall stalks with bright fluffy seed heads so they stand out in the meadow.
+    for &(ox, oz, h, puff) in &[(0.0, 0.0, 0.72, 0.11), (0.14, 0.09, 0.54, 0.085), (-0.12, 0.11, 0.60, 0.095)] {
+        m.tint(215, 240, 190);
+        m.sweep_tube(
+            &[
+                (point(ox * 0.3, -0.04, oz * 0.3), 0.016),
+                (point(ox * 0.7, h * 0.55, oz * 0.7), 0.013),
+                (point(ox, h, oz), 0.010),
+            ],
+            6,
+            false,
+            Material::Grass,
+        );
+        m.tint(255, 255, 250);
+        m.ellipsoid(point(ox, h + puff * 0.65, oz), point(puff, puff, puff), 10, 6, Material::Sand);
+    }
+    m.build()
+}
+
+/// Solid wooden pond raft (`cuboid` weathered planks + cross beams + mooring post).
+fn build_raft() -> MeshData {
+    let mut m = MeshBuilder::new();
+    // Two underside buoyancy logs.
+    m.tint(190, 175, 155);
+    m.cuboid(point(-0.68, -0.10, 0.0), point(0.14, 0.11, 1.25), Material::Wood);
+    m.cuboid(point(0.68, -0.10, 0.0), point(0.14, 0.11, 1.25), Material::Wood);
+    // Six sturdy deck planks (top surface at y = +0.08).
+    for i in 0..6 {
+        let z = -1.05 + i as f32 * 0.42;
+        let shade = if i % 2 == 0 { 235 } else { 215 };
+        m.tint(shade, shade - 10, shade - 25);
+        m.cuboid(point(0.0, 0.03, z), point(0.95, 0.05, 0.18), Material::Wood);
+    }
+    // Small corner mooring post so you can spot the raft from across the meadow.
+    m.tint(205, 185, 160);
+    m.capsule(point(0.75, 0.08, -0.95), point(0.75, 0.68, -0.95), 0.06, 8, Material::Wood);
+    m.tint(255, 235, 185);
+    m.ellipsoid(point(0.75, 0.72, -0.95), point(0.07, 0.04, 0.07), 8, 4, Material::Sand);
+    m.build()
+}
+
+/// Graceful dragonfly patrolling over the pond (`sweep_tube` body + 4 `ribbon` wings).
+fn build_dragonfly() -> MeshData {
+    let mut m = MeshBuilder::new();
+    // Slender segmented body along +Z.
+    m.tint(130, 210, 235);
+    m.sweep_tube(
+        &[
+            (point(0.0, 0.0, -0.22), 0.008),
+            (point(0.0, 0.005, -0.08), 0.012),
+            (point(0.0, 0.012, 0.04), 0.022),
+            (point(0.0, 0.010, 0.10), 0.020),
+        ],
+        6,
+        true,
+        Material::Water,
+    );
+    // Four iridescent wings (`ribbon`).
+    m.tint(245, 252, 255);
+    for &(z_off, span, tilt) in &[(0.045, 0.24, 0.12), (0.01, 0.21, -0.08)] {
+        for sgn in [-1.0f32, 1.0] {
+            let n = point(0.0, 1.0, 0.0);
+            m.ribbon(
+                &[
+                    (point(sgn * 0.02, 0.02, z_off), 0.014, n),
+                    (point(sgn * span * 0.6, 0.035, z_off + tilt * 0.5), 0.028, n),
+                    (point(sgn * span, 0.025, z_off + tilt), 0.008, n),
+                ],
+                Material::Sand,
+            );
+        }
+    }
+    m.build()
+}
+
+/// Hanging lantern for the hollow willow (`lathe` roof + 4 wood struts + warm glowing core).
+fn build_willow_lantern() -> MeshData {
+    let mut m = MeshBuilder::new();
+    m.tint(175, 160, 145);
+    m.lathe(
+        point(0.0, 0.0, 0.0),
+        &[(0.02, 0.26), (0.16, 0.14), (0.20, 0.10), (0.14, 0.09)],
+        10,
+        Material::Wood,
+    );
+    m.lathe(
+        point(0.0, 0.0, 0.0),
+        &[(0.14, -0.22), (0.17, -0.25), (0.02, -0.28)],
+        10,
+        Material::Wood,
+    );
+    for i in 0..4 {
+        let a = i as f32 * TAU / 4.0;
+        let p = point(0.12 * cos(a), 0.0, 0.12 * sin(a));
+        m.cuboid(p + point(0.0, -0.06, 0.0), point(0.015, 0.16, 0.015), Material::Wood);
+    }
+    m.tint(255, 225, 145);
+    m.ellipsoid(point(0.0, -0.06, 0.0), point(0.08, 0.11, 0.08), 8, 5, Material::Sand);
+    m.build()
+}
+
+/// Tiny glowing mushroom lantern inside the grotto (`lathe` curved stem + bell cap).
+fn build_grotto_lantern() -> MeshData {
+    let mut m = MeshBuilder::new();
+    m.tint(255, 240, 195);
+    m.lathe(
+        point(0.0, 0.0, 0.0),
+        &[(0.008, -0.005), (0.005, 0.02), (0.004, 0.045)],
+        8,
+        Material::Sand,
+    );
+    m.tint(255, 215, 120);
+    m.lathe(
+        point(0.0, 0.042, 0.0),
+        &[(0.026, -0.004), (0.028, 0.006), (0.018, 0.018), (0.001, 0.024)],
+        10,
+        Material::Sand,
+    );
+    m.build()
 }
 
 /// The nest's sticks, laid round its rim, about the middle of the snag's foot: `n` of them, their
@@ -384,6 +824,103 @@ fn smooth_both(a: f32, b: f32, k: f32) -> f32 {
 }
 
 impl Pond {
+    /// Area-specific world-space static procedural details (heron legs/beak/crest, nest rim
+    /// sticks, and grotto stalagmites/stalactites/columns/lathe mushrooms).
+    fn build_static_details(&self) -> MeshData {
+        let mut m = MeshBuilder::new();
+        // 1. Heron's thin legs, S-curved neck/head, crest, and sharp beak (crisp at 40 m).
+        let (cy, sy) = (cos(-2.498), sin(-2.498));
+        let heron_world = |lp: Point| point(HERON.x + lp.x * cy - lp.z * sy, HERON.y + lp.y, HERON.z + lp.x * sy + lp.z * cy);
+        m.tint(210, 185, 145);
+        for sgn in [-1.0f32, 1.0] {
+            m.sweep_tube(
+                &[
+                    (heron_world(point(-0.1, -1.5, sgn * 0.28)), 0.068),
+                    (heron_world(point(0.05, 0.9, sgn * 0.27)), 0.072),
+                    (heron_world(point(-0.1, 2.0, sgn * 0.25)), 0.088),
+                ],
+                8,
+                true,
+                Material::Wood,
+            );
+        }
+        m.tint(218, 224, 232);
+        m.sweep_tube(
+            &[
+                (heron_world(point(0.65, 2.52, 0.0)), 0.22),
+                (heron_world(point(1.22, 3.25, 0.0)), 0.16),
+                (heron_world(point(0.96, 4.00, 0.0)), 0.145),
+                (heron_world(point(1.20, 4.50, 0.0)), 0.175),
+                (heron_world(point(1.50, 4.48, 0.0)), 0.16),
+            ],
+            8,
+            true,
+            Material::Stone,
+        );
+        m.tint(185, 195, 205);
+        m.sweep_tube(
+            &[
+                (heron_world(point(1.2, 4.66, 0.0)), 0.068),
+                (heron_world(point(0.8, 4.58, 0.0)), 0.048),
+                (heron_world(point(0.42, 4.48, 0.0)), 0.015),
+            ],
+            6,
+            true,
+            Material::Soil,
+        );
+        m.tint(240, 205, 115);
+        m.sweep_tube(
+            &[
+                (heron_world(point(1.48, 4.46, 0.0)), 0.082),
+                (heron_world(point(2.00, 4.38, 0.0)), 0.042),
+                (heron_world(point(2.48, 4.28, 0.0)), 0.008),
+            ],
+            8,
+            true,
+            Material::Wood,
+        );
+
+        // 2. Heron's nest rim sticks.
+        m.clear_tint();
+        let nest_base = point(NEST.x, self.nest_ground, NEST.z);
+        for k in &self.sticks {
+            m.capsule(nest_base + k.a, nest_base + k.b, k.r, 6, Material::Wood);
+        }
+
+        // 3. Grotto stalagmites, stalactites, columns, and smooth `lathe` mushrooms.
+        for &(x, z, h, r) in &[
+            (0.34, -0.22, 0.12, 0.014),
+            (0.42, -0.04, 0.16, 0.018),
+            (0.37, 0.06, 0.07, 0.008),
+            (-0.37, -0.22, 0.1, 0.012),
+            (-0.2, -0.27, 0.14, 0.016),
+            (-0.02, -0.23, 0.06, 0.007),
+            (0.27, -0.28, 0.07, 0.008),
+        ] {
+            m.cone(ROOM + point(x, 0.0, z), h, r, 8, Material::Stone);
+            m.cone(ROOM + point(x - 0.01, 0.35, z), -(0.03 + h * 0.7), r, 8, Material::Stone);
+        }
+        for &(x, z, h, r) in &[(0.1, 0.14, 0.17, 0.02), (0.03, -0.1, 0.11, 0.013), (-0.22, 0.12, 0.2, 0.02), (-0.12, 0.2, 0.09, 0.01), (0.2, 0.0, 0.1, 0.012)] {
+            m.cone(ROOM + point(x, 0.35, z), -h, r, 8, Material::Stone);
+        }
+        for &(x, z, r) in &[(0.16, -0.19, 0.026), (-0.34, -0.05, 0.02)] {
+            m.capsule(ROOM + point(x, 0.0, z), ROOM + point(x, 0.35, z), r, 8, Material::Stone);
+        }
+        for &(x, z, h) in &[(0.21, 0.1, 0.05), (0.26, 0.13, 0.032), (0.17, 0.15, 0.026), (-0.43, -0.15, 0.045), (-0.1, -0.25, 0.04)] {
+            let at = ROOM + point(x, 0.0, z);
+            m.tint(240, 232, 210);
+            m.lathe(at, &[(0.004 + h * 0.04, -0.008), (0.003 + h * 0.025, h * 0.88)], 8, Material::Sand);
+            m.tint(205, 145, 115);
+            m.lathe(
+                at + point(0.0, h * 0.82, 0.0),
+                &[(h * 0.42, 0.0), (h * 0.44, h * 0.08), (h * 0.28, h * 0.20), (0.001, h * 0.24)],
+                10,
+                Material::Wood,
+            );
+        }
+        m.build()
+    }
+
     /// The distance across the ground to the pond's smooth outline, negative inside.
     fn outline(&self, x: f32, z: f32) -> f32 {
         let v = &self.corners;

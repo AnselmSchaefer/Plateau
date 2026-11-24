@@ -35,22 +35,86 @@ interface types {
 
     record description { name: string, places: list<place>, borders: borders }
 
-    /// The shape of a smooth GPU-rendered prop (thin plants, flowers, sticks, pebbles, limbs).
-    enum prop-kind { capsule, ellipsoid, cylinder, cone }
-
-    /// A smooth prop emitted once by the area and rendered natively on the GPU without voxel
-    /// aliasing or LOD morphing:
-    /// - capsule: segment from `a` to `b`, radius `r`
-    /// - ellipsoid: centre `a`, half-sizes `b`, turned by `yaw` (radians)
-    /// - cylinder: centre `a`, radius `b.x`, half-height `b.y`, optional notch angle `yaw` when `r > 0`
-    /// - cone: foot `a`, height `b.y` (negative points down), base radius `r`
-    record prop {
-        kind: prop-kind,
+    /// One vertex of a raw procedural triangle mesh: position, unit normal, engine material, and
+    /// RGB tint multiplier (0..255; 255 = pure material colour).
+    record vertex {
+        pos: point,
+        normal: point,
         material: material,
-        a: point,
-        b: point,
+        tint-r: u8,
+        tint-g: u8,
+        tint-b: u8,
+    }
+
+    /// A raw procedural triangle mesh built in WASM.
+    record mesh-data {
+        vertices: list<vertex>,
+        indices: list<u32>,
+    }
+
+    /// One placed instance of a mesh in the area: static when `id == 0`, dynamic (controllable
+    /// at runtime via `tick` / `interact`) when `id > 0`. Rotation is a unit quaternion.
+    record instance {
+        id: u32,
+        mesh: u32,
+        pos: point,
+        rot-x: f32,
+        rot-y: f32,
+        rot-z: f32,
+        rot-w: f32,
+        scale: point,
+        solid: bool,
+    }
+
+    /// A point light placed in the area (intensity == 0 turns it off).
+    record light {
+        id: u32,
+        pos: point,
         r: f32,
-        yaw: f32,
+        g: f32,
+        b: f32,
+        intensity: f32,
+        radius: f32,
+    }
+
+    /// The initial procedural scene emitted once on load: raw meshes, their instances, and lights.
+    record scene {
+        meshes: list<mesh-data>,
+        instances: list<instance>,
+        lights: list<light>,
+    }
+
+    /// What the runtime plugin senses about the player on each tick or interaction.
+    record player-state {
+        feet: point,
+        eye: point,
+        look: point,
+        velocity: point,
+        size: f32,
+        grounded: bool,
+        holding-use: bool,
+        /// Dynamic instance id under the crosshair within reach, or 0 if none.
+        target: u32,
+        /// Where the player's look ray aims, in area metres.
+        aim: point,
+        /// Seconds elapsed since the area loaded.
+        time: f32,
+    }
+
+    /// Orthogonal physical & world verbs a WASM plugin may request (validated & clamped by engine).
+    variant command {
+        /// Move, rotate, or scale a dynamic instance (`id > 0`).
+        set-transform(instance),
+        /// Show or hide a dynamic instance (`id > 0`).
+        set-visible(tuple<u32, bool>),
+        /// Toggle collision on a dynamic instance (`id > 0`).
+        set-solid(tuple<u32, bool>),
+        /// Apply a bounded velocity impulse (m/s) to the player.
+        apply-impulse(point),
+        /// Add or update a dynamic point light (intensity <= 0 removes/disables it).
+        set-light(light),
+        /// Show a short message on the player's HUD.
+        say(string),
     }
 }
 
@@ -61,7 +125,7 @@ interface host {
 }
 
 world region {
-    use types.{point, answer, description, prop};
+    use types.{point, answer, description, scene, player-state, command};
 
     import host;
 
@@ -73,7 +137,12 @@ world region {
     /// What the area is: its name, its places, its borders. Asked once.
     export describe: func() -> description;
 
-    /// Smooth GPU-rendered props (reeds, flowers, tussocks, sticks, mushrooms) that stay sharp at
-    /// every distance without voxel aliasing. Asked once.
-    export props: func() -> list<prop>;
+    /// Raw procedural meshes, their static/dynamic instances, and initial lights. Asked once.
+    export scene: func() -> scene;
+
+    /// Sandboxed runtime update called each frame/step (optional behavior, animations, physics).
+    export tick: func(dt: f32, player: player-state) -> list<command>;
+
+    /// Sandboxed runtime interaction called when the player uses/interacts (`F` / right-click).
+    export interact: func(player: player-state) -> list<command>;
 }

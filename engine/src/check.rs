@@ -27,7 +27,14 @@ const EXPORTS: [Signature; 5] = [
     ("cabi_realloc", &[I32, I32, I32, I32], &[I32]),
 ];
 /// Optional exports accepted when present (for backward compatibility with earlier modules).
-const OPTIONAL_EXPORTS: [Signature; 2] = [("props", &[], &[I32]), ("cabi_post_props", &[I32], &[])];
+const OPTIONAL_EXPORTS: [Signature; 6] = [
+    ("scene", &[], &[I32]),
+    ("cabi_post_scene", &[I32], &[]),
+    ("tick", &[I32], &[I32]),
+    ("cabi_post_tick", &[I32], &[]),
+    ("interact", &[I32], &[I32]),
+    ("cabi_post_interact", &[I32], &[]),
+];
 
 /// The WebAssembly an area may use, for good: WebAssembly 2.0 without SIMD, what every engine runs
 /// (a browser's too) and what `wasm32-unknown-unknown` turns on by default. No threads: an area

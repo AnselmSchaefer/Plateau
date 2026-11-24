@@ -16,21 +16,30 @@ pub mod laws;
 pub mod picture;
 pub mod reach;
 pub mod rings;
+pub mod scene;
 pub mod sketch;
 pub mod wasm;
 
 pub use wasm::{Compiled, Limits, Wasm};
 pub use wasmtime::{Error, Result};
 
-/// An area, to the engine: an answer for each point, at a size, what it says it is, and any smooth
-/// GPU-rendered props it emits.
+/// An area, to the engine: an answer for each point, at a size, what it says it is, any procedural
+/// meshes/instances/lights it emits, and optional sandboxed runtime behavior (`tick`, `interact`).
 pub trait Region {
     /// Fills `out` with an answer for each of `points`, in order, for a viewer `size` metres tall.
     fn sample(&mut self, points: &[[f32; 3]], size: f32, out: &mut Vec<Answer>) -> Result<()>;
     /// What the area says it is.
     fn describe(&mut self) -> Result<Description>;
-    /// Smooth GPU-rendered props emitted once by the area (reeds, flowers, tussocks, sticks, etc.).
-    fn props(&mut self) -> Result<Vec<Prop>> {
+    /// Raw procedural meshes, static/dynamic instances, and initial lights emitted once on load.
+    fn scene(&mut self) -> Result<Scene> {
+        Ok(Scene::default())
+    }
+    /// Sandboxed runtime update called each frame/step, returning clamped commands.
+    fn tick(&mut self, _dt: f32, _player: &PlayerState) -> Result<Vec<Command>> {
+        Ok(Vec::new())
+    }
+    /// Sandboxed runtime interaction called when the player presses interact (`F` / right-click).
+    fn interact(&mut self, _player: &PlayerState) -> Result<Vec<Command>> {
         Ok(Vec::new())
     }
 }
@@ -143,37 +152,76 @@ pub struct Description {
     pub borders: Borders,
 }
 
-/// The shape of a smooth GPU-rendered prop emitted by an area.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum PropKind {
-    Capsule = 0,
-    Ellipsoid = 1,
-    Cylinder = 2,
-    Cone = 3,
-}
-
-impl PropKind {
-    pub fn from_number(n: u8) -> Option<PropKind> {
-        match n {
-            0 => Some(PropKind::Capsule),
-            1 => Some(PropKind::Ellipsoid),
-            2 => Some(PropKind::Cylinder),
-            3 => Some(PropKind::Cone),
-            _ => None,
-        }
-    }
-}
-
-/// A smooth prop emitted once by an area and rendered natively on the GPU.
+/// One vertex of a raw procedural mesh emitted by an area.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Prop {
-    pub kind: PropKind,
+pub struct Vertex {
+    pub pos: [f32; 3],
+    pub normal: [f32; 3],
     pub material: Material,
-    pub a: [f32; 3],
-    pub b: [f32; 3],
-    pub r: f32,
-    pub yaw: f32,
+    pub tint: [u8; 3],
+}
+
+/// A raw procedural triangle mesh emitted by an area.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeshData {
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u32>,
+}
+
+/// One placed instance of a mesh (`id == 0` static, `id > 0` dynamic/controllable).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Instance {
+    pub id: u32,
+    pub mesh: u32,
+    pub pos: [f32; 3],
+    /// Unit quaternion `[x, y, z, w]`.
+    pub rot: [f32; 4],
+    pub scale: [f32; 3],
+    pub solid: bool,
+}
+
+/// A point light placed in the area (`intensity <= 0.0` disables/removes it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Light {
+    pub id: u32,
+    pub pos: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub radius: f32,
+}
+
+/// The initial procedural scene emitted once on load.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scene {
+    pub meshes: Vec<MeshData>,
+    pub instances: Vec<Instance>,
+    pub lights: Vec<Light>,
+}
+
+/// What the runtime WASM plugin senses about the player on each tick or interaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlayerState {
+    pub feet: [f32; 3],
+    pub eye: [f32; 3],
+    pub look: [f32; 3],
+    pub velocity: [f32; 3],
+    pub size: f32,
+    pub grounded: bool,
+    pub holding_use: bool,
+    pub target: u32,
+    pub aim: [f32; 3],
+    pub time: f32,
+}
+
+/// Orthogonal physical & world verbs a WASM plugin may request (all validated & clamped by engine).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    SetTransform(Instance),
+    SetVisible(u32, bool),
+    SetSolid(u32, bool),
+    ApplyImpulse([f32; 3]),
+    SetLight(Light),
+    Say(String),
 }
 
 /// FNV-1a over answers' bits: the same answers give the same hash on every machine.

@@ -21,7 +21,7 @@
 mod chunks;
 mod figure;
 mod flags;
-mod props;
+mod scene;
 mod surface;
 
 use std::path::PathBuf;
@@ -38,7 +38,9 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 use chunks::Chunks;
 use plateau_engine::body::{self, Body, Intent};
-use plateau_engine::{Compiled, Limits, Prop, Region, SIZES, START, Wasm, rings};
+use plateau_engine::scene::{Combined, SceneWorld};
+use plateau_engine::{Command, Compiled, Limits, PlayerState, Region, SIZES, START, Scene, Wasm, rings};
+use scene::SceneVisuals;
 use surface::{Materials, SurfaceMaterial};
 
 /// The physics' steps a second.
@@ -72,14 +74,21 @@ fn main() {
     let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", module.display())));
     let mut physics = compiled.instantiate(seed).expect("the area made");
     let described = physics.describe().expect("the area described");
-    let props = physics.props().expect("the area's props");
-    let flags: Vec<_> = described
-        .places
-        .iter()
-        .filter(|p| flags::flagged(p.size))
-        .map(|p| (p.size, flags::foot(&mut physics, p.at.map(|c| c as f64))))
-        .collect();
-    let body = Body::standing(&mut physics, [START[0], 40.0, START[1]], SIZES[1].1).expect("the area asked");
+    let initial_scene = physics.scene().expect("the area's scene");
+    let world = SceneWorld::from_scene(&initial_scene);
+    let flags: Vec<_> = {
+        let mut combined = Combined { region: &mut physics, world: &world };
+        described
+            .places
+            .iter()
+            .filter(|p| flags::flagged(p.size))
+            .map(|p| (p.size, flags::foot(&mut combined, p.at.map(|c| c as f64))))
+            .collect()
+    };
+    let body = {
+        let mut combined = Combined { region: &mut physics, world: &world };
+        Body::standing(&mut combined, [START[0], 40.0, START[1]], SIZES[1].1).expect("the area asked")
+    };
 
     let present_mode = if tour.is_some() || std::env::var_os("PLATEAU_NO_VSYNC").is_some() { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync };
     let window = Window { title: format!("Plateau: {}", described.name), present_mode, resolution: (1600, 900).into(), ..default() };
@@ -95,9 +104,9 @@ fn main() {
             seed,
             places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect(),
             flags,
-            props,
-            prop_triangles: 0,
+            initial_scene: Some(initial_scene),
         })
+        .insert_resource(LiveScene { world, elapsed: 0.0, interact_pressed: false, holding_use: false })
         .insert_resource(Player {
             body,
             pitch: -0.15,
@@ -132,8 +141,17 @@ struct Area {
     places: Vec<(String, plateau_engine::Size, [f64; 3])>,
     /// Where each flagged place's flag stands (`flags::flagged`), in the places' order.
     flags: Vec<(plateau_engine::Size, [f64; 3])>,
-    props: Vec<Prop>,
-    prop_triangles: usize,
+    /// Initial procedural scene payload, taken once in `setup` to upload GPU meshes.
+    initial_scene: Option<Scene>,
+}
+
+/// Live procedural scene state, dynamic solid collision, lights, and interaction edge state.
+#[derive(Resource)]
+struct LiveScene {
+    world: SceneWorld,
+    elapsed: f32,
+    interact_pressed: bool,
+    holding_use: bool,
 }
 
 /// The instance the player's body is moved through.
@@ -188,12 +206,15 @@ fn look(yaw: f32, pitch: f32) -> Quat {
 fn setup(
     mut commands: Commands,
     mut area: ResMut<Area>,
+    live: Res<LiveScene>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
 ) {
     let surface = Materials::new(&mut surface_materials);
-    area.prop_triangles = props::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &area.props);
+    let initial = area.initial_scene.take().unwrap_or_default();
+    let visuals = scene::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &initial, &live.world);
+    commands.insert_resource(visuals);
     commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, surface));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
     flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
@@ -213,7 +234,7 @@ fn setup(
     let text = |size: f32| TextFont { font_size: bevy::text::FontSize::Px(size), ..default() };
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
-        Text::new("W A S D walk  /  Shift run  /  Space jump  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  V from behind or through the eyes  /  M flags  /  F12 screenshot"),
+        Text::new("W A S D walk  /  Shift run  /  Space jump  /  F or right-click interact  /  mouse look (click; Esc frees it)\n1 2 3 tiny, person, giant  /  Q E shrink, grow  /  C sit or stand  /  V from behind or through the eyes  /  M flags  /  F12 screenshot"),
         text(15.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         Node { position_type: PositionType::Absolute, bottom: px(10.0), left: px(12.0), ..default() },
@@ -239,13 +260,15 @@ fn sizes() -> [f32; 3] {
     SIZES.map(|(_, h)| h)
 }
 
-/// The mouse turns the view; the keys say where to go, and change size or sit.
+/// The mouse turns the view; the keys say where to go, and change size, sit, or interact.
 fn look_and_ask(
     keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
     tour: Option<Res<Tour>>,
     mut player: ResMut<Player>,
+    mut live: ResMut<LiveScene>,
     mut physics: NonSendMut<Physics>,
 ) {
     if tour.is_some() {
@@ -263,6 +286,10 @@ fn look_and_ask(
         run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
         jump: keys.pressed(KeyCode::Space),
     };
+    if keys.just_pressed(KeyCode::KeyF) || buttons.just_pressed(MouseButton::Right) {
+        live.interact_pressed = true;
+    }
+    live.holding_use = keys.pressed(KeyCode::KeyF) || buttons.pressed(MouseButton::Right);
     let size = player.body.change.map_or(player.body.size, |c| c.to);
     let [tiny, person, giant] = sizes();
     let to = if keys.just_pressed(KeyCode::Digit1) {
@@ -279,7 +306,8 @@ fn look_and_ask(
         None
     };
     if let Some(to) = to {
-        change_size(&mut player, &mut physics.0, to);
+        let mut combined = Combined { region: &mut physics.0, world: &live.world };
+        change_size(&mut player, &mut combined, to);
     }
     if keys.just_pressed(KeyCode::KeyV) {
         player.third = !player.third;
@@ -292,14 +320,17 @@ fn look_and_ask(
             let stood = player.body.seat.unwrap().stood;
             player.body.feet = stood;
             player.body.seat = None;
-        } else if !player.body.sit(&mut physics.0).expect("the area asked") {
-            player.say("nothing to sit on here");
+        } else {
+            let mut combined = Combined { region: &mut physics.0, world: &live.world };
+            if !player.body.sit(&mut combined).expect("the area asked") {
+                player.say("nothing to sit on here");
+            }
         }
     }
 }
 
 /// Starts growing or shrinking to `to`, keeping in view the point looked at.
-fn change_size(player: &mut Player, area: &mut Wasm, to: f32) {
+fn change_size(player: &mut Player, area: &mut dyn Region, to: f32) {
     if to == player.body.size {
         return;
     }
@@ -309,13 +340,74 @@ fn change_size(player: &mut Player, area: &mut Wasm, to: f32) {
     player.body.grow_to(to);
 }
 
-/// The body moved on in steps of the physics, as much as the frame took.
-fn step(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Physics>) {
+fn apply_commands(world: &mut SceneWorld, player: &mut Player, cmds: &[Command]) {
+    if cmds.is_empty() {
+        return;
+    }
+    let applied = world.apply(cmds);
+    if applied.impulse != [0.0, 0.0, 0.0] {
+        for a in 0..3 {
+            player.body.velocity[a] += applied.impulse[a];
+        }
+        if applied.impulse[1] > 0.0 {
+            player.body.on = None;
+        }
+    }
+    if let Some(msg) = applied.said {
+        player.say(msg);
+    }
+}
+
+/// The runtime plugin ticked and the body moved on in steps of the physics.
+fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>, mut physics: NonSendMut<Physics>) {
+    let dt = time.delta_secs().min(0.1);
+    live.elapsed += dt;
+
+    // Build snapshot of player state for the sandboxed WASM runtime (`tick` / `interact`).
+    let eye64 = player.body.eye();
+    let eye32 = eye64.map(|c| c as f32);
+    let look_dir = player.looking().to_array();
+    let size = player.body.size;
+    let target = live.world.raycast_dynamic(eye32, look_dir, size * 12.0).map_or(0, |(id, _)| id);
+    let aim = {
+        let mut combined = Combined { region: &mut physics.0, world: &live.world };
+        match body::look(&mut combined, eye64, look_dir, size, size * 30.0) {
+            Ok(Some(hit)) => hit.map(|c| c as f32),
+            _ => [eye32[0] + look_dir[0] * size * 3.0, eye32[1] + look_dir[1] * size * 3.0, eye32[2] + look_dir[2] * size * 3.0],
+        }
+    };
+    let ps = PlayerState {
+        feet: player.body.feet.map(|c| c as f32),
+        eye: eye32,
+        look: look_dir,
+        velocity: player.body.velocity,
+        size,
+        grounded: player.body.on.is_some(),
+        holding_use: live.holding_use,
+        target,
+        aim,
+        time: live.elapsed,
+    };
+
+    if dt > 0.0 {
+        match physics.0.tick(dt, &ps) {
+            Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
+            Err(e) => eprintln!("area tick error: {e}"),
+        }
+    }
+    if std::mem::take(&mut live.interact_pressed) {
+        match physics.0.interact(&ps) {
+            Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
+            Err(e) => eprintln!("area interact error: {e}"),
+        }
+    }
+
     player.owed = (player.owed + time.delta_secs()).min(0.25);
     let intent = player.intent;
     while player.owed >= 1.0 / HZ {
         player.owed -= 1.0 / HZ;
-        player.body.step(&mut physics.0, intent, 1.0 / HZ).expect("the area asked");
+        let mut combined = Combined { region: &mut physics.0, world: &live.world };
+        player.body.step(&mut combined, intent, 1.0 / HZ).expect("the area asked");
         // Growing or shrinking, the point looked at is kept in the middle of the view.
         if player.body.change.is_some() {
             if let Some(f) = player.focus {
@@ -347,14 +439,15 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Phy
 /// How far behind the camera goes, seen from behind: `BEHIND`, or as near as what is in the way
 /// makes it (a ray from the point it turns about, back along the view, as the player's size sees the
 /// area), at once if nearer, slowly back out.
-fn frame(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Physics>) {
+fn frame(time: Res<Time>, mut player: ResMut<Player>, live: Res<LiveScene>, mut physics: NonSendMut<Physics>) {
     let want = if player.third { BEHIND } else { 0.0 };
     let size = player.body.size;
     // Metres of the area to a unit of the renderer.
     let per = (size / DRAWN_AS) as f64;
     let eye = player.eye.unwrap_or(player.body.eye());
+    let mut combined = Combined { region: &mut physics.0, world: &live.world };
     // The point turned about: no nearer to what is over the head than a tenth of a unit.
-    let over = match body::look(&mut physics.0, eye, [0.0, 1.0, 0.0], size, (PIVOT + 0.1) * size / DRAWN_AS).expect("the area asked") {
+    let over = match body::look(&mut combined, eye, [0.0, 1.0, 0.0], size, (PIVOT + 0.1) * size / DRAWN_AS).expect("the area asked") {
         Some(hit) => (((hit[1] - eye[1]) / per) as f32 - 0.1).clamp(0.0, PIVOT),
         None => PIVOT,
     };
@@ -362,7 +455,7 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Ph
     let pivot = [eye[0], eye[1] + player.lift as f64 * per, eye[2]];
     let away = -player.looking();
     let room = if want > 0.0 {
-        match body::look(&mut physics.0, pivot, away.to_array(), size, want * size / DRAWN_AS).expect("the area asked") {
+        match body::look(&mut combined, pivot, away.to_array(), size, want * size / DRAWN_AS).expect("the area asked") {
             Some(hit) => {
                 let far = ((hit[0] - pivot[0]).powi(2) + (hit[1] - pivot[1]).powi(2) + (hit[2] - pivot[2]).powi(2)).sqrt();
                 (far / per) as f32 - MARGIN
@@ -376,25 +469,46 @@ fn frame(time: Res<Time>, mut player: ResMut<Player>, mut physics: NonSendMut<Ph
     player.back = if target < player.back { target } else { player.back + (target - player.back) * (1.0 - (-4.0 * time.delta_secs()).exp()) };
 }
 
-/// Where the chunks are drawn, and whether: everything but the camera, the sun, and the merged props.
+/// Where the chunks are drawn, and whether: everything but the camera, the sun, and the procedural scene.
 type Placed<'w, 's> = Query<
     'w,
     's,
     (&'static mut Transform, &'static mut Visibility, Option<&'static mut MeshMaterial3d<SurfaceMaterial>>),
-    (Without<Camera3d>, Without<Sun>, Without<props::PropsMesh>),
+    (Without<Camera3d>, Without<Sun>, Without<scene::SceneNode>),
 >;
 
-/// The chunks asked for and placed about the eye, the camera turned as the player looks.
+/// The chunks asked for and placed about the eye, the procedural scene synced, the camera turned.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn draw(
     mut commands: Commands,
     time: Res<Time>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
     mut chunks: ResMut<Chunks>,
+    mut visuals: ResMut<SceneVisuals>,
+    live: Res<LiveScene>,
     player: Res<Player>,
     mut physics: NonSendMut<Physics>,
     mut transforms: Placed,
-    mut props_q: Query<&mut Transform, (With<props::PropsMesh>, Without<Camera3d>, Without<Sun>)>,
+    mut static_q: Query<
+        &mut Transform,
+        (
+            With<scene::SceneNode>,
+            With<scene::StaticSceneMesh>,
+            Without<scene::DynamicInstance>,
+            Without<scene::SceneLight>,
+            Without<Camera3d>,
+            Without<Sun>,
+        ),
+    >,
+    mut dynamic_q: Query<
+        (&scene::DynamicInstance, &mut Transform, &mut Visibility, &mut Mesh3d),
+        (With<scene::SceneNode>, Without<scene::StaticSceneMesh>, Without<scene::SceneLight>, Without<Camera3d>, Without<Sun>),
+    >,
+    mut light_q: Query<
+        (&scene::SceneLight, &mut Transform, &mut PointLight),
+        (With<scene::SceneNode>, Without<scene::StaticSceneMesh>, Without<scene::DynamicInstance>, Without<Camera3d>, Without<Sun>),
+    >,
     mut camera: Query<(&mut Transform, &mut DistanceFog), With<Camera3d>>,
 ) {
     let size = player.body.size;
@@ -415,10 +529,7 @@ fn draw(
     chunks.materials.sync_eye(&mut surface_materials, eye, scale);
     chunks.update(eye, look_dir, size, here, &ahead, time.delta_secs(), &mut commands, &mut meshes);
     chunks.place(eye, scale, &mut transforms);
-    for mut pt in &mut props_q {
-        pt.translation = Vec3::new((-eye[0] * scale) as f32, (-eye[1] * scale) as f32, (-eye[2] * scale) as f32);
-        pt.scale = Vec3::splat(scale as f32);
-    }
+    scene::sync(&mut commands, &mut visuals, &live.world, eye, scale, &mut static_q, &mut dynamic_q, &mut light_q);
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
     if let Ok((mut camera, mut fog)) = camera.single_mut() {
         camera.rotation = look(player.body.yaw, player.pitch);
@@ -438,7 +549,14 @@ fn size_name(size: f32) -> String {
     }
 }
 
-fn hud(mut text: Query<&mut Text, With<Hud>>, player: Res<Player>, chunks: Res<Chunks>, diagnostics: Res<DiagnosticsStore>, area: Res<Area>) {
+fn hud(
+    mut text: Query<&mut Text, With<Hud>>,
+    player: Res<Player>,
+    chunks: Res<Chunks>,
+    visuals: Res<SceneVisuals>,
+    diagnostics: Res<DiagnosticsStore>,
+    area: Res<Area>,
+) {
     let Ok(mut text) = text.single_mut() else { return };
     let b = &player.body;
     let fps = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS).and_then(|d| d.smoothed()).unwrap_or(0.0);
@@ -456,13 +574,13 @@ fn hud(mut text: Query<&mut Text, With<Hud>>, player: Res<Player>, chunks: Res<C
     let feet = b.seat.map_or(b.feet, |s| s.at);
     let holes = if c.holes > 0 { format!(", {} not yet stood in for", c.holes) } else { String::new() };
     let mut s = format!(
-        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k props)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         c.shown,
         c.waiting,
         c.ahead,
-        (c.triangles + area.prop_triangles) / 1000,
-        area.prop_triangles / 1000,
+        (c.triangles + visuals.triangles) / 1000,
+        visuals.triangles / 1000,
         feet[0],
         feet[1],
         feet[2]
@@ -562,6 +680,7 @@ fn go_on_tour(
     mut commands: Commands,
     mut tour: ResMut<Tour>,
     mut player: ResMut<Player>,
+    live: Res<LiveScene>,
     mut physics: NonSendMut<Physics>,
     mut chunks: ResMut<Chunks>,
     time: Res<Time>,
@@ -576,14 +695,15 @@ fn go_on_tour(
                 exit.write(AppExit::Success);
                 return;
             };
-            let mut body = Body::standing(&mut physics.0, [stop.at[0], 0.1 + stop.size as f64 * 0.5, stop.at[1]], stop.size).expect("the area asked");
+            let mut combined = Combined { region: &mut physics.0, world: &live.world };
+            let mut body = Body::standing(&mut combined, [stop.at[0], 0.1 + stop.size as f64 * 0.5, stop.at[1]], stop.size).expect("the area asked");
             body.yaw = stop.yaw;
-            if stop.sit && !body.sit(&mut physics.0).expect("the area asked") {
+            if stop.sit && !body.sit(&mut combined).expect("the area asked") {
                 tour.written += &format!("{}: found nothing to sit on\n", stop.name);
             }
             (player.body, player.pitch, player.eye, player.focus, player.intent) = (body, stop.pitch, None, None, Intent::default());
             if let Some(to) = stop.then {
-                change_size(&mut player, &mut physics.0, to);
+                change_size(&mut player, &mut combined, to);
             }
             chunks.clear_made();
             tour.phase = Phase::Wait(Instant::now());

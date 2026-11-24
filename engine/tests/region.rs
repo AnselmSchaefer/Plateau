@@ -121,55 +121,103 @@ fn an_area_that_looks_at_a_nans_bits_breaks_the_law() {
 }
 
 #[test]
-fn props_are_read_validated_and_capped() {
-    use plateau_engine::{Prop, PropKind};
-    // Old modules without `props` still load cleanly and yield no props.
+fn scene_tick_interact_and_solid_collision_work_and_are_capped() {
+    use plateau_engine::body::Body;
+    use plateau_engine::scene::{Combined, SceneWorld};
+    use plateau_engine::{Command, Instance, Light, MeshData, PlayerState, Scene, Vertex};
+
+    // Old modules without `scene`/`tick`/`interact` still load cleanly and return empty defaults.
     let mut old = Wasm::new(&module(GROUND), 7, Limits::default()).unwrap();
-    assert_eq!(old.props().unwrap(), Vec::new());
+    assert_eq!(old.scene().unwrap(), Scene::default());
+    assert_eq!(old.tick(0.016, &PlayerState::default()).unwrap(), Vec::new());
+    assert_eq!(old.interact(&PlayerState::default()).unwrap(), Vec::new());
 
-    // Build a minimal WAT module with `props` returning one 36-byte Prop at 4096, ret-area at 32.
-    let with_props = |prop_bytes: &[u8; 36], count: u32| -> Vec<u8> {
-        let hex: String = prop_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
-        let ret: String = [4096u32, count].into_iter().flat_map(u32::to_le_bytes).map(|b| format!("\\{b:02x}")).collect();
-        let extra = format!(
-            r#"  (data (i32.const 32) "{ret}")
-  (data (i32.const 4096) "{hex}")
-  (func (export "props") (result i32) (i32.const 32))
-  (func (export "cabi_post_props") (param i32)))"#
-        );
-        let wat = area(GROUND).replace(r#"(func (export "cabi_post_describe") (param i32)))"#, &format!("(func (export \"cabi_post_describe\") (param i32))\n{extra}"));
-        wat::parse_str(wat).unwrap()
-    };
-    let encode = |kind: u8, mat: u8, a: [f32; 3], b: [f32; 3], r: f32, yaw: f32| -> [u8; 36] {
-        let mut buf = [0u8; 36];
-        buf[0] = kind;
-        buf[1] = mat;
-        for (i, v) in [a[0], a[1], a[2], b[0], b[1], b[2], r, yaw].into_iter().enumerate() {
-            buf[4 + i * 4..8 + i * 4].copy_from_slice(&v.to_le_bytes());
+    // Build a real WASM module from Rust using plateau_sdk's MeshBuilder, SceneBuilder, tick & interact!
+    let src = r#"
+        use plateau_sdk::*;
+        struct Plugin { lit: bool }
+        impl Area for Plugin {
+            fn new(_: u64) -> Self { Plugin { lit: false } }
+            fn describe(&self) -> Description {
+                Description { name: "Bridge".into(), places: vec![], borders: Borders::of_ground(|_, _| 0.0) }
+            }
+            fn sample(&self, p: Point, _: &View) -> Answer {
+                Answer::new(p.y, Material::Grass)
+            }
+            fn scene(&self) -> Scene {
+                let mut m = MeshBuilder::new();
+                m.cuboid(point(0.0, 0.0, 0.0), point(2.0, 0.1, 1.0), Material::Wood);
+                let mut sc = SceneBuilder::new();
+                let deck = sc.add_mesh(m.build());
+                sc.spawn(1, deck, point(32.0, 2.0, 32.0), Quat::IDENTITY, point(1.0, 1.0, 1.0), true);
+                sc.light(1, point(32.0, 3.0, 32.0), [1.0, 0.8, 0.5], 50.0, 8.0);
+                sc.build()
+            }
+            fn tick(&mut self, dt: f32, p: &PlayerState) -> Vec<Command> {
+                let lift = 2.0 + sin(p.time + dt) * 0.5;
+                vec![Command::SetTransform(instance(1, 0, point(32.0, lift, 32.0), Quat::IDENTITY, point(1.0, 1.0, 1.0), true))]
+            }
+            fn interact(&mut self, p: &PlayerState) -> Vec<Command> {
+                self.lit = !self.lit;
+                let intensity = if self.lit { 200.0 } else { 0.0 };
+                vec![
+                    Command::SetLight(light(1, p.eye, [1.0, 0.9, 0.6], intensity, 10.0)),
+                    Command::ApplyImpulse(point(0.0, 100.0, 0.0)), // engine clamps to MAX_IMPULSE!
+                    Command::Say(if self.lit { "lamp on".into() } else { "lamp off".into() }),
+                ]
+            }
         }
-        buf
-    };
+        area!(Plugin);
+    "#;
+    let tmp = std::env::temp_dir().join(format!("plateau-scene-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let rs = tmp.join("area.rs");
+    let rlib = tmp.join("libplateau_sdk.rlib");
+    let wasm_path = tmp.join("area.wasm");
+    std::fs::write(&rs, src).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let fixed = ["--edition", "2024", "--target", "wasm32-unknown-unknown", "-O", "-C", "codegen-units=1", "-C", "panic=abort", "-C", "strip=debuginfo"];
+    assert!(std::process::Command::new("rustc").args(fixed).args(["--crate-type", "rlib", "--crate-name", "plateau_sdk"]).arg(root.join("sdk/src/lib.rs")).arg("-o").arg(&rlib).status().unwrap().success());
+    assert!(std::process::Command::new("rustc").args(["--crate-name", "area"]).args(fixed).args(["--crate-type", "cdylib", "-C", "link-arg=--max-memory=67108864", "--extern"]).arg(format!("plateau_sdk={}", rlib.display())).arg(&rs).arg("-o").arg(&wasm_path).status().unwrap().success());
+    let bytes = std::fs::read(&wasm_path).unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
 
-    let good = encode(0, Material::Leaf as u8, [1.0, 2.0, 3.0], [1.0, 4.0, 3.0], 0.015, 0.0);
-    let mut wasm = Wasm::new(&with_props(&good, 1), 7, Limits::default()).unwrap();
-    assert_eq!(
-        wasm.props().unwrap(),
-        vec![Prop { kind: PropKind::Capsule, material: Material::Leaf, a: [1.0, 2.0, 3.0], b: [1.0, 4.0, 3.0], r: 0.015, yaw: 0.0 }]
-    );
+    let mut wasm = Wasm::new(&bytes, 7, Limits::default()).unwrap();
+    let sc = wasm.scene().unwrap();
+    assert_eq!(sc.meshes.len(), 1);
+    assert_eq!(sc.instances.len(), 1);
+    assert_eq!(sc.lights.len(), 1);
+    assert_eq!(sc.instances[0].id, 1);
 
-    // Too many props, bad kind, bad material, negative/NaN radius are all rejected.
-    let mut too_many = Wasm::new(&with_props(&good, (plateau_engine::wasm::MOST_PROPS + 1) as u32), 7, Limits::default()).unwrap();
-    assert!(too_many.props().is_err());
+    // Body standing above the solid procedural bridge deck lands ON the deck at y ≈ 2.1, not ground y = 0!
+    let mut world = SceneWorld::from_scene(&sc);
+    {
+        let mut combined = Combined { region: &mut wasm, world: &world };
+        let body = Body::standing(&mut combined, [32.0, 4.0, 32.0], 1.7).unwrap();
+        assert!((body.feet[1] - 2.1).abs() < 0.05, "expected to stand on solid bridge at y=2.1, got {}", body.feet[1]);
+    }
 
-    let bad_kind = encode(99, 0, [0.0; 3], [0.0; 3], 0.1, 0.0);
-    let mut wasm = Wasm::new(&with_props(&bad_kind, 1), 7, Limits::default()).unwrap();
-    assert!(wasm.props().is_err());
+    // Crosshair raycast hits dynamic instance 1.
+    let aim_hit = world.raycast_dynamic([32.0, 3.5, 32.0], [0.0, -1.0, 0.0], 5.0);
+    assert_eq!(aim_hit.map(|(id, _)| id), Some(1));
 
-    let bad_nan = encode(0, 0, [f32::NAN, 0.0, 0.0], [0.0; 3], 0.1, 0.0);
-    let mut wasm = Wasm::new(&with_props(&bad_nan, 1), 7, Limits::default()).unwrap();
-    assert!(wasm.props().is_err());
+    // Tick moves the deck; interact toggles the light, clamps impulse to MAX_IMPULSE, and says "lamp on".
+    let ps = PlayerState { eye: [32.0, 3.5, 32.0], time: 1.0, ..PlayerState::default() };
+    let tcmds = wasm.tick(0.016, &ps).unwrap();
+    assert!(matches!(tcmds.as_slice(), [Command::SetTransform(inst)] if inst.id == 1 && inst.pos[1] > 2.2));
+    world.apply(&tcmds);
+    let icmds = wasm.interact(&ps).unwrap();
+    assert_eq!(icmds.len(), 3);
+    let applied = world.apply(&icmds);
+    assert!((applied.impulse[1] - plateau_engine::wasm::MAX_IMPULSE).abs() < 1e-4, "impulse was not clamped: {:?}", applied.impulse);
+    assert_eq!(applied.said.as_deref(), Some("lamp on"));
+    assert_eq!(world.lights.get(&1).map(|l| l.intensity), Some(200.0));
+    // Interact again turns the light off (mutable WASM state persisted!).
+    let icmds2 = wasm.interact(&ps).unwrap();
+    let applied2 = world.apply(&icmds2);
+    assert_eq!(applied2.said.as_deref(), Some("lamp off"));
+    assert!(!world.lights.contains_key(&1));
 
-    let neg_r = encode(0, 0, [0.0; 3], [0.0; 3], -0.1, 0.0);
-    let mut wasm = Wasm::new(&with_props(&neg_r, 1), 7, Limits::default()).unwrap();
-    assert!(wasm.props().is_err());
+    // Suppress unused imports check on Vertex/MeshData/Instance/Light types.
+    let _ = (Vertex { pos: [0.0; 3], normal: [0.0, 1.0, 0.0], material: Material::Stone, tint: [255; 3] }, MeshData::default(), Instance { id: 0, mesh: 0, pos: [0.0; 3], rot: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 3], solid: false }, Light { id: 0, pos: [0.0; 3], color: [1.0; 3], intensity: 0.0, radius: 1.0 });
 }

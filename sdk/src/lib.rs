@@ -30,12 +30,16 @@
 #[allow(clippy::all, dead_code, unused_imports, unused_unsafe)]
 #[rustfmt::skip]
 pub mod bindings;
+pub mod mesh;
 #[doc(hidden)]
 pub mod rt;
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-pub use bindings::plateau::region::types::{Answer, Borders, Description, Edge, Material, Place, Point, Prop, PropKind, Size};
+pub use bindings::plateau::region::types::{
+    Answer, Borders, Command, Description, Edge, Instance, Light, Material, MeshData, Place, PlayerState, Point, Scene, Size, Vertex,
+};
+pub use mesh::{MeshBuilder, Quat, SceneBuilder, instance, light};
 
 /// How wide an area is, along x and along z, in metres.
 pub const WIDTH: f32 = 64.0;
@@ -45,7 +49,8 @@ pub const TINY: f32 = 0.017;
 pub const PERSON: f32 = 1.7;
 pub const GIANT: f32 = 17.0;
 
-/// An area: made once when it is loaded, with its seed, then asked what is where.
+/// An area: made once when it is loaded, with its seed, then asked what is where, what procedural
+/// meshes/instances it builds (`scene`), and how it behaves at runtime (`tick`, `interact`).
 pub trait Area: 'static {
     fn new(seed: u64) -> Self;
     /// What the area is: its name, its places, its borders. Asked once.
@@ -53,36 +58,17 @@ pub trait Area: 'static {
     /// What is at `at` for `view`: the distance to the nearest surface (negative inside) and its
     /// material.
     fn sample(&self, at: Point, view: &View) -> Answer;
-    /// Smooth GPU-rendered props (reeds, cattails, flowers, tussocks, sticks, mushrooms) that stay
-    /// razor-sharp at every distance without voxel aliasing. Asked once on load.
-    fn props(&self) -> Vec<Prop> {
+    /// Raw procedural meshes, static/dynamic instances, and initial lights. Asked once on load.
+    fn scene(&self) -> Scene {
+        Scene { meshes: Vec::new(), instances: Vec::new(), lights: Vec::new() }
+    }
+    /// Sandboxed runtime update called each frame/step (optional animations, contraptions, physics).
+    fn tick(&mut self, _dt: f32, _player: &PlayerState) -> Vec<Command> {
         Vec::new()
     }
-}
-
-impl Prop {
-    /// A smooth capsule from `a` to `b` of radius `r`.
-    pub const fn capsule(a: Point, b: Point, r: f32, material: Material) -> Prop {
-        Prop { kind: PropKind::Capsule, material, a, b, r, yaw: 0.0 }
-    }
-
-    /// A smooth ellipsoid centred at `center` with half-sizes `radii`, turned by `yaw` radians.
-    pub const fn ellipsoid(center: Point, radii: Point, yaw: f32, material: Material) -> Prop {
-        Prop { kind: PropKind::Ellipsoid, material, a: center, b: radii, r: 0.0, yaw }
-    }
-
-    /// A smooth upright cylinder centred at `center` of radius `r` and half-height `half_h`, with
-    /// an optional V-notch facing `notch` radians (for lily pads).
-    pub const fn cylinder(center: Point, r: f32, half_h: f32, notch: Option<f32>, material: Material) -> Prop {
-        match notch {
-            Some(yaw) => Prop { kind: PropKind::Cylinder, material, a: center, b: point(r, half_h, 0.0), r: 1.0, yaw },
-            None => Prop { kind: PropKind::Cylinder, material, a: center, b: point(r, half_h, 0.0), r: 0.0, yaw: 0.0 },
-        }
-    }
-
-    /// A smooth cone with base centred at `foot`, base radius `r`, and `height` (negative points down).
-    pub const fn cone(foot: Point, height: f32, r: f32, material: Material) -> Prop {
-        Prop { kind: PropKind::Cone, material, a: foot, b: point(0.0, height, 0.0), r, yaw: 0.0 }
+    /// Sandboxed runtime interaction called when the player uses/interacts (`F` / right-click).
+    fn interact(&mut self, _player: &PlayerState) -> Vec<Command> {
+        Vec::new()
     }
 }
 
@@ -107,10 +93,22 @@ macro_rules! area {
 
         #[cfg(target_arch = "wasm32")]
         const _: () = {
-            thread_local!(static AREA: ::std::cell::OnceCell<$ty> = const { ::std::cell::OnceCell::new() });
+            thread_local!(static AREA: ::std::cell::RefCell<Option<$ty>> = const { ::std::cell::RefCell::new(None) });
 
             fn with<R>(f: impl FnOnce(&$ty) -> R) -> R {
-                AREA.with(|a| f(a.get_or_init(|| <$ty as $crate::Area>::new($crate::bindings::plateau::region::host::seed()))))
+                AREA.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let a = guard.get_or_insert_with(|| <$ty as $crate::Area>::new($crate::bindings::plateau::region::host::seed()));
+                    f(a)
+                })
+            }
+
+            fn with_mut<R>(f: impl FnOnce(&mut $ty) -> R) -> R {
+                AREA.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let a = guard.get_or_insert_with(|| <$ty as $crate::Area>::new($crate::bindings::plateau::region::host::seed()));
+                    f(a)
+                })
             }
 
             struct Exports;
@@ -124,8 +122,16 @@ macro_rules! area {
                     with(|a| $crate::Area::describe(a))
                 }
 
-                fn props() -> ::std::vec::Vec<$crate::Prop> {
-                    with(|a| $crate::Area::props(a))
+                fn scene() -> $crate::Scene {
+                    with(|a| $crate::Area::scene(a))
+                }
+
+                fn tick(dt: f32, player: $crate::PlayerState) -> ::std::vec::Vec<$crate::Command> {
+                    with_mut(|a| $crate::Area::tick(a, dt, &player))
+                }
+
+                fn interact(player: $crate::PlayerState) -> ::std::vec::Vec<$crate::Command> {
+                    with_mut(|a| $crate::Area::interact(a, &player))
                 }
             }
 
@@ -147,13 +153,19 @@ pub fn sample_all<A: Area>(area: &A, points: &[Point], size: f32) -> Vec<Answer>
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod native {
-    use crate::{Answer, Area, Description, Point, Prop};
+    use crate::{Answer, Area, Command, Description, PlayerState, Point, Scene};
 
     /// An area as the engine's tests play it, as the world's exports are called.
     pub trait Played {
         fn sample(&self, points: &[Point], size: f32, out: &mut Vec<Answer>);
         fn describe(&self) -> Description;
-        fn props(&self) -> Vec<Prop> {
+        fn scene(&self) -> Scene {
+            Scene { meshes: Vec::new(), instances: Vec::new(), lights: Vec::new() }
+        }
+        fn tick(&mut self, _dt: f32, _player: &PlayerState) -> Vec<Command> {
+            Vec::new()
+        }
+        fn interact(&mut self, _player: &PlayerState) -> Vec<Command> {
             Vec::new()
         }
     }
@@ -165,8 +177,14 @@ pub mod native {
         fn describe(&self) -> Description {
             Area::describe(self)
         }
-        fn props(&self) -> Vec<Prop> {
-            Area::props(self)
+        fn scene(&self) -> Scene {
+            Area::scene(self)
+        }
+        fn tick(&mut self, dt: f32, player: &PlayerState) -> Vec<Command> {
+            Area::tick(self, dt, player)
+        }
+        fn interact(&mut self, player: &PlayerState) -> Vec<Command> {
+            Area::interact(self, player)
         }
     }
 }
@@ -208,6 +226,10 @@ impl Point {
 
     pub fn dot(self, o: Point) -> f32 {
         self.x * o.x + self.y * o.y + self.z * o.z
+    }
+
+    pub fn cross(self, o: Point) -> Point {
+        point(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
     }
 
     /// Each coordinate made positive.

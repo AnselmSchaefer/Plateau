@@ -654,8 +654,8 @@ pub fn nans_unseen(module: &[u8], seed: u64, points: &[[f32; 3]]) -> Result<Verd
             }
         }
     }
-    if one.props()? != own.props()? {
-        return Ok(Err("the area's props differ between canonical NaNs and this machine's own".into()));
+    if one.scene()? != own.scene()? {
+        return Ok(Err("the area's procedural scene differs between canonical NaNs and this machine's own".into()));
     }
     Ok(Ok(()))
 }

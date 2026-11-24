@@ -5,7 +5,9 @@
 pub type Point = plateau::region::types::Point;
 pub type Answer = plateau::region::types::Answer;
 pub type Description = plateau::region::types::Description;
-pub type Prop = plateau::region::types::Prop;
+pub type Scene = plateau::region::types::Scene;
+pub type PlayerState = plateau::region::types::PlayerState;
+pub type Command = plateau::region::types::Command;
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
 pub unsafe fn _export_sample_cabi<T_: Guest>(
@@ -269,57 +271,723 @@ pub unsafe fn __post_return_describe<T_: Guest>(arg0: *mut u8) {
 }
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
-pub unsafe fn _export_props_cabi<T_: Guest>() -> *mut u8 {
+pub unsafe fn _export_scene_cabi<T_: Guest>() -> *mut u8 {
     unsafe {
         #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
-        let result0 = { T_::props() };
+        let result0 = { T_::scene() };
         let ptr1 = (&raw mut _RET_AREA.0).cast::<u8>();
-        let vec5 = result0;
-        let len5 = vec5.len();
-        let layout5 = _rt::alloc::Layout::from_size_align(vec5.len() * 36, 4).unwrap();
-        let (result5, _cleanup5) = crate::rt::Cleanup::new(layout5);
-        if let Some(cleanup) = _cleanup5 {
+        let plateau::region::types::Scene {
+            meshes: meshes2,
+            instances: instances2,
+            lights: lights2,
+        } = result0;
+        let vec9 = meshes2;
+        let len9 = vec9.len();
+        let layout9 = _rt::alloc::Layout::from_size_align(
+                vec9.len() * (4 * ::core::mem::size_of::<*const u8>()),
+                ::core::mem::size_of::<*const u8>(),
+            )
+            .unwrap();
+        let (result9, _cleanup9) = crate::rt::Cleanup::new(layout9);
+        if let Some(cleanup) = _cleanup9 {
             cleanup.forget();
         }
-        for (i, e) in vec5.into_iter().enumerate() {
-            let base = result5.add(i * 36);
+        for (i, e) in vec9.into_iter().enumerate() {
+            let base = result9.add(i * (4 * ::core::mem::size_of::<*const u8>()));
             {
-                let plateau::region::types::Prop {
-                    kind: kind2,
-                    material: material2,
-                    a: a2,
-                    b: b2,
-                    r: r2,
-                    yaw: yaw2,
+                let plateau::region::types::MeshData {
+                    vertices: vertices3,
+                    indices: indices3,
                 } = e;
-                *base.add(0).cast::<u8>() = (kind2.clone() as i32) as u8;
-                *base.add(1).cast::<u8>() = (material2.clone() as i32) as u8;
-                let plateau::region::types::Point { x: x3, y: y3, z: z3 } = a2;
-                *base.add(4).cast::<f32>() = _rt::as_f32(x3);
-                *base.add(8).cast::<f32>() = _rt::as_f32(y3);
-                *base.add(12).cast::<f32>() = _rt::as_f32(z3);
-                let plateau::region::types::Point { x: x4, y: y4, z: z4 } = b2;
-                *base.add(16).cast::<f32>() = _rt::as_f32(x4);
-                *base.add(20).cast::<f32>() = _rt::as_f32(y4);
-                *base.add(24).cast::<f32>() = _rt::as_f32(z4);
-                *base.add(28).cast::<f32>() = _rt::as_f32(r2);
-                *base.add(32).cast::<f32>() = _rt::as_f32(yaw2);
+                let vec7 = vertices3;
+                let len7 = vec7.len();
+                let layout7 = _rt::alloc::Layout::from_size_align(vec7.len() * 28, 4)
+                    .unwrap();
+                let (result7, _cleanup7) = crate::rt::Cleanup::new(layout7);
+                if let Some(cleanup) = _cleanup7 {
+                    cleanup.forget();
+                }
+                for (i, e) in vec7.into_iter().enumerate() {
+                    let base = result7.add(i * 28);
+                    {
+                        let plateau::region::types::Vertex {
+                            pos: pos4,
+                            normal: normal4,
+                            material: material4,
+                            tint_r: tint_r4,
+                            tint_g: tint_g4,
+                            tint_b: tint_b4,
+                        } = e;
+                        let plateau::region::types::Point { x: x5, y: y5, z: z5 } = pos4;
+                        *base.add(0).cast::<f32>() = _rt::as_f32(x5);
+                        *base.add(4).cast::<f32>() = _rt::as_f32(y5);
+                        *base.add(8).cast::<f32>() = _rt::as_f32(z5);
+                        let plateau::region::types::Point { x: x6, y: y6, z: z6 } = normal4;
+                        *base.add(12).cast::<f32>() = _rt::as_f32(x6);
+                        *base.add(16).cast::<f32>() = _rt::as_f32(y6);
+                        *base.add(20).cast::<f32>() = _rt::as_f32(z6);
+                        *base.add(24).cast::<u8>() = (material4.clone() as i32) as u8;
+                        *base.add(25).cast::<u8>() = (_rt::as_i32(tint_r4)) as u8;
+                        *base.add(26).cast::<u8>() = (_rt::as_i32(tint_g4)) as u8;
+                        *base.add(27).cast::<u8>() = (_rt::as_i32(tint_b4)) as u8;
+                    }
+                }
+                *base.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len7;
+                *base.add(0).cast::<*mut u8>() = result7;
+                let vec8 = <_ as Into<_rt::Vec<_>>>::into(indices3).into_boxed_slice();
+                let ptr8 = vec8.as_ptr().cast::<u8>();
+                let len8 = vec8.len();
+                ::core::mem::forget(vec8);
+                *base.add(3 * ::core::mem::size_of::<*const u8>()).cast::<usize>() = len8;
+                *base.add(2 * ::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr8
+                    .cast_mut();
             }
         }
-        *ptr1.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len5;
-        *ptr1.add(0).cast::<*mut u8>() = result5;
+        *ptr1.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len9;
+        *ptr1.add(0).cast::<*mut u8>() = result9;
+        let vec13 = instances2;
+        let len13 = vec13.len();
+        let layout13 = _rt::alloc::Layout::from_size_align(vec13.len() * 52, 4).unwrap();
+        let (result13, _cleanup13) = crate::rt::Cleanup::new(layout13);
+        if let Some(cleanup) = _cleanup13 {
+            cleanup.forget();
+        }
+        for (i, e) in vec13.into_iter().enumerate() {
+            let base = result13.add(i * 52);
+            {
+                let plateau::region::types::Instance {
+                    id: id10,
+                    mesh: mesh10,
+                    pos: pos10,
+                    rot_x: rot_x10,
+                    rot_y: rot_y10,
+                    rot_z: rot_z10,
+                    rot_w: rot_w10,
+                    scale: scale10,
+                    solid: solid10,
+                } = e;
+                *base.add(0).cast::<i32>() = _rt::as_i32(id10);
+                *base.add(4).cast::<i32>() = _rt::as_i32(mesh10);
+                let plateau::region::types::Point { x: x11, y: y11, z: z11 } = pos10;
+                *base.add(8).cast::<f32>() = _rt::as_f32(x11);
+                *base.add(12).cast::<f32>() = _rt::as_f32(y11);
+                *base.add(16).cast::<f32>() = _rt::as_f32(z11);
+                *base.add(20).cast::<f32>() = _rt::as_f32(rot_x10);
+                *base.add(24).cast::<f32>() = _rt::as_f32(rot_y10);
+                *base.add(28).cast::<f32>() = _rt::as_f32(rot_z10);
+                *base.add(32).cast::<f32>() = _rt::as_f32(rot_w10);
+                let plateau::region::types::Point { x: x12, y: y12, z: z12 } = scale10;
+                *base.add(36).cast::<f32>() = _rt::as_f32(x12);
+                *base.add(40).cast::<f32>() = _rt::as_f32(y12);
+                *base.add(44).cast::<f32>() = _rt::as_f32(z12);
+                *base.add(48).cast::<u8>() = (match solid10 {
+                    true => 1,
+                    false => 0,
+                }) as u8;
+            }
+        }
+        *ptr1.add(3 * ::core::mem::size_of::<*const u8>()).cast::<usize>() = len13;
+        *ptr1.add(2 * ::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = result13;
+        let vec14 = <_ as Into<_rt::Vec<_>>>::into(lights2).into_boxed_slice();
+        let ptr14 = vec14.as_ptr().cast::<u8>();
+        let len14 = vec14.len();
+        ::core::mem::forget(vec14);
+        *ptr1.add(5 * ::core::mem::size_of::<*const u8>()).cast::<usize>() = len14;
+        *ptr1.add(4 * ::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr14
+            .cast_mut();
         ptr1
     }
 }
 #[doc(hidden)]
 #[allow(non_snake_case)]
-pub unsafe fn __post_return_props<T_: Guest>(arg0: *mut u8) {
+pub unsafe fn __post_return_scene<T_: Guest>(arg0: *mut u8) {
     unsafe {
         let l0 = *arg0.add(0).cast::<*mut u8>();
         let l1 = *arg0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
-        let base2 = l0;
-        let len2 = l1;
-        _rt::cabi_dealloc(base2, len2 * 36, 4);
+        let base8 = l0;
+        let len8 = l1;
+        for i in 0..len8 {
+            let base = base8.add(i * (4 * ::core::mem::size_of::<*const u8>()));
+            {
+                let l2 = *base.add(0).cast::<*mut u8>();
+                let l3 = *base.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+                let base4 = l2;
+                let len4 = l3;
+                _rt::cabi_dealloc(base4, len4 * 28, 4);
+                let l5 = *base
+                    .add(2 * ::core::mem::size_of::<*const u8>())
+                    .cast::<*mut u8>();
+                let l6 = *base
+                    .add(3 * ::core::mem::size_of::<*const u8>())
+                    .cast::<usize>();
+                let base7 = l5;
+                let len7 = l6;
+                _rt::cabi_dealloc(base7, len7 * 4, 4);
+            }
+        }
+        _rt::cabi_dealloc(
+            base8,
+            len8 * (4 * ::core::mem::size_of::<*const u8>()),
+            ::core::mem::size_of::<*const u8>(),
+        );
+        let l9 = *arg0.add(2 * ::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+        let l10 = *arg0.add(3 * ::core::mem::size_of::<*const u8>()).cast::<usize>();
+        let base11 = l9;
+        let len11 = l10;
+        _rt::cabi_dealloc(base11, len11 * 52, 4);
+        let l12 = *arg0.add(4 * ::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+        let l13 = *arg0.add(5 * ::core::mem::size_of::<*const u8>()).cast::<usize>();
+        let base14 = l12;
+        let len14 = l13;
+        _rt::cabi_dealloc(base14, len14 * 36, 4);
+    }
+}
+#[doc(hidden)]
+#[allow(non_snake_case, unused_unsafe)]
+pub unsafe fn _export_tick_cabi<T_: Guest>(arg0: *mut u8) -> *mut u8 {
+    unsafe {
+        #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+        let result21 = {
+            let l0 = *arg0.add(0).cast::<f32>();
+            let l1 = *arg0.add(4).cast::<f32>();
+            let l2 = *arg0.add(8).cast::<f32>();
+            let l3 = *arg0.add(12).cast::<f32>();
+            let l4 = *arg0.add(16).cast::<f32>();
+            let l5 = *arg0.add(20).cast::<f32>();
+            let l6 = *arg0.add(24).cast::<f32>();
+            let l7 = *arg0.add(28).cast::<f32>();
+            let l8 = *arg0.add(32).cast::<f32>();
+            let l9 = *arg0.add(36).cast::<f32>();
+            let l10 = *arg0.add(40).cast::<f32>();
+            let l11 = *arg0.add(44).cast::<f32>();
+            let l12 = *arg0.add(48).cast::<f32>();
+            let l13 = *arg0.add(52).cast::<f32>();
+            let l14 = i32::from(*arg0.add(56).cast::<u8>());
+            let l15 = i32::from(*arg0.add(57).cast::<u8>());
+            let l16 = *arg0.add(60).cast::<i32>();
+            let l17 = *arg0.add(64).cast::<f32>();
+            let l18 = *arg0.add(68).cast::<f32>();
+            let l19 = *arg0.add(72).cast::<f32>();
+            let l20 = *arg0.add(76).cast::<f32>();
+            T_::tick(
+                l0,
+                plateau::region::types::PlayerState {
+                    feet: plateau::region::types::Point {
+                        x: l1,
+                        y: l2,
+                        z: l3,
+                    },
+                    eye: plateau::region::types::Point {
+                        x: l4,
+                        y: l5,
+                        z: l6,
+                    },
+                    look: plateau::region::types::Point {
+                        x: l7,
+                        y: l8,
+                        z: l9,
+                    },
+                    velocity: plateau::region::types::Point {
+                        x: l10,
+                        y: l11,
+                        z: l12,
+                    },
+                    size: l13,
+                    grounded: _rt::bool_lift(l14 as u8),
+                    holding_use: _rt::bool_lift(l15 as u8),
+                    target: l16 as u32,
+                    aim: plateau::region::types::Point {
+                        x: l17,
+                        y: l18,
+                        z: l19,
+                    },
+                    time: l20,
+                },
+            )
+        };
+        _rt::cabi_dealloc(arg0, 80, 4);
+        let ptr22 = (&raw mut _RET_AREA.0).cast::<u8>();
+        let vec33 = result21;
+        let len33 = vec33.len();
+        let layout33 = _rt::alloc::Layout::from_size_align(
+                vec33.len() * (48 + 2 * ::core::mem::size_of::<*const u8>()),
+                ::core::mem::size_of::<*const u8>(),
+            )
+            .unwrap();
+        let (result33, _cleanup33) = crate::rt::Cleanup::new(layout33);
+        if let Some(cleanup) = _cleanup33 {
+            cleanup.forget();
+        }
+        for (i, e) in vec33.into_iter().enumerate() {
+            let base = result33.add(i * (48 + 2 * ::core::mem::size_of::<*const u8>()));
+            {
+                use plateau::region::types::Command as V32;
+                match e {
+                    V32::SetTransform(e) => {
+                        *base.add(0).cast::<u8>() = (0i32) as u8;
+                        let plateau::region::types::Instance {
+                            id: id23,
+                            mesh: mesh23,
+                            pos: pos23,
+                            rot_x: rot_x23,
+                            rot_y: rot_y23,
+                            rot_z: rot_z23,
+                            rot_w: rot_w23,
+                            scale: scale23,
+                            solid: solid23,
+                        } = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            id23,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<i32>() = _rt::as_i32(mesh23);
+                        let plateau::region::types::Point { x: x24, y: y24, z: z24 } = pos23;
+                        *base
+                            .add(8 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(x24);
+                        *base
+                            .add(12 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y24);
+                        *base
+                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z24);
+                        *base
+                            .add(20 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_x23);
+                        *base
+                            .add(24 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_y23);
+                        *base
+                            .add(28 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_z23);
+                        *base
+                            .add(32 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_w23);
+                        let plateau::region::types::Point { x: x25, y: y25, z: z25 } = scale23;
+                        *base
+                            .add(36 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(x25);
+                        *base
+                            .add(40 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y25);
+                        *base
+                            .add(44 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z25);
+                        *base
+                            .add(48 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<u8>() = (match solid23 {
+                            true => 1,
+                            false => 0,
+                        }) as u8;
+                    }
+                    V32::SetVisible(e) => {
+                        *base.add(0).cast::<u8>() = (1i32) as u8;
+                        let (t26_0, t26_1) = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            t26_0,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<u8>() = (match t26_1 {
+                            true => 1,
+                            false => 0,
+                        }) as u8;
+                    }
+                    V32::SetSolid(e) => {
+                        *base.add(0).cast::<u8>() = (2i32) as u8;
+                        let (t27_0, t27_1) = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            t27_0,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<u8>() = (match t27_1 {
+                            true => 1,
+                            false => 0,
+                        }) as u8;
+                    }
+                    V32::ApplyImpulse(e) => {
+                        *base.add(0).cast::<u8>() = (3i32) as u8;
+                        let plateau::region::types::Point { x: x28, y: y28, z: z28 } = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<f32>() = _rt::as_f32(
+                            x28,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y28);
+                        *base
+                            .add(8 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z28);
+                    }
+                    V32::SetLight(e) => {
+                        *base.add(0).cast::<u8>() = (4i32) as u8;
+                        let plateau::region::types::Light {
+                            id: id29,
+                            pos: pos29,
+                            r: r29,
+                            g: g29,
+                            b: b29,
+                            intensity: intensity29,
+                            radius: radius29,
+                        } = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            id29,
+                        );
+                        let plateau::region::types::Point { x: x30, y: y30, z: z30 } = pos29;
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(x30);
+                        *base
+                            .add(8 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y30);
+                        *base
+                            .add(12 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z30);
+                        *base
+                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(r29);
+                        *base
+                            .add(20 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(g29);
+                        *base
+                            .add(24 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(b29);
+                        *base
+                            .add(28 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(intensity29);
+                        *base
+                            .add(32 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(radius29);
+                    }
+                    V32::Say(e) => {
+                        *base.add(0).cast::<u8>() = (5i32) as u8;
+                        let vec31 = (e.into_bytes()).into_boxed_slice();
+                        let ptr31 = vec31.as_ptr().cast::<u8>();
+                        let len31 = vec31.len();
+                        ::core::mem::forget(vec31);
+                        *base
+                            .add(2 * ::core::mem::size_of::<*const u8>())
+                            .cast::<usize>() = len31;
+                        *base
+                            .add(::core::mem::size_of::<*const u8>())
+                            .cast::<*mut u8>() = ptr31.cast_mut();
+                    }
+                }
+            }
+        }
+        *ptr22.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len33;
+        *ptr22.add(0).cast::<*mut u8>() = result33;
+        ptr22
+    }
+}
+#[doc(hidden)]
+#[allow(non_snake_case)]
+pub unsafe fn __post_return_tick<T_: Guest>(arg0: *mut u8) {
+    unsafe {
+        let l0 = *arg0.add(0).cast::<*mut u8>();
+        let l1 = *arg0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+        let base5 = l0;
+        let len5 = l1;
+        for i in 0..len5 {
+            let base = base5.add(i * (48 + 2 * ::core::mem::size_of::<*const u8>()));
+            {
+                let l2 = i32::from(*base.add(0).cast::<u8>());
+                match l2 {
+                    0 => {}
+                    1 => {}
+                    2 => {}
+                    3 => {}
+                    4 => {}
+                    _ => {
+                        let l3 = *base
+                            .add(::core::mem::size_of::<*const u8>())
+                            .cast::<*mut u8>();
+                        let l4 = *base
+                            .add(2 * ::core::mem::size_of::<*const u8>())
+                            .cast::<usize>();
+                        _rt::cabi_dealloc(l3, l4, 1);
+                    }
+                }
+            }
+        }
+        _rt::cabi_dealloc(
+            base5,
+            len5 * (48 + 2 * ::core::mem::size_of::<*const u8>()),
+            ::core::mem::size_of::<*const u8>(),
+        );
+    }
+}
+#[doc(hidden)]
+#[allow(non_snake_case, unused_unsafe)]
+pub unsafe fn _export_interact_cabi<T_: Guest>(arg0: *mut u8) -> *mut u8 {
+    unsafe {
+        #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+        let result20 = {
+            let l0 = *arg0.add(0).cast::<f32>();
+            let l1 = *arg0.add(4).cast::<f32>();
+            let l2 = *arg0.add(8).cast::<f32>();
+            let l3 = *arg0.add(12).cast::<f32>();
+            let l4 = *arg0.add(16).cast::<f32>();
+            let l5 = *arg0.add(20).cast::<f32>();
+            let l6 = *arg0.add(24).cast::<f32>();
+            let l7 = *arg0.add(28).cast::<f32>();
+            let l8 = *arg0.add(32).cast::<f32>();
+            let l9 = *arg0.add(36).cast::<f32>();
+            let l10 = *arg0.add(40).cast::<f32>();
+            let l11 = *arg0.add(44).cast::<f32>();
+            let l12 = *arg0.add(48).cast::<f32>();
+            let l13 = i32::from(*arg0.add(52).cast::<u8>());
+            let l14 = i32::from(*arg0.add(53).cast::<u8>());
+            let l15 = *arg0.add(56).cast::<i32>();
+            let l16 = *arg0.add(60).cast::<f32>();
+            let l17 = *arg0.add(64).cast::<f32>();
+            let l18 = *arg0.add(68).cast::<f32>();
+            let l19 = *arg0.add(72).cast::<f32>();
+            T_::interact(plateau::region::types::PlayerState {
+                feet: plateau::region::types::Point {
+                    x: l0,
+                    y: l1,
+                    z: l2,
+                },
+                eye: plateau::region::types::Point {
+                    x: l3,
+                    y: l4,
+                    z: l5,
+                },
+                look: plateau::region::types::Point {
+                    x: l6,
+                    y: l7,
+                    z: l8,
+                },
+                velocity: plateau::region::types::Point {
+                    x: l9,
+                    y: l10,
+                    z: l11,
+                },
+                size: l12,
+                grounded: _rt::bool_lift(l13 as u8),
+                holding_use: _rt::bool_lift(l14 as u8),
+                target: l15 as u32,
+                aim: plateau::region::types::Point {
+                    x: l16,
+                    y: l17,
+                    z: l18,
+                },
+                time: l19,
+            })
+        };
+        _rt::cabi_dealloc(arg0, 76, 4);
+        let ptr21 = (&raw mut _RET_AREA.0).cast::<u8>();
+        let vec32 = result20;
+        let len32 = vec32.len();
+        let layout32 = _rt::alloc::Layout::from_size_align(
+                vec32.len() * (48 + 2 * ::core::mem::size_of::<*const u8>()),
+                ::core::mem::size_of::<*const u8>(),
+            )
+            .unwrap();
+        let (result32, _cleanup32) = crate::rt::Cleanup::new(layout32);
+        if let Some(cleanup) = _cleanup32 {
+            cleanup.forget();
+        }
+        for (i, e) in vec32.into_iter().enumerate() {
+            let base = result32.add(i * (48 + 2 * ::core::mem::size_of::<*const u8>()));
+            {
+                use plateau::region::types::Command as V31;
+                match e {
+                    V31::SetTransform(e) => {
+                        *base.add(0).cast::<u8>() = (0i32) as u8;
+                        let plateau::region::types::Instance {
+                            id: id22,
+                            mesh: mesh22,
+                            pos: pos22,
+                            rot_x: rot_x22,
+                            rot_y: rot_y22,
+                            rot_z: rot_z22,
+                            rot_w: rot_w22,
+                            scale: scale22,
+                            solid: solid22,
+                        } = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            id22,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<i32>() = _rt::as_i32(mesh22);
+                        let plateau::region::types::Point { x: x23, y: y23, z: z23 } = pos22;
+                        *base
+                            .add(8 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(x23);
+                        *base
+                            .add(12 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y23);
+                        *base
+                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z23);
+                        *base
+                            .add(20 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_x22);
+                        *base
+                            .add(24 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_y22);
+                        *base
+                            .add(28 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_z22);
+                        *base
+                            .add(32 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(rot_w22);
+                        let plateau::region::types::Point { x: x24, y: y24, z: z24 } = scale22;
+                        *base
+                            .add(36 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(x24);
+                        *base
+                            .add(40 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y24);
+                        *base
+                            .add(44 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z24);
+                        *base
+                            .add(48 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<u8>() = (match solid22 {
+                            true => 1,
+                            false => 0,
+                        }) as u8;
+                    }
+                    V31::SetVisible(e) => {
+                        *base.add(0).cast::<u8>() = (1i32) as u8;
+                        let (t25_0, t25_1) = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            t25_0,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<u8>() = (match t25_1 {
+                            true => 1,
+                            false => 0,
+                        }) as u8;
+                    }
+                    V31::SetSolid(e) => {
+                        *base.add(0).cast::<u8>() = (2i32) as u8;
+                        let (t26_0, t26_1) = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            t26_0,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<u8>() = (match t26_1 {
+                            true => 1,
+                            false => 0,
+                        }) as u8;
+                    }
+                    V31::ApplyImpulse(e) => {
+                        *base.add(0).cast::<u8>() = (3i32) as u8;
+                        let plateau::region::types::Point { x: x27, y: y27, z: z27 } = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<f32>() = _rt::as_f32(
+                            x27,
+                        );
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y27);
+                        *base
+                            .add(8 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z27);
+                    }
+                    V31::SetLight(e) => {
+                        *base.add(0).cast::<u8>() = (4i32) as u8;
+                        let plateau::region::types::Light {
+                            id: id28,
+                            pos: pos28,
+                            r: r28,
+                            g: g28,
+                            b: b28,
+                            intensity: intensity28,
+                            radius: radius28,
+                        } = e;
+                        *base.add(::core::mem::size_of::<*const u8>()).cast::<i32>() = _rt::as_i32(
+                            id28,
+                        );
+                        let plateau::region::types::Point { x: x29, y: y29, z: z29 } = pos28;
+                        *base
+                            .add(4 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(x29);
+                        *base
+                            .add(8 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(y29);
+                        *base
+                            .add(12 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(z29);
+                        *base
+                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(r28);
+                        *base
+                            .add(20 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(g28);
+                        *base
+                            .add(24 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(b28);
+                        *base
+                            .add(28 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(intensity28);
+                        *base
+                            .add(32 + 1 * ::core::mem::size_of::<*const u8>())
+                            .cast::<f32>() = _rt::as_f32(radius28);
+                    }
+                    V31::Say(e) => {
+                        *base.add(0).cast::<u8>() = (5i32) as u8;
+                        let vec30 = (e.into_bytes()).into_boxed_slice();
+                        let ptr30 = vec30.as_ptr().cast::<u8>();
+                        let len30 = vec30.len();
+                        ::core::mem::forget(vec30);
+                        *base
+                            .add(2 * ::core::mem::size_of::<*const u8>())
+                            .cast::<usize>() = len30;
+                        *base
+                            .add(::core::mem::size_of::<*const u8>())
+                            .cast::<*mut u8>() = ptr30.cast_mut();
+                    }
+                }
+            }
+        }
+        *ptr21.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len32;
+        *ptr21.add(0).cast::<*mut u8>() = result32;
+        ptr21
+    }
+}
+#[doc(hidden)]
+#[allow(non_snake_case)]
+pub unsafe fn __post_return_interact<T_: Guest>(arg0: *mut u8) {
+    unsafe {
+        let l0 = *arg0.add(0).cast::<*mut u8>();
+        let l1 = *arg0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+        let base5 = l0;
+        let len5 = l1;
+        for i in 0..len5 {
+            let base = base5.add(i * (48 + 2 * ::core::mem::size_of::<*const u8>()));
+            {
+                let l2 = i32::from(*base.add(0).cast::<u8>());
+                match l2 {
+                    0 => {}
+                    1 => {}
+                    2 => {}
+                    3 => {}
+                    4 => {}
+                    _ => {
+                        let l3 = *base
+                            .add(::core::mem::size_of::<*const u8>())
+                            .cast::<*mut u8>();
+                        let l4 = *base
+                            .add(2 * ::core::mem::size_of::<*const u8>())
+                            .cast::<usize>();
+                        _rt::cabi_dealloc(l3, l4, 1);
+                    }
+                }
+            }
+        }
+        _rt::cabi_dealloc(
+            base5,
+            len5 * (48 + 2 * ::core::mem::size_of::<*const u8>()),
+            ::core::mem::size_of::<*const u8>(),
+        );
     }
 }
 pub trait Guest {
@@ -331,10 +999,15 @@ pub trait Guest {
     /// What the area is: its name, its places, its borders. Asked once.
     #[allow(async_fn_in_trait)]
     fn describe() -> Description;
-    /// Smooth GPU-rendered props (reeds, flowers, tussocks, sticks, mushrooms) that stay sharp at
-    /// every distance without voxel aliasing. Asked once.
+    /// Raw procedural meshes, their static/dynamic instances, and initial lights. Asked once.
     #[allow(async_fn_in_trait)]
-    fn props() -> _rt::Vec<Prop>;
+    fn scene() -> Scene;
+    /// Sandboxed runtime update called each frame/step (optional behavior, animations, physics).
+    #[allow(async_fn_in_trait)]
+    fn tick(dt: f32, player: PlayerState) -> _rt::Vec<Command>;
+    /// Sandboxed runtime interaction called when the player uses/interacts (`F` / right-click).
+    #[allow(async_fn_in_trait)]
+    fn interact(player: PlayerState) -> _rt::Vec<Command>;
 }
 #[doc(hidden)]
 #[macro_export]
@@ -349,11 +1022,20 @@ macro_rules! __export_world_region_cabi {
         -> * mut u8 { unsafe { $($path_to_types)*:: _export_describe_cabi::<$ty > () } }
         #[unsafe (export_name = "cabi_post_describe")] unsafe extern "C" fn
         _post_return_describe(arg0 : * mut u8,) { unsafe { $($path_to_types)*::
-        __post_return_describe::<$ty > (arg0) } } #[unsafe (export_name = "props")]
-        unsafe extern "C" fn export_props() -> * mut u8 { unsafe { $($path_to_types)*::
-        _export_props_cabi::<$ty > () } } #[unsafe (export_name = "cabi_post_props")]
-        unsafe extern "C" fn _post_return_props(arg0 : * mut u8,) { unsafe {
-        $($path_to_types)*:: __post_return_props::<$ty > (arg0) } } };
+        __post_return_describe::<$ty > (arg0) } } #[unsafe (export_name = "scene")]
+        unsafe extern "C" fn export_scene() -> * mut u8 { unsafe { $($path_to_types)*::
+        _export_scene_cabi::<$ty > () } } #[unsafe (export_name = "cabi_post_scene")]
+        unsafe extern "C" fn _post_return_scene(arg0 : * mut u8,) { unsafe {
+        $($path_to_types)*:: __post_return_scene::<$ty > (arg0) } } #[unsafe (export_name
+        = "tick")] unsafe extern "C" fn export_tick(arg0 : * mut u8,) -> * mut u8 {
+        unsafe { $($path_to_types)*:: _export_tick_cabi::<$ty > (arg0) } } #[unsafe
+        (export_name = "cabi_post_tick")] unsafe extern "C" fn _post_return_tick(arg0 : *
+        mut u8,) { unsafe { $($path_to_types)*:: __post_return_tick::<$ty > (arg0) } }
+        #[unsafe (export_name = "interact")] unsafe extern "C" fn export_interact(arg0 :
+        * mut u8,) -> * mut u8 { unsafe { $($path_to_types)*::
+        _export_interact_cabi::<$ty > (arg0) } } #[unsafe (export_name =
+        "cabi_post_interact")] unsafe extern "C" fn _post_return_interact(arg0 : * mut
+        u8,) { unsafe { $($path_to_types)*:: __post_return_interact::<$ty > (arg0) } } };
     };
 }
 #[doc(hidden)]
@@ -605,76 +1287,208 @@ pub mod plateau {
                         .finish()
                 }
             }
-            /// The shape of a smooth GPU-rendered prop (thin plants, flowers, sticks, pebbles, limbs).
-            #[repr(u8)]
-            #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-            pub enum PropKind {
-                Capsule,
-                Ellipsoid,
-                Cylinder,
-                Cone,
+            /// One vertex of a raw procedural triangle mesh: position, unit normal, engine material, and
+            /// RGB tint multiplier (0..255; 255 = pure material colour).
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct Vertex {
+                pub pos: Point,
+                pub normal: Point,
+                pub material: Material,
+                pub tint_r: u8,
+                pub tint_g: u8,
+                pub tint_b: u8,
             }
-            impl ::core::fmt::Debug for PropKind {
+            impl ::core::fmt::Debug for Vertex {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Vertex")
+                        .field("pos", &self.pos)
+                        .field("normal", &self.normal)
+                        .field("material", &self.material)
+                        .field("tint-r", &self.tint_r)
+                        .field("tint-g", &self.tint_g)
+                        .field("tint-b", &self.tint_b)
+                        .finish()
+                }
+            }
+            /// A raw procedural triangle mesh built in WASM.
+            #[derive(Clone)]
+            pub struct MeshData {
+                pub vertices: _rt::Vec<Vertex>,
+                pub indices: _rt::Vec<u32>,
+            }
+            impl ::core::fmt::Debug for MeshData {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("MeshData")
+                        .field("vertices", &self.vertices)
+                        .field("indices", &self.indices)
+                        .finish()
+                }
+            }
+            /// One placed instance of a mesh in the area: static when `id == 0`, dynamic (controllable
+            /// at runtime via `tick` / `interact`) when `id > 0`. Rotation is a unit quaternion.
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct Instance {
+                pub id: u32,
+                pub mesh: u32,
+                pub pos: Point,
+                pub rot_x: f32,
+                pub rot_y: f32,
+                pub rot_z: f32,
+                pub rot_w: f32,
+                pub scale: Point,
+                pub solid: bool,
+            }
+            impl ::core::fmt::Debug for Instance {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Instance")
+                        .field("id", &self.id)
+                        .field("mesh", &self.mesh)
+                        .field("pos", &self.pos)
+                        .field("rot-x", &self.rot_x)
+                        .field("rot-y", &self.rot_y)
+                        .field("rot-z", &self.rot_z)
+                        .field("rot-w", &self.rot_w)
+                        .field("scale", &self.scale)
+                        .field("solid", &self.solid)
+                        .finish()
+                }
+            }
+            /// A point light placed in the area (intensity == 0 turns it off).
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct Light {
+                pub id: u32,
+                pub pos: Point,
+                pub r: f32,
+                pub g: f32,
+                pub b: f32,
+                pub intensity: f32,
+                pub radius: f32,
+            }
+            impl ::core::fmt::Debug for Light {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Light")
+                        .field("id", &self.id)
+                        .field("pos", &self.pos)
+                        .field("r", &self.r)
+                        .field("g", &self.g)
+                        .field("b", &self.b)
+                        .field("intensity", &self.intensity)
+                        .field("radius", &self.radius)
+                        .finish()
+                }
+            }
+            /// The initial procedural scene emitted once on load: raw meshes, their instances, and lights.
+            #[derive(Clone)]
+            pub struct Scene {
+                pub meshes: _rt::Vec<MeshData>,
+                pub instances: _rt::Vec<Instance>,
+                pub lights: _rt::Vec<Light>,
+            }
+            impl ::core::fmt::Debug for Scene {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Scene")
+                        .field("meshes", &self.meshes)
+                        .field("instances", &self.instances)
+                        .field("lights", &self.lights)
+                        .finish()
+                }
+            }
+            /// What the runtime plugin senses about the player on each tick or interaction.
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct PlayerState {
+                pub feet: Point,
+                pub eye: Point,
+                pub look: Point,
+                pub velocity: Point,
+                pub size: f32,
+                pub grounded: bool,
+                pub holding_use: bool,
+                /// Dynamic instance id under the crosshair within reach, or 0 if none.
+                pub target: u32,
+                /// Where the player's look ray aims, in area metres.
+                pub aim: Point,
+                /// Seconds elapsed since the area loaded.
+                pub time: f32,
+            }
+            impl ::core::fmt::Debug for PlayerState {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("PlayerState")
+                        .field("feet", &self.feet)
+                        .field("eye", &self.eye)
+                        .field("look", &self.look)
+                        .field("velocity", &self.velocity)
+                        .field("size", &self.size)
+                        .field("grounded", &self.grounded)
+                        .field("holding-use", &self.holding_use)
+                        .field("target", &self.target)
+                        .field("aim", &self.aim)
+                        .field("time", &self.time)
+                        .finish()
+                }
+            }
+            /// Orthogonal physical & world verbs a WASM plugin may request (validated & clamped by engine).
+            #[derive(Clone)]
+            pub enum Command {
+                /// Move, rotate, or scale a dynamic instance (`id > 0`).
+                SetTransform(Instance),
+                /// Show or hide a dynamic instance (`id > 0`).
+                SetVisible((u32, bool)),
+                /// Toggle collision on a dynamic instance (`id > 0`).
+                SetSolid((u32, bool)),
+                /// Apply a bounded velocity impulse (m/s) to the player.
+                ApplyImpulse(Point),
+                /// Add or update a dynamic point light (intensity <= 0 removes/disables it).
+                SetLight(Light),
+                /// Show a short message on the player's HUD.
+                Say(_rt::String),
+            }
+            impl ::core::fmt::Debug for Command {
                 fn fmt(
                     &self,
                     f: &mut ::core::fmt::Formatter<'_>,
                 ) -> ::core::fmt::Result {
                     match self {
-                        PropKind::Capsule => f.debug_tuple("PropKind::Capsule").finish(),
-                        PropKind::Ellipsoid => {
-                            f.debug_tuple("PropKind::Ellipsoid").finish()
+                        Command::SetTransform(e) => {
+                            f.debug_tuple("Command::SetTransform").field(e).finish()
                         }
-                        PropKind::Cylinder => {
-                            f.debug_tuple("PropKind::Cylinder").finish()
+                        Command::SetVisible(e) => {
+                            f.debug_tuple("Command::SetVisible").field(e).finish()
                         }
-                        PropKind::Cone => f.debug_tuple("PropKind::Cone").finish(),
+                        Command::SetSolid(e) => {
+                            f.debug_tuple("Command::SetSolid").field(e).finish()
+                        }
+                        Command::ApplyImpulse(e) => {
+                            f.debug_tuple("Command::ApplyImpulse").field(e).finish()
+                        }
+                        Command::SetLight(e) => {
+                            f.debug_tuple("Command::SetLight").field(e).finish()
+                        }
+                        Command::Say(e) => {
+                            f.debug_tuple("Command::Say").field(e).finish()
+                        }
                     }
-                }
-            }
-            impl PropKind {
-                #[doc(hidden)]
-                pub unsafe fn _lift(val: u8) -> PropKind {
-                    if !cfg!(debug_assertions) {
-                        return unsafe { ::core::mem::transmute(val) };
-                    }
-                    match val {
-                        0 => PropKind::Capsule,
-                        1 => PropKind::Ellipsoid,
-                        2 => PropKind::Cylinder,
-                        3 => PropKind::Cone,
-                        _ => panic!("invalid enum discriminant"),
-                    }
-                }
-            }
-            /// A smooth prop emitted once by the area and rendered natively on the GPU without voxel
-            /// aliasing or LOD morphing:
-            /// - capsule: segment from `a` to `b`, radius `r`
-            /// - ellipsoid: centre `a`, half-sizes `b`, turned by `yaw` (radians)
-            /// - cylinder: centre `a`, radius `b.x`, half-height `b.y`, optional notch angle `yaw` when `r > 0`
-            /// - cone: foot `a`, height `b.y` (negative points down), base radius `r`
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            pub struct Prop {
-                pub kind: PropKind,
-                pub material: Material,
-                pub a: Point,
-                pub b: Point,
-                pub r: f32,
-                pub yaw: f32,
-            }
-            impl ::core::fmt::Debug for Prop {
-                fn fmt(
-                    &self,
-                    f: &mut ::core::fmt::Formatter<'_>,
-                ) -> ::core::fmt::Result {
-                    f.debug_struct("Prop")
-                        .field("kind", &self.kind)
-                        .field("material", &self.material)
-                        .field("a", &self.a)
-                        .field("b", &self.b)
-                        .field("r", &self.r)
-                        .field("yaw", &self.yaw)
-                        .finish()
                 }
             }
         }
@@ -716,6 +1530,76 @@ mod _rt {
             alloc::dealloc(ptr, layout);
         }
     }
+    pub fn as_i32<T: AsI32>(t: T) -> i32 {
+        t.as_i32()
+    }
+    pub trait AsI32 {
+        fn as_i32(self) -> i32;
+    }
+    impl<'a, T: Copy + AsI32> AsI32 for &'a T {
+        fn as_i32(self) -> i32 {
+            (*self).as_i32()
+        }
+    }
+    impl AsI32 for i32 {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for u32 {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for i16 {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for u16 {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for i8 {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for u8 {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for char {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    impl AsI32 for usize {
+        #[inline]
+        fn as_i32(self) -> i32 {
+            self as i32
+        }
+    }
+    pub unsafe fn bool_lift(val: u8) -> bool {
+        if cfg!(debug_assertions) {
+            match val {
+                0 => false,
+                1 => true,
+                _ => panic!("invalid bool discriminant"),
+            }
+        } else {
+            val != 0
+        }
+    }
     extern crate alloc as alloc_crate;
 }
 /// Generates `#[unsafe(no_mangle)]` functions to export the specified type as
@@ -747,27 +1631,39 @@ macro_rules! __export_region_impl {
         "wasm32")] #[unsafe (link_section =
         "component-type:wit-bindgen:0.63.0:plateau:region@0.1.0:region:imports and exports")]
         #[doc(hidden)] #[allow(clippy::octal_escapes)] pub static
-        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 810] = *
+        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 1310] = *
         b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xad\x05\x01A\x02\x01\
-A\x15\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B\x17\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05\
-grass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\
-\x03\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\
-\x04tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\
-\x02at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\
-\x04\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\
-\x04\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\
-\x04\0\x0bdescription\x03\0\x11\x01m\x04\x07capsule\x09ellipsoid\x08cylinder\x04\
-cone\x04\0\x09prop-kind\x03\0\x13\x01r\x06\x04kind\x14\x08material\x03\x01a\x01\x01\
-b\x01\x01rv\x03yawv\x04\0\x04prop\x03\0\x15\x03\0\x1aplateau:region/types@0.1.0\x05\
-\x01\x02\x03\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\
-\0\x06answer\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\
-\x02\x03\0\x01\x04prop\x03\0\x04prop\x03\0\x08\x01p\x03\x01p\x05\x01@\x02\x06poi\
-nts\x0a\x04sizev\0\x0b\x04\0\x06sample\x01\x0c\x01@\0\0\x07\x04\0\x08describe\x01\
-\x0d\x01p\x09\x01@\0\0\x0e\x04\0\x05props\x01\x0f\x04\0\x1bplateau:region/region\
-@0.1.0\x04\0\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09producers\x01\x0cprocessed-by\
-\x02\x0dwit-component\x070.262.0\x10wit-bindgen-rust\x060.63.0";
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xa1\x09\x01A\x02\x01\
+A\x1d\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
+\0\x01B'\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
+rass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\x03\
+\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04\
+tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\x02\
+at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\x04\
+\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\x04\
+\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\x04\
+\0\x0bdescription\x03\0\x11\x01r\x06\x03pos\x01\x06normal\x01\x08material\x03\x06\
+tint-r}\x06tint-g}\x06tint-b}\x04\0\x06vertex\x03\0\x13\x01p\x14\x01py\x01r\x02\x08\
+vertices\x15\x07indices\x16\x04\0\x09mesh-data\x03\0\x17\x01r\x09\x02idy\x04mesh\
+y\x03pos\x01\x05rot-xv\x05rot-yv\x05rot-zv\x05rot-wv\x05scale\x01\x05solid\x7f\x04\
+\0\x08instance\x03\0\x19\x01r\x07\x02idy\x03pos\x01\x01rv\x01gv\x01bv\x09intensi\
+tyv\x06radiusv\x04\0\x05light\x03\0\x1b\x01p\x18\x01p\x1a\x01p\x1c\x01r\x03\x06m\
+eshes\x1d\x09instances\x1e\x06lights\x1f\x04\0\x05scene\x03\0\x20\x01r\x0a\x04fe\
+et\x01\x03eye\x01\x04look\x01\x08velocity\x01\x04sizev\x08grounded\x7f\x0bholdin\
+g-use\x7f\x06targety\x03aim\x01\x04timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\
+\x7f\x01q\x06\x0dset-transform\x01\x1a\0\x0bset-visible\x01$\0\x09set-solid\x01$\
+\0\x0dapply-impulse\x01\x01\0\x09set-light\x01\x1c\0\x03say\x01s\0\x04\0\x07comm\
+and\x03\0%\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\
+\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\
+\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05\
+scene\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\
+\x03\0\x01\x07command\x03\0\x07command\x03\0\x0c\x01p\x03\x01p\x05\x01@\x02\x06p\
+oints\x0e\x04sizev\0\x0f\x04\0\x06sample\x01\x10\x01@\0\0\x07\x04\0\x08describe\x01\
+\x11\x01@\0\0\x09\x04\0\x05scene\x01\x12\x01p\x0d\x01@\x02\x02dtv\x06player\x0b\0\
+\x13\x04\0\x04tick\x01\x14\x01@\x01\x06player\x0b\0\x13\x04\0\x08interact\x01\x15\
+\x04\0\x1bplateau:region/region@0.1.0\x04\0\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09\
+producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.262.0\x10wit-bindgen-rus\
+t\x060.63.0";
         };
     };
 }
@@ -780,25 +1676,35 @@ pub use __export_region_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 802] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x85\x05\x01A\x02\x01\
-A\x0c\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B\x17\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05\
-grass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\
-\x03\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\
-\x04tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\
-\x02at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\
-\x04\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\
-\x04\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\
-\x04\0\x0bdescription\x03\0\x11\x01m\x04\x07capsule\x09ellipsoid\x08cylinder\x04\
-cone\x04\0\x09prop-kind\x03\0\x13\x01r\x06\x04kind\x14\x08material\x03\x01a\x01\x01\
-b\x01\x01rv\x03yawv\x04\0\x04prop\x03\0\x15\x03\0\x1aplateau:region/types@0.1.0\x05\
-\x01\x02\x03\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\
-\0\x06answer\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\
-\x02\x03\0\x01\x04prop\x03\0\x04prop\x03\0\x08\x04\0;plateau:region/region-with-\
-all-of-its-exports-removed@0.1.0\x04\0\x0b,\x01\0&region-with-all-of-its-exports\
--removed\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.2\
-62.0\x10wit-bindgen-rust\x060.63.0";
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1250] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xc5\x08\x01A\x02\x01\
+A\x10\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
+\0\x01B'\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
+rass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\x03\
+\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04\
+tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\x02\
+at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\x04\
+\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\x04\
+\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\x04\
+\0\x0bdescription\x03\0\x11\x01r\x06\x03pos\x01\x06normal\x01\x08material\x03\x06\
+tint-r}\x06tint-g}\x06tint-b}\x04\0\x06vertex\x03\0\x13\x01p\x14\x01py\x01r\x02\x08\
+vertices\x15\x07indices\x16\x04\0\x09mesh-data\x03\0\x17\x01r\x09\x02idy\x04mesh\
+y\x03pos\x01\x05rot-xv\x05rot-yv\x05rot-zv\x05rot-wv\x05scale\x01\x05solid\x7f\x04\
+\0\x08instance\x03\0\x19\x01r\x07\x02idy\x03pos\x01\x01rv\x01gv\x01bv\x09intensi\
+tyv\x06radiusv\x04\0\x05light\x03\0\x1b\x01p\x18\x01p\x1a\x01p\x1c\x01r\x03\x06m\
+eshes\x1d\x09instances\x1e\x06lights\x1f\x04\0\x05scene\x03\0\x20\x01r\x0a\x04fe\
+et\x01\x03eye\x01\x04look\x01\x08velocity\x01\x04sizev\x08grounded\x7f\x0bholdin\
+g-use\x7f\x06targety\x03aim\x01\x04timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\
+\x7f\x01q\x06\x0dset-transform\x01\x1a\0\x0bset-visible\x01$\0\x09set-solid\x01$\
+\0\x0dapply-impulse\x01\x01\0\x09set-light\x01\x1c\0\x03say\x01s\0\x04\0\x07comm\
+and\x03\0%\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\
+\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\
+\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05\
+scene\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\
+\x03\0\x01\x07command\x03\0\x07command\x03\0\x0c\x04\0;plateau:region/region-wit\
+h-all-of-its-exports-removed@0.1.0\x04\0\x0b,\x01\0&region-with-all-of-its-expor\
+ts-removed\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070\
+.262.0\x10wit-bindgen-rust\x060.63.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {
