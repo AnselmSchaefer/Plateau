@@ -638,3 +638,48 @@ fn tiny_cave_breaching_gentle_pond_sketched_shoreline_fills_with_water() {
         assert!(a.distance < 0.0, "tiny cave sample {idx} should be submerged water: {a:?}");
     }
 }
+
+#[test]
+fn distinct_water_elevations_do_not_merge_or_lift_main_pond() {
+    // Regression test: carving inside an elevated pool (like the tiny grotto pool at y = -0.252
+    // in `pond-sketched`, ~10 cm higher than the main pond) must NOT cause a subsequent person-scale
+    // expansion of the main pond to merge into the elevated pool and lift the pond water up!
+    let mut base = garden(7);
+    let mut edits = EditLog::new();
+    let mut water = WaterLog::new();
+
+    // Seed an elevated tiny pool WaterBody ~9 cm higher than the garden pond (-0.30).
+    water
+        .push_body(WaterBody {
+            id: 1,
+            level: -0.21,
+            seed_point: [10.0, -0.21, 10.0],
+            basins: vec![WaterBasin { shape: Shape::Sphere { radius: 0.05 }, center: [10.0, -0.22, 10.0], pad: 0.01 }],
+            author: None,
+        })
+        .unwrap();
+
+    // Now expand the main garden pond (y = -0.30) at person scale!
+    let breach = Edit::carve(Shape::Sphere { radius: 1.5 }, [29.4, -0.45, 36.0], 0.35 * 1.5, None, SIZES[1].1);
+    let wb = water.expand_from_carve(&mut base, &edits, &breach, None).unwrap();
+    assert!(wb.is_some());
+    edits.push(breach).unwrap();
+
+    assert_eq!(water.bodies().len(), 2, "distinct water elevations must remain separate WaterBodies");
+    assert!((water.bodies()[0].level - (-0.21)).abs() < 0.001);
+    assert!(
+        (water.bodies()[1].level - (-0.30)).abs() < 0.002,
+        "main pond expansion must stay at -0.30, not lift to -0.21 (got {})",
+        water.bodies()[1].level
+    );
+
+    // At y = -0.25 (5 cm above the main pond, below the elevated pool), the expanded pond must be AIR!
+    let mut composed = Composed::new(
+        garden(7),
+        Arc::new(ComposedLog::new_with_water(Arc::new(edits), Vec::new(), Arc::new(water), 2)),
+    );
+    let mut ans = Vec::new();
+    composed.sample(&[[29.4, -0.25, 36.0], [29.4, -0.35, 36.0]], SIZES[1].1, &mut ans).unwrap();
+    assert!(ans[0].distance > 0.04, "water must NOT lift above -0.30 at main pond: {:?}", ans[0]);
+    assert!(ans[1].distance < -0.03 && ans[1].material == Material::Water, "water must fill below -0.30: {:?}", ans[1]);
+}

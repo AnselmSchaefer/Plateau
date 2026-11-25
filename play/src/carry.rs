@@ -14,6 +14,7 @@
 use bevy::prelude::*;
 use plateau_engine::compose::{PlacementTransform, euler_quat, quat_normalize, quat_rotate};
 use plateau_engine::cut::{ObjectPhysics, placement_pos_for_aim};
+use plateau_engine::physics::BuoyancyState;
 
 use crate::surface::SurfaceMaterial;
 
@@ -89,14 +90,23 @@ impl FallingElement {
     }
 }
 
+/// Cached Archimedes buoyancy result for an idling/bobbing floating element so stationary boats
+/// make zero WASM `sample()` calls per frame until world revision, rider weight, or XZ changes.
+#[derive(Clone, Copy, Debug)]
+pub struct CachedBuoyancy {
+    pub state: BuoyancyState,
+    pub world_rev: u64,
+    pub rider_kg: f32,
+}
+
 /// Runtime resource holding the currently carried item (if any), active topple animations,
 /// floating/sinking water-tracked elements, and active boat/raft piloting state.
 #[derive(Resource, Default)]
 pub struct CarryState {
     pub held: Option<CarriedItem>,
     pub falling: Vec<FallingElement>,
-    /// Placed element IDs currently floating in water (bobbing & pilotable).
-    pub floating: std::collections::HashSet<u32>,
+    /// Placed element IDs currently floating in water with cached buoyancy state.
+    pub floating: std::collections::HashMap<u32, CachedBuoyancy>,
     /// Placed element ID currently being paddled/steered by the player (`F` while aboard).
     pub piloting: Option<u32>,
     /// Elapsed simulation time for smooth deterministic water bobbing.

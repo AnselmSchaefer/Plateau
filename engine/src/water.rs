@@ -397,8 +397,11 @@ impl WaterLog {
             }
         }
 
-        // Merge into an existing WaterBody at matching level (within 0.15 m) or create a new one.
-        let body_idx = self.bodies.iter().position(|b| (b.level - level).abs() <= 0.15);
+        // Merge into an existing WaterBody only if it has the exact same hydrostatic level
+        // (within 5 mm; bisection is sub-0.02 mm accurate), so distinct pools at different
+        // elevations (e.g. a tiny grotto pool 9.8 cm above the main pond!) never merge or lift
+        // one water body to another's height!
+        let body_idx = self.bodies.iter().position(|b| (b.level - level).abs() <= 0.005);
         let target_idx = match body_idx {
             Some(i) => i,
             None => {

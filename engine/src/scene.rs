@@ -30,13 +30,25 @@ pub fn is_area_owner(owner: u32) -> bool {
     owner == BASE_OWNER || owner >= AREA_OWNER_BASE
 }
 
-/// Precomputed local AABB and triangle data for one mesh, for fast collision and raycasting.
+/// Compact AABB BVH node over `MeshBounds::tris` for O(log N) triangle distance queries.
+#[derive(Clone, Debug)]
+struct BvhNode {
+    lo: [f32; 3],
+    hi: [f32; 3],
+    /// Leaf: `count > 0` indexes `tris[first..first + count]`; Branch: `count == 0`, children are
+    /// `first` (left) and `first + 1` (right).
+    first: u32,
+    count: u32,
+}
+
+/// Precomputed local AABB, triangle data, and AABB BVH for one mesh, for fast collision & raycasting.
 #[derive(Clone, Debug)]
 struct MeshBounds {
     lo: [f32; 3],
     hi: [f32; 3],
-    /// Triangles as `(a, b, c, material)`.
+    /// Triangles as `(a, b, c, material)`, reordered in BVH leaf order.
     tris: Vec<([f32; 3], [f32; 3], [f32; 3], Material)>,
+    bvh: Vec<BvhNode>,
 }
 
 impl MeshBounds {
@@ -60,8 +72,114 @@ impl MeshBounds {
             let vc = &m.vertices[t[2] as usize];
             tris.push((va.pos, vb.pos, vc.pos, va.material));
         }
-        MeshBounds { lo, hi, tris }
+        let mut bvh = Vec::new();
+        if !tris.is_empty() {
+            let n = tris.len();
+            bvh.reserve(n);
+            bvh.push(BvhNode { lo, hi, first: 0, count: 0 });
+            build_bvh(&mut tris, &mut bvh, 0, 0, n);
+        }
+        MeshBounds { lo, hi, tris, bvh }
     }
+
+    /// Returns nearest `(local_dist, material)` strictly less than `best_local`, pruned by BVH.
+    fn nearest_local(&self, p: [f32; 3], mut best_local: f32) -> Option<(f32, Material)> {
+        if self.bvh.is_empty() {
+            return None;
+        }
+        let mut hit: Option<(f32, Material)> = None;
+        let mut stack = [0usize; 64];
+        let mut sp = 0usize;
+        let root_d = aabb_distance(p, self.bvh[0].lo, self.bvh[0].hi);
+        if root_d >= best_local {
+            return None;
+        }
+        stack[sp] = 0;
+        sp += 1;
+        while sp > 0 {
+            sp -= 1;
+            let node = &self.bvh[stack[sp]];
+            if aabb_distance(p, node.lo, node.hi) >= best_local {
+                continue;
+            }
+            if node.count > 0 {
+                let start = node.first as usize;
+                let end = start + node.count as usize;
+                for &(ta, tb, tc, mat) in &self.tris[start..end] {
+                    let d = point_triangle_distance(p, ta, tb, tc);
+                    if d < best_local {
+                        best_local = d;
+                        hit = Some((d, mat));
+                    }
+                }
+            } else {
+                let left = node.first as usize;
+                let right = left + 1;
+                let dl = aabb_distance(p, self.bvh[left].lo, self.bvh[left].hi);
+                let dr = aabb_distance(p, self.bvh[right].lo, self.bvh[right].hi);
+                // Push farther child first so nearer child is explored first, shrinking `best_local`.
+                if dl <= dr {
+                    if dr < best_local && sp < stack.len() {
+                        stack[sp] = right;
+                        sp += 1;
+                    }
+                    if dl < best_local && sp < stack.len() {
+                        stack[sp] = left;
+                        sp += 1;
+                    }
+                } else {
+                    if dl < best_local && sp < stack.len() {
+                        stack[sp] = left;
+                        sp += 1;
+                    }
+                    if dr < best_local && sp < stack.len() {
+                        stack[sp] = right;
+                        sp += 1;
+                    }
+                }
+            }
+        }
+        hit
+    }
+}
+
+fn build_bvh(tris: &mut [([f32; 3], [f32; 3], [f32; 3], Material)], nodes: &mut Vec<BvhNode>, node_idx: usize, start: usize, end: usize) {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for &(a, b, c, _) in &tris[start..end] {
+        for p in [a, b, c] {
+            for ax in 0..3 {
+                lo[ax] = lo[ax].min(p[ax]);
+                hi[ax] = hi[ax].max(p[ax]);
+            }
+        }
+    }
+    let count = end - start;
+    if count <= 6 {
+        nodes[node_idx] = BvhNode { lo, hi, first: start as u32, count: count as u32 };
+        return;
+    }
+    let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let axis = if ext[0] >= ext[1] && ext[0] >= ext[2] {
+        0
+    } else if ext[1] >= ext[2] {
+        1
+    } else {
+        2
+    };
+    let mid = start + count / 2;
+    let slice = &mut tris[start..end];
+    slice.select_nth_unstable_by(mid - start, |x, y| {
+        let cx = x.0[axis] + x.1[axis] + x.2[axis];
+        let cy = y.0[axis] + y.1[axis] + y.2[axis];
+        cx.total_cmp(&cy)
+    });
+    let left_idx = nodes.len();
+    nodes.push(BvhNode { lo: [0.0; 3], hi: [0.0; 3], first: 0, count: 0 });
+    nodes.push(BvhNode { lo: [0.0; 3], hi: [0.0; 3], first: 0, count: 0 });
+    nodes[node_idx] = BvhNode { lo, hi, first: left_idx as u32, count: 0 };
+    build_bvh(tris, nodes, left_idx, start, mid);
+    build_bvh(tris, nodes, left_idx + 1, mid, end);
 }
 
 /// Live state of one placed instance (static or dynamic), stored in world coordinates.
@@ -243,6 +361,56 @@ impl SceneWorld {
         best_owner.map(|o| (o, best_t))
     }
 
+    /// Updates instance transforms & AABBs for an existing `owner` layer in-place without
+    /// rebuilding `MeshBounds` or BVHs (used every frame for smooth bobbing, sailing, & toppling).
+    pub fn relocate_layer_fast(&mut self, owner: u32, local_scene: &Scene, transform: PlacementTransform, skip_solid: bool) -> bool {
+        let Some(bounds) = self.bounds.get(&owner) else {
+            return false;
+        };
+        let mut solid_static = Vec::new();
+        let mut placed_static = Vec::new();
+        for &raw in &local_scene.instances {
+            if skip_solid && raw.solid {
+                continue;
+            }
+            let Some(b) = bounds.get(raw.mesh as usize) else { continue };
+            if b.tris.is_empty() {
+                continue;
+            }
+            let inst = transform.transform_instance(raw);
+            let live = LiveInstance::new(owner, inst, b);
+            if inst.id > 0 {
+                if let Some(existing) = self.dynamic.get_mut(&(owner, inst.id)) {
+                    existing.instance = inst;
+                    existing.recompute_aabb(b);
+                } else {
+                    self.dynamic.insert((owner, inst.id), live);
+                }
+            } else if inst.solid {
+                solid_static.push(live);
+            } else if !is_area_owner(owner) {
+                placed_static.push(live);
+            }
+        }
+        for &raw in &local_scene.lights {
+            let l = transform.transform_light(raw);
+            if l.id > 0 && l.intensity > 0.0 && self.lights.contains_key(&(owner, l.id)) {
+                self.lights.insert((owner, l.id), l);
+            }
+        }
+        if solid_static.is_empty() {
+            self.solid_static.remove(&owner);
+        } else {
+            self.solid_static.insert(owner, solid_static);
+        }
+        if placed_static.is_empty() {
+            self.placed_static.remove(&owner);
+        } else {
+            self.placed_static.insert(owner, placed_static);
+        }
+        true
+    }
+
     /// Removes every mesh, static/dynamic instance, and light owned by `owner`.
     pub fn remove_layer(&mut self, owner: u32) {
         self.bounds.remove(&owner);
@@ -340,8 +508,8 @@ impl SceneWorld {
                 continue;
             };
             let local = world_to_local(p, &live.instance);
-            for &(ta, tb, tc, mat) in &b.tris {
-                let d_local = point_triangle_distance(local, ta, tb, tc);
+            let max_local = d_best / live.min_scale.max(1e-5);
+            if let Some((d_local, mat)) = b.nearest_local(local, max_local) {
                 let d_world = d_local * live.min_scale;
                 if d_world < d_best {
                     d_best = d_world;
@@ -513,7 +681,7 @@ impl<R: Region + ?Sized> Region for Combined<'_, R> {
             } else if ans.material == Material::Water {
                 // Solid procedural geometry (boat hulls, floating logs, submerged piers, sunken
                 // stone) displaces liquid water so wading players stand cleanly on submerged decks.
-                let reach = (size * 0.25).max(0.08);
+                let reach = (size * 0.08).max(0.03);
                 if let Some(hit) = self.world.distance_to_solids(p, reach) {
                     *ans = hit;
                 }

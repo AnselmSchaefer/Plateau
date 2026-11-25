@@ -869,6 +869,26 @@ impl ElementRuntime {
         Some(transform_scene(&l.local_scene, tf))
     }
 
+    /// Fast in-place transform update for bobbing, sailing, or falling un-held elements: updates
+    /// `SceneWorld` instance transforms & AABBs directly while reusing existing `MeshBounds`/BVHs
+    /// (zero triangle-BVH rebuilds, zero `ObjectPhysics` recomputation when scale is unchanged).
+    pub fn relocate_fast(&mut self, id: u32, tf: PlacementTransform, world: &mut SceneWorld) -> bool {
+        let Some(l) = self.live.iter_mut().find(|l| l.placed.id == id) else {
+            return false;
+        };
+        let scale_changed = (l.placed.scale - tf.scale).abs() > 1e-6;
+        l.placed.set_transform(tf);
+        let tf = l.placed.transform();
+        if scale_changed {
+            l.physics = ObjectPhysics::compute(&l.local_scene, l.placed.scale);
+        }
+        if !l.held {
+            world.relocate_layer_fast(id, &l.local_scene, tf, l.skip_solid())
+        } else {
+            true
+        }
+    }
+
     /// Marks a live element as carried in-hand (`held = true`, removing its solid collision from
     /// `SceneWorld` and pausing its `tick`/`interact`) or sets it back down into the world
     /// (`held = false`, restoring solid collision and returning its world `Scene`).

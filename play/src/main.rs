@@ -28,7 +28,7 @@ use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
-use carry::{CarriedItem, CarryAssets, CarryGhost, CarryState, FallingElement, HeldVisual};
+use carry::{CachedBuoyancy, CarriedItem, CarryAssets, CarryGhost, CarryState, FallingElement, HeldVisual};
 use chunks::{Chunks, Invalidate};
 use place::{ElementGhost, PlaceMode, PreviewAssets, WorldAction};
 use plateau_engine::atlas::{Atlas, CompiledAtlas, Side, TileSpec};
@@ -451,14 +451,15 @@ impl EditCtx<'_, '_> {
             return None;
         }
         let old_tf = pl.transform();
+        let world_rev = (self.sculpt.edits.revision() << 32) ^ self.sculpt.water.revision();
         let buoy = compute_buoyancy(&phys, old_tf, &mut self.physics.0, extra_load_kg).ok()?;
         match buoy {
             BuoyancyState::Floating { target_y, .. } => {
-                self.carry.floating.insert(id);
+                self.carry.floating.insert(id, CachedBuoyancy { state: buoy, world_rev, rider_kg: extra_load_kg });
                 let mut tf = old_tf;
                 tf.pos[1] = target_y;
                 if (tf.pos[1] - old_tf.pos[1]).abs() > 1e-4 {
-                    self.relocate_placed(id, tf, None);
+                    self.relocate_placed_fast(id, tf);
                 }
             }
             BuoyancyState::Sinking { target_y, .. } => {
@@ -469,7 +470,7 @@ impl EditCtx<'_, '_> {
                 let mut tf = old_tf;
                 tf.pos[1] = target_y;
                 if (tf.pos[1] - old_tf.pos[1]).abs() > 1e-4 {
-                    self.relocate_placed(id, tf, None);
+                    self.relocate_placed_fast(id, tf);
                 }
             }
             BuoyancyState::Dry { .. } => {
@@ -491,11 +492,30 @@ impl EditCtx<'_, '_> {
         }
     }
 
+    /// Zero-allocation in-place relocation for bobbing, sailing, or falling un-promoted `Scene`
+    /// elements: reuses existing GPU vertex buffers & `SceneWorld` triangle BVHs!
+    fn relocate_placed_fast(&mut self, id: u32, tf: PlacementTransform) -> bool {
+        let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        let old_tf = self.place.placed[pos].transform();
+        self.place.placed[pos].set_transform(tf);
+        if self.elements.0.relocate_fast(id, tf, &mut self.live.world) {
+            self.visuals.set_layer_reloc(id, old_tf, tf);
+            true
+        } else {
+            self.relocate_placed(id, tf, None)
+        }
+    }
+
     /// Updates passive bobbing, rider weight draft, and active WASD boat/raft paddling each frame.
+    /// Uses `CachedBuoyancy` + `relocate_placed_fast` so idle floating boats make **zero** WASM
+    /// `sample()` calls and **zero** GPU mesh re-uploads per frame!
     fn tick_buoyancy(&mut self, dt: f32, forward_in: f32, turn_in: f32, player: &mut Player) {
         self.carry.float_time += dt;
         let standing_id = self.live.world.standing_on_placed(player.body.feet, player.body.size);
         let rider_kg = player_mass_kg(player.body.size);
+        let world_rev = (self.sculpt.edits.revision() << 32) ^ self.sculpt.water.revision();
 
         // 1. Active piloting (`F` while standing on a floating boat/log).
         if let Some(boat_id) = self.carry.piloting {
@@ -506,20 +526,34 @@ impl EditCtx<'_, '_> {
                 let boat_scale = old_tf.scale.max(0.01);
                 let speed = forward_in * (2.8 * boat_scale);
                 let turn_rate = turn_in * 1.65;
-                if let Ok((new_tf, buoy)) = step_floating_move(
-                    &phys,
-                    old_tf,
-                    speed,
-                    turn_rate,
-                    dt,
-                    &mut self.physics.0,
-                    rider_kg,
-                    self.carry.float_time,
-                ) {
+                let moving = speed.abs() > 1e-4 || turn_rate.abs() > 1e-4;
+                let cached = self.carry.floating.get(&boat_id).copied();
+                let cache_valid = !moving
+                    && cached.is_some_and(|c| c.world_rev == world_rev && (c.rider_kg - rider_kg).abs() <= 1e-2);
+                let stepped = if cache_valid {
+                    let buoy = cached.unwrap().state;
+                    let mut next_tf = old_tf;
+                    if let BuoyancyState::Floating { target_y, bob_amplitude, .. } = buoy {
+                        next_tf.pos[1] = target_y + (self.carry.float_time * 2.2).sin() * bob_amplitude;
+                    }
+                    Ok((next_tf, buoy))
+                } else {
+                    step_floating_move(
+                        &phys,
+                        old_tf,
+                        speed,
+                        turn_rate,
+                        dt,
+                        &mut self.physics.0,
+                        rider_kg,
+                        self.carry.float_time,
+                    )
+                };
+                if let Ok((new_tf, buoy)) = stepped {
                     if let BuoyancyState::Sinking { .. } = buoy {
                         self.carry.piloting = None;
                         self.carry.floating.remove(&boat_id);
-                        self.relocate_placed(boat_id, new_tf, None);
+                        self.relocate_placed_fast(boat_id, new_tf);
                         let name = self
                             .place
                             .catalog
@@ -528,11 +562,11 @@ impl EditCtx<'_, '_> {
                         player.say(format!("too heavy — {name} is sinking!"));
                         return;
                     }
+                    self.carry.floating.insert(boat_id, CachedBuoyancy { state: buoy, world_rev, rider_kg });
                     let dyaw = turn_rate * dt;
                     let dx = (new_tf.pos[0] - old_tf.pos[0]) as f64;
                     let dy = (new_tf.pos[1] - old_tf.pos[1]) as f64;
                     let dz = (new_tf.pos[2] - old_tf.pos[2]) as f64;
-                    // Rotate rider offset around the boat's yaw pivot so turning carries the rider cleanly.
                     let rx = player.body.feet[0] - old_tf.pos[0] as f64;
                     let rz = player.body.feet[2] - old_tf.pos[2] as f64;
                     let (s, c) = (dyaw as f64).sin_cos();
@@ -542,15 +576,18 @@ impl EditCtx<'_, '_> {
                     player.body.feet[1] += dy;
                     player.body.feet[2] = old_tf.pos[2] as f64 + nrz + dz;
                     player.body.yaw += dyaw;
-                    self.relocate_placed(boat_id, new_tf, None);
+                    self.relocate_placed_fast(boat_id, new_tf);
+                    if moving {
+                        self.sculpt.dirty = true;
+                    }
                 }
             } else {
                 self.carry.piloting = None;
             }
         }
 
-        // 2. Gentle bobbing & rider-weight draft for un-piloted floating objects.
-        let mut active_ids: Vec<u32> = self.carry.floating.iter().copied().collect();
+        // 2. Gentle bobbing & rider-weight draft for un-piloted floating objects (zero WASM calls when cached!).
+        let mut active_ids: Vec<u32> = self.carry.floating.keys().copied().collect();
         if let Some(sid) = standing_id
             && !active_ids.contains(&sid)
         {
@@ -578,10 +615,14 @@ impl EditCtx<'_, '_> {
             }
             let old_tf = self.place.placed[pos].transform();
             let load = if standing_id == Some(id) { rider_kg } else { 0.0 };
-            if let Ok(buoy) = compute_buoyancy(&phys, old_tf, &mut self.physics.0, load) {
+            let buoy = match self.carry.floating.get(&id).copied() {
+                Some(c) if c.world_rev == world_rev && (c.rider_kg - load).abs() <= 1e-2 => Some(c.state),
+                _ => compute_buoyancy(&phys, old_tf, &mut self.physics.0, load).ok(),
+            };
+            if let Some(buoy) = buoy {
                 match buoy {
                     BuoyancyState::Floating { target_y, bob_amplitude, .. } => {
-                        self.carry.floating.insert(id);
+                        self.carry.floating.insert(id, CachedBuoyancy { state: buoy, world_rev, rider_kg: load });
                         let phase = self.carry.float_time * 2.2 + id as f32 * 1.13;
                         let desired_y = target_y + phase.sin() * bob_amplitude;
                         let next_y = old_tf.pos[1] + (desired_y - old_tf.pos[1]) * (dt * 6.0).min(1.0);
@@ -589,7 +630,7 @@ impl EditCtx<'_, '_> {
                             let mut tf = old_tf;
                             tf.pos[1] = next_y;
                             let dy = (next_y - old_tf.pos[1]) as f64;
-                            self.relocate_placed(id, tf, None);
+                            self.relocate_placed_fast(id, tf);
                             if standing_id == Some(id) {
                                 player.body.feet[1] += dy;
                             }
@@ -601,7 +642,7 @@ impl EditCtx<'_, '_> {
                             let mut tf = old_tf;
                             tf.pos[1] = next_y;
                             let dy = (next_y - old_tf.pos[1]) as f64;
-                            self.relocate_placed(id, tf, None);
+                            self.relocate_placed_fast(id, tf);
                             if standing_id == Some(id) {
                                 player.body.feet[1] += dy;
                             }
@@ -741,9 +782,11 @@ impl EditCtx<'_, '_> {
             self.carry.falling.remove(idx);
         }
         for (id, tf, finished) in updates {
-            self.relocate_placed(id, tf, if finished { Some(&mut *player) } else { None });
             if finished {
+                self.relocate_placed(id, tf, Some(&mut *player));
                 let _ = self.settle_buoyancy_for(id, 0.0);
+            } else {
+                self.relocate_placed_fast(id, tf);
             }
         }
     }
@@ -769,7 +812,7 @@ impl EditCtx<'_, '_> {
         let mut names = Vec::new();
         for id in candidates {
             // Never accidentally voxelize a floating boat/raft when sculpting nearby terrain!
-            if self.carry.floating.contains(&id) && aimed_owner != Some(id) {
+            if self.carry.floating.contains_key(&id) && aimed_owner != Some(id) {
                 continue;
             }
             let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else { continue };
@@ -990,7 +1033,7 @@ fn look_and_ask(
             ctx.carry.piloting = None;
             player.say("released helm");
         } else if let Some(boat_id) = ctx.live.world.standing_on_placed(player.body.feet, player.body.size)
-            && ctx.carry.floating.contains(&boat_id)
+            && ctx.carry.floating.contains_key(&boat_id)
         {
             ctx.sculpt.active = false;
             ctx.sculpt.aim = None;
@@ -1320,7 +1363,7 @@ fn look_and_ask(
                 };
                 match ctx.spawn_placed(pl.clone(), &mut player) {
                     Ok(name) => {
-                        let floating = ctx.carry.floating.contains(&id);
+                        let floating = ctx.carry.floating.contains_key(&id);
                         ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
                         ctx.place.redo_stack.clear();
                         if floating {
@@ -2058,10 +2101,9 @@ fn draw(
     mut physics: NonSendMut<Physics>,
     mut transforms: Placed,
     mut static_q: Query<
-        &mut Transform,
+        (&scene::StaticSceneMesh, &mut Transform),
         (
             With<scene::SceneNode>,
-            With<scene::StaticSceneMesh>,
             Without<scene::DynamicInstance>,
             Without<scene::SceneLight>,
             Without<Camera3d>,

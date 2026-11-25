@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use plateau_engine::compose::PlacementTransform;
 use plateau_engine::picture::colour;
 use plateau_engine::scene::{SceneWorld, is_area_owner};
 use plateau_engine::{Light, Material, MeshData, Scene};
@@ -25,7 +26,9 @@ use crate::surface::{SurfaceMaterial, properties};
 pub struct SceneNode;
 
 #[derive(Component)]
-pub struct StaticSceneMesh;
+pub struct StaticSceneMesh {
+    pub owner: u32,
+}
 
 #[derive(Component)]
 pub struct DynamicInstance {
@@ -45,8 +48,19 @@ pub struct SceneVisuals {
     layer_meshes: HashMap<u32, Vec<Option<Handle<Mesh>>>>,
     layer_entities: HashMap<u32, Vec<Entity>>,
     layer_triangles: HashMap<u32, usize>,
+    /// Optional rigid relocation `(baked_tf, current_tf)` for placed static layers so bobbing,
+    /// sailing, and toppling move the existing GPU mesh in-place with zero mesh re-uploads!
+    layer_reloc: HashMap<u32, (PlacementTransform, PlacementTransform)>,
     light_entities: HashMap<(u32, u32), Entity>,
     pub triangles: usize,
+}
+
+impl SceneVisuals {
+    /// Moves an already-spawned static layer from its baked `spawn_tf` to `cur_tf` on the GPU
+    /// without despawning entities or re-uploading vertex buffers.
+    pub fn set_layer_reloc(&mut self, owner: u32, spawn_tf: PlacementTransform, cur_tf: PlacementTransform) {
+        self.layer_reloc.entry(owner).and_modify(|e| e.1 = cur_tf).or_insert((spawn_tf, cur_tf));
+    }
 }
 
 fn vertex_color(mat: Material, tint: [u8; 3]) -> [f32; 4] {
@@ -164,6 +178,7 @@ pub fn spawn_areas(
         layer_meshes: HashMap::new(),
         layer_entities: HashMap::new(),
         layer_triangles: HashMap::new(),
+        layer_reloc: HashMap::new(),
         light_entities: HashMap::new(),
         triangles: 0,
     };
@@ -210,7 +225,7 @@ pub fn spawn_layer_filtered(
                 Transform::default(),
                 Visibility::Visible,
                 SceneNode,
-                StaticSceneMesh,
+                StaticSceneMesh { owner },
             ))
             .id();
         entities.push(entity);
@@ -262,6 +277,7 @@ pub fn despawn_layer(commands: &mut Commands, visuals: &mut SceneVisuals, owner:
         }
     }
     visuals.layer_meshes.remove(&owner);
+    visuals.layer_reloc.remove(&owner);
     if let Some(tris) = visuals.layer_triangles.remove(&owner) {
         visuals.triangles = visuals.triangles.saturating_sub(tris);
     }
@@ -290,8 +306,8 @@ pub fn sync(
     eye: [f64; 3],
     scale: f64,
     static_q: &mut Query<
-        &mut Transform,
-        (With<SceneNode>, With<StaticSceneMesh>, Without<DynamicInstance>, Without<SceneLight>, Without<Camera3d>, Without<crate::Sun>),
+        (&StaticSceneMesh, &mut Transform),
+        (With<SceneNode>, Without<DynamicInstance>, Without<SceneLight>, Without<Camera3d>, Without<crate::Sun>),
     >,
     dynamic_q: &mut Query<
         (&DynamicInstance, &mut Transform, &mut Visibility, &mut Mesh3d),
@@ -303,9 +319,31 @@ pub fn sync(
     >,
 ) {
     let s = scale as f32;
-    for mut tf in static_q.iter_mut() {
-        tf.translation = Vec3::new((-eye[0] * scale) as f32, (-eye[1] * scale) as f32, (-eye[2] * scale) as f32);
-        tf.scale = Vec3::splat(s);
+    for (sm, mut tf) in static_q.iter_mut() {
+        if let Some(&(baked, cur)) = visuals.layer_reloc.get(&sm.owner) {
+            let norm_q = |a: [f32; 4]| {
+                let q = Quat::from_array(a);
+                if q.length_squared() > 1e-6 { q.normalize() } else { Quat::IDENTITY }
+            };
+            let q0 = norm_q(baked.rot);
+            let q1 = norm_q(cur.rot);
+            let dq = q1 * q0.inverse();
+            let dq = if dq.length_squared() > 1e-6 { dq.normalize() } else { Quat::IDENTITY };
+            let ds = cur.scale / baked.scale.max(1e-5);
+            let p0 = Vec3::from_array(baked.pos);
+            let rot_p0 = dq * (p0 * ds);
+            tf.rotation = dq;
+            tf.scale = Vec3::splat(ds * s);
+            tf.translation = Vec3::new(
+                ((cur.pos[0] as f64 - eye[0] - rot_p0.x as f64) * scale) as f32,
+                ((cur.pos[1] as f64 - eye[1] - rot_p0.y as f64) * scale) as f32,
+                ((cur.pos[2] as f64 - eye[2] - rot_p0.z as f64) * scale) as f32,
+            );
+        } else {
+            tf.rotation = Quat::IDENTITY;
+            tf.translation = Vec3::new((-eye[0] * scale) as f32, (-eye[1] * scale) as f32, (-eye[2] * scale) as f32);
+            tf.scale = Vec3::splat(s);
+        }
     }
 
     for (di, mut tf, mut vis, mut mesh3d) in dynamic_q.iter_mut() {
