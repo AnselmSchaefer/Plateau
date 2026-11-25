@@ -31,9 +31,9 @@ use plateau_engine::compose::PlacedElement;
 use plateau_engine::edit::{WorldSave, surface_normal};
 use plateau_engine::sketch::Sketch;
 use plateau_engine::{Limits, OpenWorld, SiteContext, SiteProbe, Size, Wasm, laws};
-use plateau_make::claude::Claude;
+use plateau_make::claude::{Agy, Claude};
 use plateau_make::{
-    Builder, FitLaw, Made, Neighbor, SEED, Settings, Site, element_guide, element_guide_at, guide, judge_element, judge_element_at,
+    Builder, FitLaw, Made, Neighbor, SEED, Settings, Site, Writer, element_guide, element_guide_at, guide, judge_element, judge_element_at,
     judge_with_neighbors, load_neighbors, log, make_element, make_element_at, make_with_neighbors, pictures, save_neighbors, seam_pictures, site_pictures,
 };
 
@@ -109,13 +109,13 @@ fn main() {
             });
             let sketch = flag(&args, "--sketch").map(PathBuf::from);
             let beside = flags(&args, "--beside");
-            parse_beside(&repo, &beside).and_then(|neighbors| one(&repo, &name, &words, sketch.as_deref(), &neighbors).map(|made| println!("{}", log(&words, &made))))
+            parse_beside(&repo, &beside).and_then(|neighbors| one(&repo, &name, &words, sketch.as_deref(), &neighbors, &args).map(|made| println!("{}", log(&words, &made))))
         }
         Some("test-set") => {
             let named: Vec<&str> = args[1..].iter().map(String::as_str).collect();
             let mut failed = None;
             for (name, words) in TEST_SET.iter().filter(|(n, _)| named.is_empty() || named.contains(n)) {
-                match one(&repo, name, words, None, &[]) {
+                match one(&repo, name, words, None, &[], &args) {
                     Ok(made) => {
                         let row = format!(
                             "| {name} | {words} | {} | {} | {} | {} | {:.0} min | ${:.2} |\n",
@@ -163,7 +163,7 @@ fn main() {
                 words.split_whitespace().take(4).collect::<Vec<_>>().join("-").to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "")
             });
             site_of(&repo, &args).and_then(|site| {
-                let made = one_element(&repo, &name, &words, site.as_ref())?;
+                let made = one_element(&repo, &name, &words, site.as_ref(), &args)?;
                 println!("{}", log(&words, &made));
                 match &site {
                     Some(site) if made.kept.is_some() => place(&args, &name, site),
@@ -205,8 +205,20 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+fn make_writer(guide_file: &Path, dir: &Path, args: &[String]) -> Result<Box<dyn Writer>, String> {
+    let kind = flag(args, "--writer")
+        .or_else(|| std::env::var("PLATEAU_WRITER").ok())
+        .unwrap_or_else(|| "claude".to_string());
+    let model = flag(args, "--model").or_else(|| std::env::var("PLATEAU_MODEL").ok());
+    match kind.as_str() {
+        "claude" => Ok(Box::new(Claude::new(guide_file, dir))),
+        "agy" => Ok(Box::new(Agy::new(guide_file, dir, model.as_deref()))),
+        other => Err(format!("unknown --writer `{other}` (expected `claude` or `agy`)")),
+    }
+}
+
 /// One area made, into `made/NAME/`, the folder emptied first.
-fn one(repo: &Path, name: &str, words: &str, sketch: Option<&Path>, neighbors: &[Neighbor]) -> Result<Made, String> {
+fn one(repo: &Path, name: &str, words: &str, sketch: Option<&Path>, neighbors: &[Neighbor], args: &[String]) -> Result<Made, String> {
     let dir = repo.join("made").join(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -217,8 +229,8 @@ fn one(repo: &Path, name: &str, words: &str, sketch: Option<&Path>, neighbors: &
     let builder = Builder::new(repo, &work)?;
     let guide_file = work.join("guide.md");
     std::fs::write(&guide_file, guide(repo)?).map_err(|e| e.to_string())?;
-    let mut claude = Claude::new(&guide_file, &dir);
-    let made = make_with_neighbors(&mut claude, &builder, words, sketch, neighbors, &dir, Settings::default(), &mut |line| eprintln!("{name}: {line}"))?;
+    let mut writer = make_writer(&guide_file, &dir, args)?;
+    let made = make_with_neighbors(&mut *writer, &builder, words, sketch, neighbors, &dir, Settings::default(), &mut |line| eprintln!("{name}: {line}"))?;
     std::fs::write(dir.join("log.md"), log(words, &made)).map_err(|e| e.to_string())?;
     // The build's own copies are not kept; the rounds and the kept version are.
     std::fs::remove_dir_all(dir.join("build")).ok();
@@ -357,7 +369,7 @@ fn place(args: &[String], name: &str, site: &Site) -> Result<(), String> {
 }
 
 /// One standalone composable element made into `made/elements/NAME/`, for `site` if there is one.
-fn one_element(repo: &Path, name: &str, words: &str, site: Option<&Site>) -> Result<Made, String> {
+fn one_element(repo: &Path, name: &str, words: &str, site: Option<&Site>, args: &[String]) -> Result<Made, String> {
     let dir = repo.join("made/elements").join(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -368,7 +380,7 @@ fn one_element(repo: &Path, name: &str, words: &str, site: Option<&Site>) -> Res
     let guide_file = work.join("element-guide.md");
     let guide = if site.is_some() { element_guide_at(repo)? } else { element_guide(repo)? };
     std::fs::write(&guide_file, guide).map_err(|e| e.to_string())?;
-    let mut claude = Claude::new(&guide_file, &dir);
+    let mut writer = make_writer(&guide_file, &dir, args)?;
     let mut say = |line: &str| eprintln!("{name}: {line}");
     let made = match site {
         Some(site) => {
@@ -376,9 +388,9 @@ fn one_element(repo: &Path, name: &str, words: &str, site: Option<&Site>) -> Res
             if let Some(world) = &site.world {
                 world.save.save(&dir.join("element.plateau")).map_err(|e| format!("{e:#}"))?;
             }
-            make_element_at(&mut claude, &builder, words, site, &dir, Settings::default(), &mut say)?
+            make_element_at(&mut *writer, &builder, words, site, &dir, Settings::default(), &mut say)?
         }
-        None => make_element(&mut claude, &builder, words, &dir, Settings::default(), &mut say)?,
+        None => make_element(&mut *writer, &builder, words, &dir, Settings::default(), &mut say)?,
     };
     std::fs::write(dir.join("log.md"), log(words, &made)).map_err(|e| e.to_string())?;
     std::fs::remove_dir_all(dir.join("build")).ok();

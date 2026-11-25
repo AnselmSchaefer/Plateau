@@ -16,6 +16,8 @@ use crate::{Reply, Writer};
 /// The model and effort of POC_PLAN.md, "Decisions".
 pub const MODEL: &str = "claude-opus-5-5";
 pub const EFFORT: &str = "medium";
+/// Default Antigravity CLI (`agy`) model when `--writer agy` is selected.
+pub const AGY_MODEL: &str = "gemini-4-neon-high";
 
 pub struct Claude {
     /// The file the guide is in (`crate::guide`), given as the instructions every time.
@@ -98,4 +100,85 @@ fn uuid() -> String {
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+/// Antigravity CLI (`agy -p`) writer, e.g. with `gemini-4-neon-high`.
+/// Uses one persistent conversation per area/element via `--conversation <id>` and injects the
+/// guide at the top of the first round's prompt.
+pub struct Agy {
+    guide: PathBuf,
+    folder: PathBuf,
+    model: String,
+    conversation: Option<String>,
+}
+
+impl Agy {
+    pub fn new(guide: &Path, folder: &Path, model: Option<&str>) -> Agy {
+        Agy {
+            guide: guide.to_path_buf(),
+            folder: folder.to_path_buf(),
+            model: model.unwrap_or(AGY_MODEL).to_string(),
+            conversation: None,
+        }
+    }
+}
+
+impl Writer for Agy {
+    fn write(&mut self, prompt: &str, pictures: Option<&Path>) -> Result<Reply, String> {
+        let started = Instant::now();
+        let full_prompt = if self.conversation.is_none() {
+            let guide = std::fs::read_to_string(&self.guide).map_err(|e| format!("{}: {e}", self.guide.display()))?;
+            format!(
+                "{guide}\n\n---\n\nImportant: Do NOT write/edit files or run shell commands. You may ONLY read the reference image files listed below to inspect the site/renders. Answer with the complete Rust source in a single ```rust block.\n\n{prompt}"
+            )
+        } else {
+            format!(
+                "Important: Do NOT write/edit files or run shell commands (you may read any listed PNG pictures). Answer with the complete Rust source in a single ```rust block.\n\n{prompt}"
+            )
+        };
+        let mut c = Command::new("agy");
+        c.current_dir(&self.folder)
+            .stdin(Stdio::null())
+            .arg("-p")
+            .arg(&full_prompt)
+            .args([
+                "--model",
+                &self.model,
+                "--output-format",
+                "json",
+                "--disable-slash-commands",
+                "--dangerously-skip-permissions",
+            ]);
+        if let Some(id) = &self.conversation {
+            c.args(["--conversation", id]);
+        }
+        if let Some(folder) = pictures {
+            c.arg("--add-dir").arg(folder);
+        }
+        let out = c.output().map_err(|e| format!("agy: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // `agy` may print a status line before the final JSON line; parse the whole output or its last JSON line.
+        let json: serde_json::Value = serde_json::from_str(stdout.trim())
+            .or_else(|_| {
+                stdout
+                    .lines()
+                    .rev()
+                    .find(|l| l.trim_start().starts_with('{'))
+                    .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no JSON line")))
+                    .and_then(serde_json::from_str)
+            })
+            .map_err(|e| format!("agy answered what is not JSON ({e}): {stdout}{}", String::from_utf8_lossy(&out.stderr)))?;
+        if let Some(cid) = json["conversation_id"].as_str() {
+            self.conversation = Some(cid.to_string());
+        }
+        let status = json["status"].as_str().unwrap_or("");
+        if !out.status.success() || (!status.is_empty() && status != "SUCCESS") {
+            return Err(format!("agy failed: {json}"));
+        }
+        Ok(Reply {
+            text: json["response"].as_str().unwrap_or_default().to_string(),
+            cost: 0.0,
+            seconds: started.elapsed().as_secs_f64(),
+        })
+    }
 }

@@ -114,12 +114,14 @@ fn trunk_home() -> World {
 #[test]
 fn a_tinys_tunnel_into_a_trunk_is_measured_the_same_from_wherever_it_is_pointed_at() {
     let mut area = trunk_home();
-    // Straight in at its end; slantwise at its side wall; down at its lip; at the bark beside it.
+    // Straight in at its end; slantwise at its side wall; down at its lip; at the bark beside it;
+    // and obliquely on the flared inner mouth lip where the surface normal points sideways (-X).
     let looks = [
         ([32.0, 0.505, SOUTH + 0.06], [0.0, 0.0, -1.0]),
         ([32.02, 0.505, SOUTH + 0.06], [-0.3, -0.03, -0.95]),
         ([32.0, 0.53, SOUTH + 0.08], [0.0, -0.1, -1.0]),
         ([32.03, 0.50, SOUTH + 0.08], [-0.05, 0.0, -1.0]),
+        ([31.995, 0.50, SOUTH + 0.04], [0.38, 0.02, -0.92]),
     ];
     for (from, dir) in looks {
         let site = measured(&mut area, from, dir, TINY);

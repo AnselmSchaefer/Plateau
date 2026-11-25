@@ -430,7 +430,7 @@ impl Cavity {
 
     /// Whether it is gone into on foot (and not, as a hole in the ground, dropped into).
     pub fn upright(&self) -> bool {
-        abs(self.axis[1]) < 1e-4
+        abs(self.axis[1]) < 0.5
     }
 
     /// What its outline is most like, in words.
@@ -885,9 +885,15 @@ fn cavity(sight: &mut Sight, probe: &SiteProbe) -> Result<Option<Cavity>> {
     let mut inner = squared(sight, within, far)?;
     if abs(inner.axis[1]) < 0.5
         && let Some(level) = unit([inner.axis[0], 0.0, inner.axis[2]])
-        && let Some(ring) = sight.ring(inner.center, level, 24, far)?
     {
-        inner = ring;
+        let m = inner.mean();
+        for inset in [0.0f32, 0.25, 0.5, 0.9, 1.4] {
+            let p = add(inner.center, scale(level, -inset * m));
+            if let Some(ring) = sight.ring(p, level, 24, far)? {
+                inner = ring;
+                break;
+            }
+        }
     }
     let axis = inner.axis;
     let straight = outwards(sight, inner.center, axis, 0.06, 160, CONTOUR, far, false)?;
@@ -989,24 +995,38 @@ fn inside(sight: &mut Sight, probe: &SiteProbe) -> Result<Option<([f32; 3], [f32
             return Ok(Some((ring.center, ring.axis)));
         }
     }
-    // Pointed at the wall beside it: look over the surface round about, nearest first, for where a
-    // ray goes well past the surface.
-    let (right, up) = basis(normal);
-    for far in 1..=8 {
-        let reach = 0.25 * h * far as f32;
-        let over: Vec<[f32; 3]> = (0..16).map(|k| add(target, add(scale(spoke(right, up, k, 16), reach), scale(normal, 0.3 * h)))).collect();
-        let rays: Vec<Ray> = over.iter().map(|&from| Ray { from, along: scale(normal, -1.0), far: 1.1 * h }).collect();
-        let hits = sight.cast(&rays, false)?;
-        for (from, hit) in over.iter().zip(&hits) {
-            let t = hit.map_or(1.1 * h, |hit| hit.t);
-            if t < 0.6 * h {
-                continue;
-            }
-            let seed = add(*from, scale(normal, -(0.3 * h + 0.5 * (t - 0.3 * h))));
-            if let Some(ring) = sight.ring(seed, normal, 24, FAR * h)?
-                && ring.mean() >= 0.08 * h
-            {
-                return Ok(Some((seed, normal)));
+    // Pointed at the wall or flared lip beside it: look across the surface normal and (when aimed
+    // obliquely at a curved rim/bark lip) across the viewer's line of sight, nearest first, for
+    // where a ray goes well past the surface into an enclosed opening.
+    let mut faces: Vec<[f32; 3]> = vec![normal];
+    for cand in [back, back.and_then(|b| unit([b[0], 0.0, b[2]]))] {
+        if let Some(f) = cand
+            && faces.iter().all(|&prev| dot(prev, f) < 0.96)
+        {
+            faces.push(f);
+        }
+    }
+    for face in faces {
+        let (right, up) = basis(face);
+        for far in 1..=8 {
+            let reach = 0.25 * h * far as f32;
+            let over: Vec<[f32; 3]> = (0..16).map(|k| add(target, add(scale(spoke(right, up, k, 16), reach), scale(face, 0.3 * h)))).collect();
+            let ray_far = 1.6 * h;
+            let rays: Vec<Ray> = over.iter().map(|&from| Ray { from, along: scale(face, -1.0), far: ray_far }).collect();
+            let hits = sight.cast(&rays, false)?;
+            for (from, hit) in over.iter().zip(&hits) {
+                let t = hit.map_or(ray_far, |hit| hit.t);
+                if t < 0.6 * h {
+                    continue;
+                }
+                let seed = add(*from, scale(face, -(0.3 * h + 0.5 * (t - 0.3 * h))));
+                for axis in [Some(face), unit([face[0], 0.0, face[2]])].into_iter().flatten() {
+                    if let Some(ring) = sight.ring(seed, axis, 24, FAR * h)?
+                        && ring.mean() >= 0.08 * h
+                    {
+                        return Ok(Some((seed, axis)));
+                    }
+                }
             }
         }
     }
