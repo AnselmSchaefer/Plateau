@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use plateau_engine::atlas::{Atlas, CompiledAtlas};
 use plateau_engine::chunk::{self, Key, Made};
 use plateau_engine::compose::{Composed, ComposedLog, PlacementTransform};
 use plateau_engine::edit::Edit;
 use plateau_engine::picture::colour;
-use plateau_engine::{Compiled, ElementBounds, Wasm, rings};
+use plateau_engine::{ElementBounds, Wasm, rings};
 
 use crate::surface::{FADE_SECONDS, Materials, SurfaceMaterial, properties};
 
@@ -102,6 +103,7 @@ pub struct Chunks {
     /// Cached chunks invalidated by SDF edits/elements that need rebuilding to at least `min_revision`.
     /// Their old mesh stays visible until the rebuilt mesh arrives, preventing flicker.
     stale: HashMap<Key, u64>,
+    tiles: Vec<[i32; 2]>,
     rings: rings::Rings,
     wanted: HashSet<Key>,
     shown: HashSet<Key>,
@@ -113,7 +115,7 @@ pub struct Chunks {
 }
 
 impl Chunks {
-    pub fn new(compiled: Arc<Compiled>, seed: u64, composed: Arc<ComposedLog>, materials: Materials) -> Chunks {
+    pub fn new(atlas: Arc<CompiledAtlas>, composed: Arc<ComposedLog>, materials: Materials) -> Chunks {
         let queue = Arc::new(Queue {
             jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashMap::new(), composed, stop: false }),
             more: Condvar::new(),
@@ -121,15 +123,17 @@ impl Chunks {
         let (tell, done) = channel();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(2).max(1);
         for k in 0..threads {
-            let (queue, tell, compiled) = (queue.clone(), tell.clone(), compiled.clone());
-            std::thread::Builder::new().name(format!("chunks {k}")).spawn(move || work(&queue, &tell, &compiled, seed)).expect("a thread to make chunks");
+            let (queue, tell, atlas) = (queue.clone(), tell.clone(), atlas.clone());
+            std::thread::Builder::new().name(format!("chunks {k}")).spawn(move || work(&queue, &tell, &atlas)).expect("a thread to make chunks");
         }
+        let tiles = atlas.tile_coords();
         Chunks {
             queue,
             done: Mutex::new(done),
             known: HashMap::new(),
             stale: HashMap::new(),
-            rings: rings::Rings::default(),
+            rings: rings::Rings::with_tiles(tiles.clone()),
+            tiles,
             wanted: HashSet::new(),
             shown: HashSet::new(),
             fading_in: HashMap::new(),
@@ -293,7 +297,7 @@ impl Chunks {
             }
         }
         let prev_shown = std::mem::take(&mut self.shown);
-        let (shown, holes) = rings::shown(&wanted, &|k| self.known.contains_key(&k) && !fresh.contains(&k));
+        let (shown, holes) = rings::shown_over(&wanted, &self.tiles, &|k| self.known.contains_key(&k) && !fresh.contains(&k));
         self.shown = shown.into_iter().collect();
 
         let step = if FADE_SECONDS > 0.0 { dt / FADE_SECONDS } else { 1.0 };
@@ -406,8 +410,8 @@ impl Drop for Chunks {
     }
 }
 
-fn work(queue: &Queue, tell: &Sender<Done>, compiled: &Compiled, seed: u64) {
-    let mut composed: Option<Composed<Wasm, Arc<ComposedLog>>> = None;
+fn work(queue: &Queue, tell: &Sender<Done>, atlas: &CompiledAtlas) {
+    let mut composed: Option<Composed<Atlas<Wasm>, Arc<ComposedLog>>> = None;
     loop {
         let (key, log) = {
             let mut jobs = queue.jobs.lock().unwrap();
@@ -433,7 +437,7 @@ fn work(queue: &Queue, tell: &Sender<Done>, compiled: &Compiled, seed: u64) {
                 }
                 Ok(c)
             }
-            None => compiled.instantiate(seed).map(|a| composed.insert(Composed::new(a, log))),
+            None => atlas.instantiate().map(|a| composed.insert(Composed::new(a, log))),
         }
         .and_then(|c| chunk::make(c, key));
         if made.is_err() {

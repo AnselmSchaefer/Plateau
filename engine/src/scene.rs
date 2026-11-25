@@ -12,8 +12,23 @@ use std::collections::HashMap;
 use crate::compose::PlacementTransform;
 use crate::{Answer, Command, Description, ElementBounds, Instance, Light, Material, MeshData, Region, Result, Scene};
 
-/// Owner namespace reserved for the base area's own `Scene`. Placed elements use `id >= 1`.
+/// Owner namespace reserved for the base area's own `Scene` (tile 0). Placed elements use `1..AREA_OWNER_BASE`.
 pub const BASE_OWNER: u32 = 0;
+
+/// Owner namespace prefix reserved for additional base area tiles (`tile_idx >= 1`) in a multi-area `Atlas`.
+pub const AREA_OWNER_BASE: u32 = 0x8000_0000;
+
+/// Owner ID for area tile `index` (`0` → `BASE_OWNER`, `k >= 1` → `AREA_OWNER_BASE + k`).
+#[inline]
+pub fn tile_owner(index: usize) -> u32 {
+    if index == 0 { BASE_OWNER } else { AREA_OWNER_BASE + index as u32 }
+}
+
+/// Whether `owner` belongs to a base area tile rather than a player-placed standalone element.
+#[inline]
+pub fn is_area_owner(owner: u32) -> bool {
+    owner == BASE_OWNER || owner >= AREA_OWNER_BASE
+}
 
 /// Precomputed local AABB and triangle data for one mesh, for fast collision and raycasting.
 #[derive(Clone, Debug)]
@@ -154,7 +169,7 @@ impl SceneWorld {
                 self.dynamic.insert((owner, inst.id), live);
             } else if inst.solid {
                 solid_static.push(live);
-            } else if owner != BASE_OWNER {
+            } else if !is_area_owner(owner) {
                 placed_static.push(live);
             }
         }
@@ -176,12 +191,12 @@ impl SceneWorld {
         }
     }
 
-    /// Returns the `owner > 0` of any solid placed element whose world AABB overlaps `(lo, hi)`.
+    /// Returns the placed-element owner of any solid placed element whose world AABB overlaps `(lo, hi)`.
     pub fn solid_placed_overlapping(&self, lo: [f32; 3], hi: [f32; 3]) -> Vec<u32> {
         let mut owners = Vec::new();
         let overlaps = |a_lo: [f32; 3], a_hi: [f32; 3]| (0..3).all(|i| a_hi[i] >= lo[i] && a_lo[i] <= hi[i]);
         for (&owner, list) in &self.solid_static {
-            if owner == BASE_OWNER || owners.contains(&owner) {
+            if is_area_owner(owner) || owners.contains(&owner) {
                 continue;
             }
             if list.iter().any(|l| overlaps(l.world_lo, l.world_hi)) {
@@ -189,7 +204,7 @@ impl SceneWorld {
             }
         }
         for (&(owner, _), live) in &self.dynamic {
-            if owner == BASE_OWNER || !live.visible || !live.instance.solid || owners.contains(&owner) {
+            if is_area_owner(owner) || !live.visible || !live.instance.solid || owners.contains(&owner) {
                 continue;
             }
             if overlaps(live.world_lo, live.world_hi) {
@@ -200,13 +215,13 @@ impl SceneWorld {
         owners
     }
 
-    /// Raycasts against visible **solid** instances belonging to placed elements (`owner > 0`),
+    /// Raycasts against visible **solid** instances belonging to placed elements,
     /// returning `(placement_id, hit_t)` for lazy Scene→SDF sculpt targeting.
     pub fn raycast_solid_placed(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32)> {
         let mut best_t = max_dist;
         let mut best_owner = None;
         for (&owner, list) in &self.solid_static {
-            if owner == BASE_OWNER {
+            if is_area_owner(owner) {
                 continue;
             }
             for live in list {
@@ -217,7 +232,7 @@ impl SceneWorld {
             }
         }
         for (&(owner, _), live) in &self.dynamic {
-            if owner == BASE_OWNER || !live.visible || !live.instance.solid {
+            if is_area_owner(owner) || !live.visible || !live.instance.solid {
                 continue;
             }
             if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
@@ -370,13 +385,13 @@ impl SceneWorld {
         best_id.map(|id| (id, best_t))
     }
 
-    /// Raycasts against any visible static or dynamic instance belonging to a placed element
-    /// (`owner > 0`), returning `(placement_id, hit_t)` for interactive removal/selection.
+    /// Raycasts against any visible static or dynamic instance belonging to a placed element,
+    /// returning `(placement_id, hit_t)` for interactive removal/selection.
     pub fn raycast_placed_owner(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32)> {
         let mut best_t = max_dist;
         let mut best_owner = None;
         for (&owner, list) in self.solid_static.iter().chain(self.placed_static.iter()) {
-            if owner == BASE_OWNER {
+            if is_area_owner(owner) {
                 continue;
             }
             for live in list {
@@ -387,7 +402,7 @@ impl SceneWorld {
             }
         }
         for (&(owner, _), live) in &self.dynamic {
-            if owner == BASE_OWNER || !live.visible {
+            if is_area_owner(owner) || !live.visible {
                 continue;
             }
             if let Some(t) = ray_aabb(origin, dir, live.world_lo, live.world_hi, best_t) {
@@ -399,7 +414,7 @@ impl SceneWorld {
     }
 
     /// Exact ray-triangle hit against any visible static or dynamic instance belonging to a placed
-    /// element (`owner > 0`), returning `(placement_id, hit_t, hit_world_point)`.
+    /// element, returning `(placement_id, hit_t, hit_world_point)`.
     /// Prefers solid triangles when a solid hit exists at or near the ray, falling back to
     /// non-solid triangles so both cutting trunks and grabbing decorative items work cleanly.
     pub fn raycast_placed_surface(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32, [f32; 3])> {
@@ -436,7 +451,7 @@ impl SceneWorld {
         };
 
         for (&owner, list) in self.solid_static.iter().chain(self.placed_static.iter()) {
-            if owner == BASE_OWNER {
+            if is_area_owner(owner) {
                 continue;
             }
             for live in list {
@@ -444,7 +459,7 @@ impl SceneWorld {
             }
         }
         for (&(owner, _), live) in &self.dynamic {
-            if owner == BASE_OWNER || !live.visible {
+            if is_area_owner(owner) || !live.visible {
                 continue;
             }
             test_live(owner, live);

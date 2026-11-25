@@ -15,7 +15,9 @@
 //! | `surfaces_have_an_inside` | Wherever the distance comes to nought, something is solid right by it |
 //! | `sketch_materials` | Blue is water, grey is stone rock/cliff, brown is land (not water), within a tolerance |
 //! | `sketch_places` | Every orange mark is reached by the tiny alone, and every purple mark by giants alone |
+//! | `borders_match` | Ground height, water level, and surface material are continuous along a shared edge with a neighbouring area |
 
+use crate::atlas::{BorderSample, Side, sample_edge};
 use crate::chunk::{CELLS, Key};
 use crate::reach::{HIGHEST, LOWEST, Reach, Stand, World};
 use crate::sketch::{Pen, Sketch};
@@ -1016,4 +1018,197 @@ pub fn sketch_places(world: &mut World, all: &Reach, description: &Description, 
         }
     }
     Ok(Ok(()))
+}
+
+/// Maximum vertical ground height difference allowed along a shared edge between two areas (metres).
+pub const BORDER_HEIGHT_TOL: f32 = 0.15;
+/// Maximum vertical water level difference allowed where water crosses a shared edge (metres).
+pub const BORDER_WATER_TOL: f32 = 0.05;
+/// Horizontal tolerance along a shared edge for shoreline and material transitions (metres).
+pub const BORDER_EDGE_TOL: f32 = 1.5;
+/// Maximum discrepancy allowed between an area's own `describe().borders` and its sampled ground
+/// along a shared edge (metres; generous enough for natural terrain roughness `detail()`).
+pub const BORDER_DECLARED_TOL: f32 = 0.45;
+
+/// **Borders match** (POC_PLAN.md, step 9): `area`'s edge on `my_side` matches `neighbour`'s
+/// opposite edge in ground height (within `BORDER_HEIGHT_TOL`), water presence & level (within
+/// `BORDER_WATER_TOL` / `BORDER_EDGE_TOL`), and surface material (within `BORDER_EDGE_TOL`), and
+/// `area`'s declared `describe().borders` agrees with its actual edge.
+pub fn borders_match(area: &mut dyn Region, my_side: Side, neighbour: &mut dyn Region) -> Result<Verdict> {
+    const STEPS: usize = 128; // 0.5 m spacing along the 64 m shared edge
+    let my_desc = area.describe()?;
+    let nb_desc = neighbour.describe()?;
+    let mine = sample_edge(area, my_side, STEPS)?;
+    let theirs = sample_edge(neighbour, my_side.opposite(), STEPS)?;
+    Ok(check_border_samples(&my_desc, my_side, &mine, &nb_desc.name, &theirs))
+}
+
+fn check_border_samples(
+    my_desc: &Description,
+    my_side: Side,
+    mine: &[BorderSample],
+    neighbour_name: &str,
+    theirs: &[BorderSample],
+) -> Verdict {
+    let axis = my_side.along_axis();
+    let side_name = my_side.name();
+    let eq = my_side.equation();
+    let step_m = WIDTH / (mine.len().saturating_sub(1).max(1) as f32);
+    let edge_radius = (BORDER_EDGE_TOL / step_m).ceil() as isize;
+
+    // 1. Ground height continuity: solid ground (including underwater beds) matches within BORDER_HEIGHT_TOL.
+    let mut worst_h: Option<(f32, String)> = None;
+    let mut bad_h = 0usize;
+    for (a, b) in mine.iter().zip(theirs) {
+        let diff = (a.solid_y - b.solid_y).abs();
+        if diff > BORDER_HEIGHT_TOL {
+            bad_h += 1;
+            if worst_h.as_ref().is_none_or(|(w, _)| diff > *w) {
+                worst_h = Some((
+                    diff,
+                    format!(
+                        "at {axis} = {:.1} m, \"{neighbour_name}\"'s ground is at y = {:.2} m ({}), but this area's ground is at y = {:.2} m ({}) — \
+                         {} apart (at most {} allowed)",
+                        b.s,
+                        b.solid_y,
+                        b.solid_material.name(),
+                        a.solid_y,
+                        a.solid_material.name(),
+                        length(diff),
+                        length(BORDER_HEIGHT_TOL)
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some((_, why)) = worst_h {
+        return Err(format!(
+            "borders do not match along the {side_name} edge ({eq}): {why} ({bad_h} of {} edge samples differ). Match \"{neighbour_name}\"'s \
+             ground height table along `{eq}` (using `edge_height`) and blend smoothly into your interior over 4–8 m; keep walls, cliffs, or \
+             boulders clear of the seam.",
+            mine.len()
+        ));
+    }
+
+    // 2. Water continuity: where either side has water, the other must have water within
+    //    BORDER_EDGE_TOL along the edge, at a level within BORDER_WATER_TOL.
+    let mut worst_water: Option<(f32, String)> = None;
+    for (i, (a, b)) in mine.iter().zip(theirs).enumerate() {
+        let lo = (i as isize - edge_radius).max(0) as usize;
+        let hi = (i as isize + edge_radius).min(mine.len() as isize - 1) as usize;
+        if let Some(wb) = b.water {
+            let near_a = mine[lo..=hi].iter().filter_map(|s| s.water).min_by(|x, y| (x - wb).abs().total_cmp(&(y - wb).abs()));
+            match near_a {
+                None => {
+                    let score = 10.0 + (a.surface_y - wb).abs();
+                    if worst_water.as_ref().is_none_or(|(w, _)| score > *w) {
+                        worst_water = Some((
+                            score,
+                            format!(
+                                "at {axis} = {:.1} m, \"{neighbour_name}\" has water at y = {wb:.2} m, but this area has dry {} at y = {:.2} m \
+                                 (no water within {BORDER_EDGE_TOL:.1} m along the edge)",
+                                b.s,
+                                a.material.name(),
+                                a.surface_y
+                            ),
+                        ));
+                    }
+                }
+                Some(wa) if (wa - wb).abs() > BORDER_WATER_TOL => {
+                    let diff = (wa - wb).abs();
+                    if worst_water.as_ref().is_none_or(|(w, _)| diff > *w) {
+                        worst_water = Some((
+                            diff,
+                            format!(
+                                "at {axis} = {:.1} m, \"{neighbour_name}\" has water at y = {wb:.2} m, but this area's water is at y = {wa:.2} m — \
+                                 {} apart (at most {} allowed)",
+                                b.s,
+                                length(diff),
+                                length(BORDER_WATER_TOL)
+                            ),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(wa) = a.water {
+            let has_nb_water = theirs[lo..=hi].iter().any(|s| s.water.is_some());
+            if !has_nb_water {
+                let score = 10.0 + (b.surface_y - wa).abs();
+                if worst_water.as_ref().is_none_or(|(w, _)| score > *w) {
+                    worst_water = Some((
+                        score,
+                        format!(
+                            "at {axis} = {:.1} m, this area has water at y = {wa:.2} m, but \"{neighbour_name}\" has dry {} at y = {:.2} m \
+                             (no water within {BORDER_EDGE_TOL:.1} m along the edge)",
+                            a.s,
+                            b.material.name(),
+                            b.surface_y
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some((_, why)) = worst_water {
+        return Err(format!(
+            "borders do not match along the {side_name} edge ({eq}): {why}. Match \"{neighbour_name}\"'s water level (within {}) and shoreline \
+             along `{eq}`.",
+            length(BORDER_WATER_TOL)
+        ));
+    }
+
+    // 3. Surface material continuity on dry land (at least BORDER_EDGE_TOL from any water shoreline):
+    //    each dry station must match a material present on the neighbour within ±BORDER_EDGE_TOL.
+    let mut dry_total = 0usize;
+    let mut mat_misses: Vec<(usize, Material, Material)> = Vec::new();
+    for (i, (a, b)) in mine.iter().zip(theirs).enumerate() {
+        let lo = (i as isize - edge_radius).max(0) as usize;
+        let hi = (i as isize + edge_radius).min(mine.len() as isize - 1) as usize;
+        let near_water = mine[lo..=hi].iter().any(|s| s.water.is_some()) || theirs[lo..=hi].iter().any(|s| s.water.is_some());
+        if near_water {
+            continue;
+        }
+        dry_total += 1;
+        let matched = theirs[lo..=hi].iter().any(|s| s.material == a.material);
+        if !matched {
+            mat_misses.push((i, a.material, b.material));
+        }
+    }
+    let allowed_misses = (dry_total / 20).max(2); // allow up to ~5% scattered detail spots
+    if mat_misses.len() > allowed_misses {
+        let (first_i, got_m, want_m) = mat_misses[mat_misses.len() / 2];
+        let pct = (mat_misses.len() * 100) / dry_total.max(1);
+        return Err(format!(
+            "borders do not match along the {side_name} edge ({eq}): {pct}% of the dry edge has the wrong material (at {axis} = {:.1} m, \
+             \"{neighbour_name}\" has {}, but this area has {} with no {} within {BORDER_EDGE_TOL:.1} m). Match \"{neighbour_name}\"'s materials \
+             along `{eq}` and transition cleanly into your interior.",
+            mine[first_i].s,
+            want_m.name(),
+            got_m.name(),
+            got_m.name()
+        ));
+    }
+
+    // 4. Declared `describe().borders` sanity along the shared edge.
+    let decl = my_side.edge(&my_desc.borders);
+    let mut worst_decl: Option<(f32, f32, f32, f32)> = None;
+    for (m, &decl_y) in decl.ground.iter().enumerate() {
+        let idx = (m * (mine.len() - 1) / (decl.ground.len() - 1).max(1)).min(mine.len() - 1);
+        let actual_y = mine[idx].solid_y;
+        let diff = (decl_y - actual_y).abs();
+        if diff > BORDER_DECLARED_TOL && worst_decl.as_ref().is_none_or(|w| diff > w.0) {
+            worst_decl = Some((diff, m as f32, decl_y, actual_y));
+        }
+    }
+    if let Some((diff, s, decl_y, actual_y)) = worst_decl {
+        return Err(format!(
+            "declared {side_name} border disagrees with the area's surface: at {axis} = {s:.0} m, `describe().borders.{side_name}` says \
+             y = {decl_y:.2} m, but the surface is at y = {actual_y:.2} m ({} off). Return the real ground height from `describe().borders`.",
+            length(diff)
+        ));
+    }
+
+    Ok(())
 }

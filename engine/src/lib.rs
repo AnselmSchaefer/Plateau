@@ -9,6 +9,7 @@
 //! size can go (`reach`), pictures (`picture`), sketched maps (`sketch`), and the laws an area
 //! must keep (`laws`). The window is `play/`.
 
+pub mod atlas;
 pub mod body;
 pub mod check;
 pub mod chunk;
@@ -24,6 +25,7 @@ pub mod scene;
 pub mod sketch;
 pub mod wasm;
 
+pub use atlas::{Atlas, AtlasTile, BorderProfile, BorderSample, CompiledAtlas, SEAM_HALF, Side, TileSpec};
 pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, SdfSource};
 pub use cut::{CarryDecision, ClipPlane, ObjectPhysics};
 pub use edit::{Edit, EditLog, Edited, Op, Shape, WorldSave};

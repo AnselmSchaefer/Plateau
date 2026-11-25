@@ -18,9 +18,11 @@ pub mod claude;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 
-use plateau_engine::picture::{Camera, map, picture, plan, plans, tint, views};
+use plateau_engine::atlas::{BorderProfile, CompiledAtlas, Side, TileSpec};
+use plateau_engine::picture::{Camera, map, picture, plan, plans, seam_camera, seam_plan, tint, views};
 use plateau_engine::reach::World;
 use plateau_engine::sketch::Sketch;
 use plateau_engine::{Compiled, Description, Limits, PlayerState, Region, Size, Wasm, check, laws, points};
@@ -208,6 +210,68 @@ impl Judged {
     }
 }
 
+/// An existing neighbouring area bordering one side of the area being made or checked (Step 9).
+#[derive(Clone, Debug)]
+pub struct Neighbor {
+    /// Which side of the *new* area touches this neighbour (e.g. `Side::West` means this neighbour
+    /// lies to the west of the new area, so its east edge meets the new area's west edge).
+    pub side: Side,
+    pub path: PathBuf,
+    pub seed: u64,
+    pub module: Vec<u8>,
+    pub profile: BorderProfile,
+}
+
+impl Neighbor {
+    /// Loads a neighbour `.wasm` module, instantiates it with `seed`, and extracts the border
+    /// profile on the edge facing the new area (`side.opposite()`).
+    pub fn load(side: Side, path: PathBuf, seed: u64) -> Result<Neighbor, String> {
+        let module = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut wasm = Wasm::new(&module, seed, Limits::default()).map_err(|e| format!("{}: {e:#}", path.display()))?;
+        let profile = BorderProfile::extract(&mut wasm, side.opposite()).map_err(|e| format!("{}: {e:#}", path.display()))?;
+        Ok(Neighbor { side, path, seed, module, profile })
+    }
+}
+
+/// Saves neighbour references to `dir/neighbors.txt` so `plateau check` can re-verify `borders_match`.
+pub fn save_neighbors(dir: &Path, neighbors: &[Neighbor]) -> Result<(), String> {
+    if neighbors.is_empty() {
+        return Ok(());
+    }
+    let mut text = String::from("# Neighbouring areas for border continuity checks (side seed path)\n");
+    for n in neighbors {
+        text.push_str(&format!("{} {} {}\n", n.side.name(), n.seed, n.path.display()));
+    }
+    std::fs::write(dir.join("neighbors.txt"), text).map_err(|e| format!("neighbors.txt: {e}"))
+}
+
+/// Loads saved neighbour references from `dir/neighbors.txt` if present.
+pub fn load_neighbors(dir: &Path) -> Result<Vec<Neighbor>, String> {
+    let file = dir.join("neighbors.txt");
+    if !file.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, char::is_whitespace);
+        let side_s = parts.next().unwrap_or("");
+        let seed_s = parts.next().unwrap_or("");
+        let path_s = parts.next().unwrap_or("").trim();
+        let side = Side::from_name(side_s).ok_or_else(|| format!("{}:{}: unknown side `{side_s}`", file.display(), idx + 1))?;
+        let seed = seed_s.parse::<u64>().map_err(|e| format!("{}:{}: bad seed `{seed_s}`: {e}", file.display(), idx + 1))?;
+        if path_s.is_empty() {
+            return Err(format!("{}:{}: missing module path", file.display(), idx + 1));
+        }
+        out.push(Neighbor::load(side, PathBuf::from(path_s), seed)?);
+    }
+    Ok(out)
+}
+
 /// The module checked (`check::check`), made with `SEED`, and held to the laws: sizes agree,
 /// distances never too long, surfaces have an inside, gates are real, no traps, NaNs unseen, and
 /// (when `sketch` is given) the sketch's two laws (`sketch_materials`, `sketch_places`). ("The
@@ -215,6 +279,12 @@ impl Judged {
 /// that keep them.) A law that cannot be asked of it (the module traps, or runs out of fuel) is
 /// broken.
 pub fn judge(module: &[u8], sketch: Option<&Sketch>, settings: Settings) -> Judged {
+    judge_with_neighbors(module, sketch, &[], settings)
+}
+
+/// Same as [`judge`], additionally holding the area to `laws::borders_match` against every
+/// neighbouring area in `neighbors`.
+pub fn judge_with_neighbors(module: &[u8], sketch: Option<&Sketch>, neighbors: &[Neighbor], settings: Settings) -> Judged {
     let started = Instant::now();
     let mut judged = Judged::default();
     if let Err(why) = check::check(module) {
@@ -252,6 +322,15 @@ pub fn judge(module: &[u8], sketch: Option<&Sketch>, settings: Settings) -> Judg
     with!("surfaces have an inside", |a: &mut Wasm| laws::surfaces_have_an_inside(a, &d, 1, settings.rays));
     if let Some(s) = sketch {
         with!("sketch materials", |a: &mut Wasm| laws::sketch_materials(a, s));
+    }
+    for n in neighbors {
+        match Wasm::new(&n.module, n.seed, Limits::default()) {
+            Ok(mut nb) => {
+                let law_name = format!("borders match ({})", n.side.name());
+                with!(&law_name, |a: &mut Wasm| laws::borders_match(a, n.side, &mut nb));
+            }
+            Err(e) => judged.broken.push(("borders match".into(), format!("loading neighbour {}: {e:#}", n.path.display()))),
+        }
     }
     let mut world = World::new(&mut area, &d.places);
     match world.reach(&Size::ALL) {
@@ -506,6 +585,63 @@ pub fn pictures(module: &[u8], into: &Path, settings: Settings) -> Result<Vec<(S
     Ok(shown)
 }
 
+/// Renders stitched overhead (`seam-<side>.png`) and elevated perspective (`seam-view-<side>.png`)
+/// pictures across each shared border with `neighbors`, so Claude and humans can inspect how the
+/// two areas meet side by side.
+pub fn seam_pictures(module: &[u8], neighbors: &[Neighbor], into: &Path, settings: Settings) -> Result<Vec<(String, String)>, String> {
+    if neighbors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let e = |e: plateau_engine::Error| format!("{e:#}");
+    std::fs::create_dir_all(into).map_err(|e| e.to_string())?;
+    let mine = Arc::new(Compiled::new(module, Limits::default()).map_err(e)?);
+    let write = |name: &str, pixels: &[[u8; 3]], width: usize, height: usize| -> Result<String, String> {
+        let file = format!("{name}.png");
+        let w = std::io::BufWriter::new(std::fs::File::create(into.join(&file)).map_err(|e| e.to_string())?);
+        let mut encoder = png::Encoder::new(w, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.write_header().and_then(|mut h| h.write_image_data(pixels.as_flattened())).map_err(|e| e.to_string())?;
+        Ok(file)
+    };
+    let mut shown = Vec::new();
+    let side_px = settings.plan_width;
+    let (w, h) = (settings.view_width, settings.view_width * 9 / 16);
+    for n in neighbors {
+        let nb = Arc::new(Compiled::new(&n.module, Limits::default()).map_err(e)?);
+        let atlas = CompiledAtlas::new(vec![
+            TileSpec { at: [0, 0], seed: SEED, compiled: mine.clone() },
+            TileSpec { at: n.side.step(), seed: n.seed, compiled: nb },
+        ])
+        .map_err(e)?;
+        let make = || atlas.instantiate();
+        let p = seam_plan(n.side);
+        let pixels = plan(&make, &p, side_px).map_err(e)?;
+        let pname = format!("seam-{}", n.side.name());
+        shown.push((
+            write(&pname, &pixels, side_px, side_px)?,
+            format!(
+                "overhead view straddling the {} border ({}) where your area meets \"{}\"",
+                n.side.name(),
+                n.side.equation(),
+                n.profile.area_name
+            ),
+        ));
+        let cam = seam_camera(n.side);
+        let vpixels = picture(&make, &cam, w, h).map_err(e)?;
+        let vname = format!("seam-view-{}", n.side.name());
+        shown.push((
+            write(&vname, &vpixels, w, h)?,
+            format!(
+                "elevated perspective looking along the {} border ({}) where your area meets \"{}\"",
+                n.side.name(),
+                n.side.equation(),
+                n.profile.area_name
+            ),
+        ));
+    }
+    Ok(shown)
+}
+
 fn a_size(size: f32) -> &'static str {
     if size < 0.1 {
         "a tiny person"
@@ -562,7 +698,7 @@ fn laws_said(broken: &[(String, String)]) -> String {
 }
 
 /// What to say when it keeps every law: look at the pictures, then make it better.
-fn look_said(dir: &Path, shown: &[(String, String)], has_sketch: bool) -> String {
+fn look_said(dir: &Path, shown: &[(String, String)], has_sketch: bool, has_neighbors: bool) -> String {
     let list: String = shown.iter().map(|(file, what)| format!("- `{}`: {what}\n", dir.join(file).display())).collect();
     let sketch_note = if has_sketch {
         format!(
@@ -573,32 +709,47 @@ fn look_said(dir: &Path, shown: &[(String, String)], has_sketch: bool) -> String
     } else {
         String::new()
     };
+    let neighbor_note = if has_neighbors {
+        " Check the `seam-*.png` and `seam-view-*.png` pictures to verify the join with the neighbouring area looks completely natural and seamless."
+    } else {
+        ""
+    };
     format!(
         "It builds and keeps every law. These are pictures of it, as the engine draws it (read them with your Read tool; start with \
          `giant-over-the-area.png`, `plan.png`, `reach.png`, and each place's view and reach map):\n\n\
-         {list}\nLook at them as the one who asked for it would.{sketch_note} Does it look like what was asked? Is each size's world \
+         {list}\nLook at them as the one who asked for it would.{sketch_note}{neighbor_note} Does it look like what was asked? Is each size's world \
          worth walking: the tiny's, a person's, a giant's? Is anything missing, wrong, too plain, or broken up? Then answer with the \
          whole of `area.rs` again, made better, in one ```rust block, keeping every law. If it is already as good as you can make \
          it, answer with it unchanged."
     )
 }
 
-/// The first prompt, with or without a sketch map.
-fn first_prompt(words: &str, sketch: Option<(&Path, &Sketch)>) -> String {
-    match sketch {
-        None => format!("Make this area: {words}\n\nAnswer with the whole of `area.rs` in one ```rust block."),
-        Some((path, s)) => format!(
-            "Make this area: {words}\n\n\
-             A sketch map from above is at `{}` — read it with your Read tool before writing. North is at the top (z = 0), south at \
+/// The first prompt, with optional sketch map and/or neighbouring area borders.
+fn first_prompt(words: &str, sketch: Option<(&Path, &Sketch)>, neighbors: &[Neighbor]) -> String {
+    let mut prompt = format!("Make this area: {words}\n\n");
+    if let Some((path, s)) = sketch {
+        prompt.push_str(&format!(
+            "A sketch map from above is at `{}` — read it with your Read tool before writing. North is at the top (z = 0), south at \
              the bottom (z = 64), west on the left (x = 0), east on the right (x = 64). Below are the shapes the engine read from \
              the sketch in area metres:\n\n{}\
              Follow the sketch's layout and keep its two laws (materials within 3 m; orange places for the tiny only and purple \
-             places for giants only), while making the world natural, rich and finished at every size.\n\n\
-             Answer with the whole of `area.rs` in one ```rust block.",
+             places for giants only), while making the world natural, rich and finished at every size.\n\n",
             path.display(),
             s.describe()
-        ),
+        ));
     }
+    if !neighbors.is_empty() {
+        prompt.push_str(
+            "This area lies side by side with existing Plateau areas. Match every shared border below (ground height within 15 cm, \
+             water level within 5 cm, and surface material continuous) so players of every size (`tiny`, `person`, `giant`) can walk \
+             straight across with no visible or physical seam:\n\n",
+        );
+        for n in neighbors {
+            prompt.push_str(&n.profile.describe_for_prompt(n.side));
+        }
+    }
+    prompt.push_str("Answer with the whole of `area.rs` in one ```rust block.");
+    prompt
 }
 
 /// Makes an area of `words` (and an optional `sketch` PNG) with `writer`, in `dir`: each round's
@@ -614,9 +765,25 @@ pub fn make(
     settings: Settings,
     say: &mut dyn FnMut(&str),
 ) -> Result<Made, String> {
+    make_with_neighbors(writer, builder, words, sketch_path, &[], dir, settings, say)
+}
+
+/// Same as [`make`], additionally briefing Claude on `neighbors` and enforcing `laws::borders_match`.
+#[allow(clippy::too_many_arguments)]
+pub fn make_with_neighbors(
+    writer: &mut dyn Writer,
+    builder: &Builder,
+    words: &str,
+    sketch_path: Option<&Path>,
+    neighbors: &[Neighbor],
+    dir: &Path,
+    settings: Settings,
+    say: &mut dyn FnMut(&str),
+) -> Result<Made, String> {
     let started = Instant::now();
     let rounds_dir = dir.join("rounds");
     std::fs::create_dir_all(&rounds_dir).map_err(|e| e.to_string())?;
+    save_neighbors(dir, neighbors)?;
     let sketch_info: Option<(PathBuf, Sketch)> = match sketch_path {
         Some(path) => {
             let parsed = Sketch::open(path)?;
@@ -628,7 +795,7 @@ pub fn make(
     };
     let sketch = sketch_info.as_ref().map(|(_, s)| s);
     let mut made = Made { kept: None, rounds: Vec::new(), fixes: 0, looked: false, seconds: 0.0 };
-    let mut prompt = first_prompt(words, sketch_info.as_ref().map(|(p, s)| (p.as_path(), s)));
+    let mut prompt = first_prompt(words, sketch_info.as_ref().map(|(p, s)| (p.as_path(), s)), neighbors);
     let mut asked = "write";
     let mut pictures_for: Option<PathBuf> = sketch_info.as_ref().map(|_| dir.to_path_buf());
     loop {
@@ -662,7 +829,7 @@ pub fn make(
                 match builder.build(&source, &dir.join("build")) {
                     Err(words) => ("does not build".into(), Some(("compile", compiler_said(&words)))),
                     Ok(module) => {
-                        let judged = judge(&module, sketch, settings);
+                        let judged = judge_with_neighbors(&module, sketch, neighbors, settings);
                         if judged.kept() {
                             std::fs::write(dir.join("area.rs"), &source).map_err(|e| e.to_string())?;
                             std::fs::write(dir.join("area.wasm"), &module).map_err(|e| e.to_string())?;
@@ -671,12 +838,13 @@ pub fn make(
                                 ("keeps every law".into(), None)
                             } else {
                                 let pics = dir.join("pictures");
-                                let shown = pictures(&module, &pics, settings)?;
+                                let mut shown = pictures(&module, &pics, settings)?;
+                                shown.extend(seam_pictures(&module, neighbors, &pics, settings)?);
                                 if let Some((copied, _)) = &sketch_info {
                                     std::fs::copy(copied, pics.join("sketch.png")).ok();
                                 }
                                 pictures_for = Some(pics.clone());
-                                ("keeps every law".into(), Some(("look", look_said(&pics, &shown, sketch.is_some()))))
+                                ("keeps every law".into(), Some(("look", look_said(&pics, &shown, sketch.is_some(), !neighbors.is_empty()))))
                             }
                         } else {
                             let names: Vec<_> = judged.broken.iter().map(|b| b.0.clone()).collect();
@@ -702,6 +870,7 @@ pub fn make(
     if let Some(source) = &made.kept {
         let module = builder.build(source, &dir.join("build"))?;
         pictures(&module, &dir.join("pictures"), settings)?;
+        seam_pictures(&module, neighbors, &dir.join("pictures"), settings)?;
     }
     made.seconds = started.elapsed().as_secs_f64();
     Ok(made)

@@ -83,12 +83,25 @@ pub struct Rings {
     /// Each level's block on the next level's grid: low corner for horizontal axes (`x`, `z`, 6
     /// chunks wide = 3 parent chunks), middle for vertical (`y`, 4 chunks tall = 2 parent chunks).
     middles: HashMap<i32, [i32; 3]>,
+    /// Grid tiles `(gx, gz)` covered by the world; empty means the single default tile `[0, 0]`.
+    tiles: Vec<[i32; 2]>,
 }
 
+const SINGLE_TILE: [[i32; 2]; 1] = [[0, 0]];
+
 impl Rings {
+    /// Rings covering a multi-area atlas grid of 64 m tiles `(gx, gz)`.
+    pub fn with_tiles(tiles: Vec<[i32; 2]>) -> Rings {
+        Rings { middles: HashMap::new(), tiles }
+    }
+
+    /// The grid tiles this ring set covers (defaults to `&[[0, 0]]`).
+    pub fn tiles(&self) -> &[[i32; 2]] {
+        if self.tiles.is_empty() { &SINGLE_TILE } else { &self.tiles }
+    }
+
     /// Every chunk a viewer with their eye at `eye`, `size` tall, sees, finest first, each level's
-    /// block about the middle of their body: only chunks over the area (x and z from 0 to
-    /// `WIDTH`).
+    /// block about the middle of their body: only chunks over the world's tiles.
     pub fn wanted(&mut self, eye: [f64; 3], size: f32) -> Vec<Key> {
         self.wanted_looking(eye, [0.0, 0.0], size, COARSEST)
     }
@@ -128,6 +141,7 @@ impl Rings {
             blocks.push((level, at));
             outer = Some(at);
         }
+        let tiles = self.tiles();
         let mut keys = Vec::new();
         let mut inner: Option<[i32; 3]> = None;
         for &(level, b) in blocks.iter().rev() {
@@ -146,7 +160,7 @@ impl Rings {
                             continue;
                         }
                         let key = Key::new(level, at).capped(open);
-                        if over(key) {
+                        if over_tiles(key, tiles) {
                             keys.push(key);
                         }
                     }
@@ -158,16 +172,26 @@ impl Rings {
     }
 
     /// The space the chunks last wanted fill: the coarsest block, as its lowest and highest
-    /// corners (x and z cut to the area).
+    /// corners (x and z cut to the world's tiles' bounding extent).
     pub fn reach(&self) -> Option<([f64; 3], [f64; 3])> {
         let m = self.middles.get(&COARSEST)?;
         let side = 2f64.powi(COARSEST) * CELLS as f64;
         let mut lo = [(2 * m[0]) as f64 * side, (2 * m[1] - 2) as f64 * side, (2 * m[2]) as f64 * side];
         let mut hi = [(2 * m[0] + 6) as f64 * side, (2 * m[1] + 2) as f64 * side, (2 * m[2] + 6) as f64 * side];
-        for a in [0, 2] {
-            lo[a] = lo[a].max(0.0);
-            hi[a] = hi[a].min(WIDTH as f64);
+        let tiles = self.tiles();
+        let (mut min_x, mut max_x, mut min_z, mut max_z) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for &[gx, gz] in tiles {
+            let tx = gx as f64 * WIDTH as f64;
+            let tz = gz as f64 * WIDTH as f64;
+            min_x = min_x.min(tx);
+            max_x = max_x.max(tx + WIDTH as f64);
+            min_z = min_z.min(tz);
+            max_z = max_z.max(tz + WIDTH as f64);
         }
+        lo[0] = lo[0].max(min_x);
+        hi[0] = hi[0].min(max_x);
+        lo[2] = lo[2].max(min_z);
+        hi[2] = hi[2].min(max_z);
         Some((lo, hi))
     }
 }
@@ -177,20 +201,35 @@ pub fn wanted(eye: [f64; 3], size: f32) -> Vec<Key> {
     Rings::default().wanted(eye, size)
 }
 
-/// Whether a chunk lies over the area, across the ground.
+/// Whether a chunk lies over the default single area `[0, WIDTH] × [0, WIDTH]`.
 pub fn over(key: Key) -> bool {
-    let side = key.side();
-    let over = |i: i32| (i as f64 + 1.0) * side > 0.0 && (i as f64) * side < WIDTH as f64;
-    over(key.at[0]) && over(key.at[2])
+    over_tiles(key, &SINGLE_TILE)
 }
 
-/// What to show of the chunks `wanted`, when only those `made` says are made (with a surface or
-/// without): chunks that never overlap, filling as much of the wanted space as can be, each
-/// wanted chunk not yet made stood in for by the coarser chunk about it or the finer ones within
-/// it. With how many wanted chunks have nothing shown in their space.
-/// The wanted chunks are asked for one viewer at most (`Rings::wanted_open`), and so are those
-/// that stand in for them.
+/// Whether a chunk overlaps at least one 64 m tile in `tiles` across the ground.
+pub fn over_tiles(key: Key, tiles: &[[i32; 2]]) -> bool {
+    let side = key.side();
+    let x0 = key.at[0] as f64 * side;
+    let x1 = x0 + side;
+    let z0 = key.at[2] as f64 * side;
+    let z1 = z0 + side;
+    tiles.iter().any(|&[gx, gz]| {
+        let tx0 = gx as f64 * WIDTH as f64;
+        let tz0 = gz as f64 * WIDTH as f64;
+        x1 > tx0 && x0 < tx0 + WIDTH as f64 && z1 > tz0 && z0 < tz0 + WIDTH as f64
+    })
+}
+
+/// What to show of the chunks `wanted` over the single default area `[0, 64] × [0, 64]`.
 pub fn shown(wanted: &[Key], made: &dyn Fn(Key) -> bool) -> (Vec<Key>, usize) {
+    shown_over(wanted, &SINGLE_TILE, made)
+}
+
+/// What to show of the chunks `wanted` over `tiles`, when only those `made` says are made (with a
+/// surface or without): chunks that never overlap, filling as much of the wanted space as can be,
+/// each wanted chunk not yet made stood in for by the coarser chunk about it or the finer ones
+/// within it. With how many wanted chunks have nothing shown in their space.
+pub fn shown_over(wanted: &[Key], tiles: &[[i32; 2]], made: &dyn Fn(Key) -> bool) -> (Vec<Key>, usize) {
     let wanted_set: HashSet<Key> = wanted.iter().copied().collect();
     let open = wanted.iter().filter(|k| k.asked < k.level).map(|k| k.asked).min().unwrap_or(COARSEST);
     // Every chunk about a wanted one, up to the coarsest.
@@ -205,7 +244,7 @@ pub fn shown(wanted: &[Key], made: &dyn Fn(Key) -> bool) -> (Vec<Key>, usize) {
         }
     }
     let roots: HashSet<Key> = wanted_set.iter().chain(&about).filter(|k| k.level == COARSEST).copied().collect();
-    let look = Look { wanted: &wanted_set, about: &about, made, open };
+    let look = Look { wanted: &wanted_set, about: &about, tiles, made, open };
     let (mut shown, mut holes) = (Vec::new(), 0);
     for root in roots {
         let (keys, h) = look.show(root);
@@ -218,6 +257,7 @@ pub fn shown(wanted: &[Key], made: &dyn Fn(Key) -> bool) -> (Vec<Key>, usize) {
 struct Look<'a> {
     wanted: &'a HashSet<Key>,
     about: &'a HashSet<Key>,
+    tiles: &'a [[i32; 2]],
     made: &'a dyn Fn(Key) -> bool,
     /// The level whose viewer every chunk is asked for at most.
     open: i32,
@@ -226,7 +266,7 @@ struct Look<'a> {
 impl Look<'_> {
     /// What to show in `key`'s space, and how many wanted chunks there have nothing shown.
     fn show(&self, key: Key) -> (Vec<Key>, usize) {
-        if !over(key) {
+        if !over_tiles(key, self.tiles) {
             return (Vec::new(), 0);
         }
         if self.wanted.contains(&key) {
@@ -253,7 +293,7 @@ impl Look<'_> {
 
     /// `key` if it is made, or else the finer chunks made within it, a few levels down at most.
     fn finer(&self, key: Key, depth: u32) -> Option<Vec<Key>> {
-        if !over(key) {
+        if !over_tiles(key, self.tiles) {
             return Some(Vec::new());
         }
         if (self.made)(key) {

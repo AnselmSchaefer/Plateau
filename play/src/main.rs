@@ -1,8 +1,9 @@
-//! Plateau, played (POC_PLAN.md, steps 2, 7, and 8): one area, walked at three sizes, the player
-//! seen from behind (`figure`) or through their own eyes, with live multi-scale SDF sculpting (`B`)
-//! and composable standalone `.wasm` element placement (`P`).
+//! Plateau, played (POC_PLAN.md, steps 2, 7, 8, and 9): one or more areas stitched side by side,
+//! walked at three sizes, the player seen from behind (`figure`) or through their own eyes, with
+//! live multi-scale SDF sculpting (`B`), composable standalone `.wasm` element placement (`P`),
+//! and physical chopping (`K`) & carrying (`G`).
 //!
-//! `cargo run --release -p plateau-play [-- area.wasm] [--seed N] [--save file.plateau] [--element elem.wasm ...] [--tour folder [--behind]]`;
+//! `cargo run --release -p plateau-play [-- area.wasm] [--north|--east|--south|--west area.wasm] [--tile gx,gz:area.wasm ...] [--seed N] [--save file.plateau] [--element elem.wasm ...] [--tour folder [--behind]]`;
 //! the walled garden (`areas/modules/garden.wasm`) unless another module is given.
 
 mod carry;
@@ -30,12 +31,13 @@ use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 use carry::{CarriedItem, CarryAssets, CarryGhost, CarryState, FallingElement, HeldVisual};
 use chunks::{Chunks, Invalidate};
 use place::{ElementGhost, PlaceMode, PreviewAssets, WorldAction};
+use plateau_engine::atlas::{Atlas, CompiledAtlas, Side, TileSpec};
 use plateau_engine::body::{self, Body, Intent};
 use plateau_engine::compose::{Composed, ComposedLog, ElementRuntime, PlacedElement, PlacementTransform};
 use plateau_engine::cut::{CarryDecision, check_carry, check_cut, choose_cut_plane, clip_scene, format_mass, toppled_transform, world_edit_to_local};
 use plateau_engine::edit::{Edit, EditLog, Op, WorldSave, surface_normal};
-use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld};
-use plateau_engine::{Command, Compiled, ElementBounds, Limits, PlayerState, Region, SIZES, START, Scene, Wasm, rings};
+use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld, is_area_owner};
+use plateau_engine::{Compiled, ElementBounds, Limits, PlayerState, Region, SIZES, START, Scene, WIDTH, Wasm, rings};
 use scene::SceneVisuals;
 use sculpt::{BrushGhost, Sculpt};
 use surface::{Materials, SurfaceMaterial};
@@ -57,6 +59,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut module, mut seed, mut tour, mut behind, mut save_arg) = (here.join("areas/modules/garden.wasm"), 7u64, None, false, None);
     let mut extra_elements: Vec<PathBuf> = Vec::new();
+    let mut extra_tiles: Vec<([i32; 2], PathBuf)> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
@@ -64,11 +67,21 @@ fn main() {
             "--behind" => behind = true,
             "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
             "--element" => extra_elements.push(PathBuf::from(args.next().expect("--element takes a .wasm path"))),
+            "--north" => extra_tiles.push((Side::North.step(), PathBuf::from(args.next().expect("--north takes a .wasm path")))),
+            "--east" => extra_tiles.push((Side::East.step(), PathBuf::from(args.next().expect("--east takes a .wasm path")))),
+            "--south" => extra_tiles.push((Side::South.step(), PathBuf::from(args.next().expect("--south takes a .wasm path")))),
+            "--west" => extra_tiles.push((Side::West.step(), PathBuf::from(args.next().expect("--west takes a .wasm path")))),
+            "--tile" => {
+                let spec = args.next().expect("--tile takes GX,GZ:PATH");
+                let (coord, path) = spec.split_once(':').expect("--tile expects GX,GZ:PATH");
+                let (gx_s, gz_s) = coord.split_once(',').expect("--tile expects GX,GZ:PATH");
+                let gx: i32 = gx_s.parse().expect("bad tile gx");
+                let gz: i32 = gz_s.parse().expect("bad tile gz");
+                extra_tiles.push(([gx, gz], PathBuf::from(path)));
+            }
             _ => module = PathBuf::from(arg),
         }
     }
-    let bytes = std::fs::read(&module).unwrap_or_else(|e| panic!("{}: {e} (areas/build.sh builds the areas)", module.display()));
-    let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", module.display())));
     let (initial_edits, initial_elements) = match &save_arg {
         Some(path) if path.exists() => {
             let loaded = WorldSave::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -81,6 +94,16 @@ fn main() {
         }
         _ => (Arc::new(EditLog::new()), Vec::new()),
     };
+    let compile_tile = |path: &PathBuf, at: [i32; 2], seed: u64| -> TileSpec {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e} (areas/build.sh builds the areas)", path.display()));
+        let compiled = Arc::new(Compiled::new(&bytes, Limits::default()).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
+        TileSpec { at, seed, compiled }
+    };
+    let mut tile_specs = vec![compile_tile(&module, [0, 0], seed)];
+    for (at, path) in &extra_tiles {
+        tile_specs.push(compile_tile(path, *at, seed));
+    }
+    let compiled_atlas = Arc::new(CompiledAtlas::new(tile_specs).expect("valid atlas tiles"));
     let stem = module
         .parent()
         .and_then(|p| p.file_name())
@@ -92,10 +115,17 @@ fn main() {
 
     let mut place_mode = PlaceMode::new(here.clone(), extra_elements, initial_elements);
     let initial_composed = place_mode.build_composed(initial_edits.clone());
-    let mut physics = Composed::new(compiled.instantiate(seed).expect("the area made"), initial_composed.clone());
+    let mut atlas_live = compiled_atlas.instantiate().expect("the area atlas made");
+    let tile_names: Vec<([i32; 2], String)> = atlas_live
+        .describe_tiles()
+        .expect("the areas described")
+        .into_iter()
+        .map(|(at, d)| (at, d.name))
+        .collect();
+    let mut world = SceneWorld::default();
+    let initial_area_scenes = atlas_live.load_scenes_into(&mut world).expect("the areas' scenes");
+    let mut physics = Composed::new(atlas_live, initial_composed.clone());
     let described = physics.describe().expect("the area described");
-    let initial_scene = physics.scene().expect("the area's scene");
-    let mut world = SceneWorld::from_scene(&initial_scene);
 
     // Spawn any placed elements loaded from the save file into SceneWorld & ElementRuntime.
     let mut element_runtime = ElementRuntime::new();
@@ -135,11 +165,11 @@ fn main() {
         .insert_resource(ClearColor(SKY))
         .insert_resource(GlobalAmbientLight { brightness: 500.0, ..default() })
         .insert_resource(Area {
-            compiled,
-            seed,
+            atlas: compiled_atlas,
+            tile_names,
             places: described.places.iter().map(|p| (p.name.clone(), p.size, p.at.map(|c| c as f64))).collect(),
             flags,
-            initial_scene: Some(initial_scene),
+            initial_area_scenes,
             initial_element_scenes,
             initial_composed: Some(initial_composed),
         })
@@ -177,16 +207,16 @@ fn main() {
     app.run();
 }
 
-/// The area: its module, to make an instance for each thread, and the places it describes.
+/// The loaded area atlas: compiled tiles for chunk worker threads, tile names, and world-space places.
 #[derive(Resource)]
 struct Area {
-    compiled: Arc<Compiled>,
-    seed: u64,
+    atlas: Arc<CompiledAtlas>,
+    tile_names: Vec<([i32; 2], String)>,
     places: Vec<(String, plateau_engine::Size, [f64; 3])>,
     /// Where each flagged place's flag stands (`flags::flagged`), in the places' order.
     flags: Vec<(plateau_engine::Size, [f64; 3])>,
-    /// Initial procedural scene payload, taken once in `setup` to upload GPU meshes.
-    initial_scene: Option<Scene>,
+    /// Initial world-space procedural scenes for each base area tile `(owner, scene)`, taken once in `setup`.
+    initial_area_scenes: Vec<(u32, Scene)>,
     /// Initial placed element scenes loaded from `--save`, taken once in `setup` (`(id, scene, skip_solid)`).
     initial_element_scenes: Vec<(u32, Scene, bool)>,
     /// Initial composed SDF snapshot, taken once in `setup` to seed `Chunks`.
@@ -202,8 +232,8 @@ struct LiveScene {
     holding_use: bool,
 }
 
-/// The instance the player's body is moved through (base WASM area + live SDF edits + placed SDF elements).
-struct Physics(Composed<Wasm, Arc<ComposedLog>>);
+/// The instance the player's body is moved through (base multi-area atlas + live SDF edits + placed SDF elements).
+struct Physics(Composed<Atlas<Wasm>, Arc<ComposedLog>>);
 
 /// Live per-placement sandboxed Wasmtime instances for runtime `tick` / `interact`.
 struct Elements(ElementRuntime);
@@ -253,15 +283,15 @@ fn setup(
     mut surface_materials: ResMut<Assets<SurfaceMaterial>>,
 ) {
     let surface = Materials::new(&mut surface_materials);
-    let initial = area.initial_scene.take().unwrap_or_default();
-    let mut visuals = scene::spawn(&mut commands, &mut meshes, surface.opaque.clone(), &initial, &live.world);
+    let area_scenes = std::mem::take(&mut area.initial_area_scenes);
+    let mut visuals = scene::spawn_areas(&mut commands, &mut meshes, surface.opaque.clone(), &area_scenes, &live.world);
     for (owner, elem_scene, skip_solid) in area.initial_element_scenes.drain(..) {
         scene::spawn_layer_filtered(&mut commands, &mut meshes, &mut visuals, owner, &elem_scene, &live.world, skip_solid);
     }
     commands.insert_resource(visuals);
     let composed = area.initial_composed.take().unwrap_or_else(|| Arc::new(ComposedLog::empty()));
     let surface_opaque = surface.opaque.clone();
-    commands.insert_resource(Chunks::new(area.compiled.clone(), area.seed, composed, surface));
+    commands.insert_resource(Chunks::new(area.atlas.clone(), composed, surface));
     figure::spawn(&mut commands, &mut meshes, &mut materials);
     flags::spawn(&mut commands, &mut meshes, &mut materials, &area.flags);
     sculpt::spawn_ghost(&mut commands, &mut meshes, &mut materials);
@@ -1493,15 +1523,7 @@ fn apply_side_effects(player: &mut Player, applied: &Applied) {
     }
 }
 
-fn apply_commands(world: &mut SceneWorld, player: &mut Player, cmds: &[Command]) {
-    if cmds.is_empty() {
-        return;
-    }
-    let applied = world.apply(cmds);
-    apply_side_effects(player, &applied);
-}
-
-/// The runtime plugins (base area + placed elements) ticked and the body moved on in steps.
+/// The runtime plugins (all base area tiles + placed elements) ticked and the body moved on in steps.
 fn step(
     time: Res<Time>,
     mut player: ResMut<Player>,
@@ -1524,7 +1546,7 @@ fn step(
             _ => [eye32[0] + look_dir[0] * size * 3.0, eye32[1] + look_dir[1] * size * 3.0, eye32[2] + look_dir[2] * size * 3.0],
         }
     };
-    let ps_base = PlayerState {
+    let ps_world = PlayerState {
         feet: player.body.feet.map(|c| c as f32),
         eye: eye32,
         look: look_dir,
@@ -1532,28 +1554,26 @@ fn step(
         size,
         grounded: player.body.on.is_some(),
         holding_use: live.holding_use,
-        target: if hit_owner == BASE_OWNER { hit_id } else { 0 },
+        target: hit_id,
         aim,
         time: live.elapsed,
     };
 
     if dt > 0.0 {
-        match physics.0.tick(dt, &ps_base) {
-            Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
-            Err(e) => eprintln!("area tick error: {e}"),
+        for eff in physics.0.region.tick_all(dt, &ps_world, hit_owner, hit_id, &mut live.world) {
+            apply_side_effects(&mut player, &eff);
         }
-        for eff in elements.0.tick_all(dt, &ps_base, hit_owner, hit_id, &mut live.world) {
+        for eff in elements.0.tick_all(dt, &ps_world, hit_owner, hit_id, &mut live.world) {
             apply_side_effects(&mut player, &eff);
         }
     }
     if std::mem::take(&mut live.interact_pressed) {
-        if hit_owner == BASE_OWNER {
-            match physics.0.interact(&ps_base) {
-                Ok(cmds) => apply_commands(&mut live.world, &mut player, &cmds),
-                Err(e) => eprintln!("area interact error: {e}"),
-            }
+        if is_area_owner(hit_owner)
+            && let Some(eff) = physics.0.region.interact_tile(&ps_world, hit_owner, hit_id, &mut live.world)
+        {
+            apply_side_effects(&mut player, &eff);
         }
-        for eff in elements.0.interact(&ps_base, hit_owner, hit_id, &mut live.world) {
+        for eff in elements.0.interact(&ps_world, hit_owner, hit_id, &mut live.world) {
             apply_side_effects(&mut player, &eff);
         }
     }
@@ -1734,8 +1754,18 @@ fn hud(
     } else {
         String::new()
     };
+    let tile_note = if area.tile_names.len() > 1 {
+        let cur = [(feet[0] / WIDTH as f64).floor() as i32, (feet[2] / WIDTH as f64).floor() as i32];
+        area.tile_names
+            .iter()
+            .find(|(at, _)| *at == cur)
+            .map(|(_, name)| format!("  /  in {name} ({}, {})", cur[0], cur[1]))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut s = format!(
-        "{}  /  {doing}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}{tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         c.shown,
         c.waiting,

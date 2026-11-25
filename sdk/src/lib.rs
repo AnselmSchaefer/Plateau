@@ -695,11 +695,36 @@ impl Place {
     }
 }
 
+/// Linearly interpolates a border height table (one height per metre along `0..=64`) at
+/// coordinate `s`, clamped to `[0, WIDTH]`, using deterministic IEEE-754 arithmetic.
+pub fn edge_height(ground: &[f32], s: f32) -> f32 {
+    if ground.is_empty() {
+        return 0.0;
+    }
+    let last = (ground.len() - 1) as f32;
+    let u = clamp(s, 0.0, last);
+    let i = u.floor() as usize;
+    if i + 1 >= ground.len() {
+        return ground[ground.len() - 1];
+    }
+    mix(ground[i], ground[i + 1], u - i as f32)
+}
+
 impl Edge {
     /// The ground along an edge, `height(s)` at each metre `s` from its first corner to the next;
     /// no water crossing it.
     pub fn along(height: impl Fn(f32) -> f32) -> Edge {
         Edge { ground: (0..=WIDTH as u32).map(|s| height(s as f32)).collect(), water: None }
+    }
+
+    /// The ground along an edge with an optional water level crossing it.
+    pub fn along_with_water(height: impl Fn(f32) -> f32, water: Option<f32>) -> Edge {
+        Edge { ground: (0..=WIDTH as u32).map(|s| height(s as f32)).collect(), water }
+    }
+
+    /// The ground's height at coordinate `s` (`0..=64` m) along this edge, linearly interpolated.
+    pub fn height_at(&self, s: f32) -> f32 {
+        edge_height(&self.ground, s)
     }
 }
 

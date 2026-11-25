@@ -15,7 +15,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::picture::colour;
-use plateau_engine::scene::{BASE_OWNER, SceneWorld};
+use plateau_engine::scene::{SceneWorld, is_area_owner};
 use plateau_engine::{Light, Material, MeshData, Scene};
 
 use crate::surface::{SurfaceMaterial, properties};
@@ -151,12 +151,12 @@ fn light_components(l: &Light, eye: [f64; 3], scale: f64) -> (PointLight, Transf
     (pl, tf)
 }
 
-/// Initializes `SceneVisuals` and spawns the base area layer (`owner = 0`).
-pub fn spawn(
+/// Initializes `SceneVisuals` and spawns all base area tile layers (`(owner, world_scene)`).
+pub fn spawn_areas(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     material: Handle<SurfaceMaterial>,
-    scene: &Scene,
+    areas: &[(u32, Scene)],
     world: &SceneWorld,
 ) -> SceneVisuals {
     let mut visuals = SceneVisuals {
@@ -167,7 +167,9 @@ pub fn spawn(
         light_entities: HashMap::new(),
         triangles: 0,
     };
-    spawn_layer(commands, meshes, &mut visuals, BASE_OWNER, scene, world);
+    for (owner, scene) in areas {
+        spawn_layer(commands, meshes, &mut visuals, *owner, scene, world);
+    }
     visuals
 }
 
@@ -271,9 +273,9 @@ pub fn despawn_layer(commands: &mut Commands, visuals: &mut SceneVisuals, owner:
     }
 }
 
-/// Despawns all placed element layers (`owner > 0`), leaving the base area intact.
+/// Despawns all placed element layers (`!is_area_owner(o)`), leaving all base area tiles intact.
 pub fn despawn_placed_layers(commands: &mut Commands, visuals: &mut SceneVisuals) {
-    let owners: Vec<u32> = visuals.layer_entities.keys().copied().filter(|&o| o != BASE_OWNER).collect();
+    let owners: Vec<u32> = visuals.layer_entities.keys().copied().filter(|&o| !is_area_owner(o)).collect();
     for owner in owners {
         despawn_layer(commands, visuals, owner);
     }

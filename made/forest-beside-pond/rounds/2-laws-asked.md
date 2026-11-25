@@ -1,0 +1,6 @@
+It builds, but it breaks these laws:
+
+- **distances never too long**: distances are too long: at (57.38, 2.60, 29.41), for a 54.0 cm viewer, the area answers a distance of 4.3 cm, but a surface is at most 6.88 mm away: 6.29 times too long (1 of 2800 rays found such a place; seed 1). A distance may be less than the true one, never more: the engine steps that far without looking, so it would step through the surface. Scaling a distance never moves its surface: multiply the part that is too long by 0.15 or less (steep detail, sums that are not distances, a bound answered close to what it bounds).
+- **surfaces have an inside**: a surface has no inside: at (31.7, 8.7, 19.5), for a 5.40 m viewer, the distance comes to nought, but nothing within 1.6 cm of it is inside anything (1 of 2800 rays stopped at such a place; seed 1). A ray stops there and a body stands on it or walks into it, though nothing is there. It is where a shape cut out ends exactly at the surface of what it is cut from: make what is cut out reach a little beyond it (a pit from above the ground, a door through more than the wall's thickness), and answer a bound only well away from what it bounds.
+
+Answer with the whole of `area.rs` again, fixed, in one ```rust block. Keep what is right; change what the laws found.

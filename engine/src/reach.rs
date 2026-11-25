@@ -107,9 +107,6 @@ impl Layer {
     /// The heights searched down a column, if it is searched at all.
     fn range(&self, at: [i32; 2]) -> Option<(f32, f32)> {
         let [x, z] = self.middle(at);
-        if !(0.0..WIDTH).contains(&x) || !(0.0..WIDTH).contains(&z) {
-            return None;
-        }
         self.boxes
             .iter()
             .filter(|(lo, hi)| (lo[0]..=hi[0]).contains(&x) && (lo[2]..=hi[2]).contains(&z))
@@ -228,16 +225,39 @@ impl<'a> World<'a> {
         Ok(Reaches { all, without: [t, p, g] })
     }
 
-    /// The stands of `area`, whose places are `places`, none found yet.
+    /// The stands of `area`, whose places are `places`, none found yet (over the default single
+    /// area `[0, WIDTH] × [0, WIDTH]`).
     pub fn new(area: &'a mut dyn Region, places: &[Place]) -> World<'a> {
+        World::new_in(area, places, &[[0, 0]])
+    }
+
+    /// The stands of a multi-area `Atlas` covering `tiles` (`[gx, gz]` grid coordinates), whose
+    /// world-space places are `places`.
+    pub fn new_in(area: &'a mut dyn Region, places: &[Place], tiles: &[[i32; 2]]) -> World<'a> {
         let layer = |size: Size, boxes| Layer { size, cell: cell(size), boxes, columns: HashMap::new() };
-        let whole = vec![([0.0, LOWEST, 0.0], [WIDTH, HIGHEST, WIDTH])];
+        let whole: Vec<([f32; 3], [f32; 3])> = tiles
+            .iter()
+            .map(|&[gx, gz]| {
+                let x0 = gx as f32 * WIDTH;
+                let z0 = gz as f32 * WIDTH;
+                ([x0, LOWEST, z0], [x0 + WIDTH, HIGHEST, z0 + WIDTH])
+            })
+            .collect();
         let tiny = places
             .iter()
             .filter(|p| p.size == Size::Tiny)
-            .map(|p| {
+            .flat_map(|p| {
                 let [x, y, z] = p.at;
-                ([x - TINY_ACROSS, y - TINY_UP, z - TINY_ACROSS], [x + TINY_ACROSS, y + TINY_UP, z + TINY_ACROSS])
+                let (bx0, bz0, bx1, bz1) = (x - TINY_ACROSS, z - TINY_ACROSS, x + TINY_ACROSS, z + TINY_ACROSS);
+                tiles.iter().filter_map(move |&[gx, gz]| {
+                    let tx0 = gx as f32 * WIDTH;
+                    let tz0 = gz as f32 * WIDTH;
+                    let ix0 = bx0.max(tx0);
+                    let iz0 = bz0.max(tz0);
+                    let ix1 = bx1.min(tx0 + WIDTH);
+                    let iz1 = bz1.min(tz0 + WIDTH);
+                    (ix0 < ix1 && iz0 < iz1).then_some(([ix0, y - TINY_UP, iz0], [ix1, y + TINY_UP, iz1]))
+                })
             })
             .collect();
         World {

@@ -7,7 +7,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use plateau_make::{Builder, Made, Reply, Settings, Writer, judge_element, make, make_element, source_of};
+use plateau_engine::atlas::Side;
+use plateau_make::{Builder, Made, Neighbor, Reply, SEED, Settings, Writer, judge_element, load_neighbors, make, make_element, make_with_neighbors, source_of};
 
 /// The area, with the pillar `PILLAR` metres high: 3 m keeps every law; half a metre, a person
 /// jumps onto it.
@@ -258,4 +259,45 @@ fn make_element_catches_clipped_bounds_and_keeps_fixed_element() {
         let judged = judge_element(&bytes, QUICK);
         assert!(judged.kept(), "{name} broke element laws: {:?}", judged.broken);
     }
+}
+
+#[test]
+fn with_a_neighbour_claude_gets_its_border_and_is_held_to_borders_match() {
+    // Build AREA as a neighbour module on disk, then generate an area to its east (--beside west:...).
+    let nb_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/plateau-make-tests/neighbor-base");
+    std::fs::remove_dir_all(&nb_dir).ok();
+    let nb_wasm_bytes = builder().build(AREA, &nb_dir).unwrap();
+    let nb_wasm = nb_dir.join("area.wasm");
+    std::fs::write(&nb_wasm, &nb_wasm_bytes).unwrap();
+
+    let neighbor = Neighbor::load(Side::West, nb_wasm, SEED).unwrap();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/plateau-make-tests/beside-west");
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Round 1: ground lifted by 0.6 m -> breaks `borders match (west)`. Round 2: matches `AREA` (y = 0) -> keeps every law.
+    let bad_border = right()
+        .replace("let ground = Answer::new(p.y, Material::Grass);", "let ground = Answer::new(p.y - 0.6, Material::Grass);")
+        .replace("Borders::of_ground(|_, _| 0.0)", "Borders::of_ground(|_, _| 0.6)")
+        .replace("point(40.0, 0.0, 30.0)", "point(40.0, 0.6, 30.0)")
+        .replace("point(40.0, 0.2, 30.0)", "point(40.0, 0.8, 30.0)")
+        .replace("point(40.0, 0.0295, 30.0)", "point(40.0, 0.6295, 30.0)")
+        .replace("point(39.85, 0.0145, 30.0)", "point(39.85, 0.6145, 30.0)")
+        .replace("point(20.0, PILLAR, 20.0)", "point(20.0, PILLAR + 0.6, 20.0)")
+        .replace("point(20.0, PILLAR * 0.5, 20.0)", "point(20.0, PILLAR * 0.5 + 0.6, 20.0)");
+
+    let mut writer = StandIn { answers: vec![bad_border, right(), right()].into(), asked: Vec::new() };
+    let made = make_with_neighbors(&mut writer, builder(), "two blocks beside west", None, &[neighbor], &dir, QUICK, &mut |_| {}).unwrap();
+    let came: Vec<_> = made.rounds.iter().map(|r| (r.asked, r.came.as_str())).collect();
+    assert_eq!(came, [("write", "breaks: borders match (west)"), ("laws", "keeps every law"), ("look", "keeps every law")]);
+
+    // Round 1 prompt included the neighbour's WEST_GROUND table and border instructions.
+    assert!(writer.asked[0].0.contains("const WEST_GROUND: [f32; 65]"), "{}", writer.asked[0].0);
+    // Round 2 got the `borders match (west)` failure message.
+    assert!(writer.asked[1].0.contains("**borders match (west)**") && writer.asked[1].0.contains("apart"), "{}", writer.asked[1].0);
+    // Look round included stitched seam pictures and `neighbors.txt` round-trips cleanly.
+    assert!(writer.asked[2].0.contains("seam-west.png") && writer.asked[2].0.contains("seam-view-west.png"), "{}", writer.asked[2].0);
+    assert!(dir.join("pictures/seam-west.png").exists() && dir.join("pictures/seam-view-west.png").exists());
+    let reloaded = load_neighbors(&dir).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].side, Side::West);
 }

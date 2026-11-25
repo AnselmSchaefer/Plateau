@@ -13,9 +13,10 @@
 //!   to, as it is; where nobody can stand, darkened; the places ringed in the colour of the size
 //!   they are for. Plateau's long exposure.
 
+use crate::atlas::Side;
 use crate::body::Body;
 use crate::reach::{Reach, Reaches, SAME_FLOOR, World, cell};
-use crate::{Answer, Description, Material, Region, Result, SIZES, START, Size};
+use crate::{Answer, Description, Material, Region, Result, SIZES, START, Size, WIDTH};
 
 /// Where a picture is taken from, and by whom.
 #[derive(Clone, Copy, Debug)]
@@ -519,4 +520,28 @@ pub fn map(world: &World, reaches: &Reaches, plan: &Plan, (low, high): (f32, f32
     let without: Vec<_> = reaches.without.iter().map(|r| reached(world, r, plan, low, high, width, true)).collect();
     let opens = opens(&near, [&without[0], &without[1], &without[2]]);
     Map { all, near, anywhere, opens }
+}
+
+/// An overhead `Plan` straddling the shared border between an area at `(0, 0)` and its neighbour
+/// on `my_side` (`step(my_side)`), showing 32 m of each area meeting along the seam.
+pub fn seam_plan(my_side: Side) -> Plan {
+    let middle = match my_side {
+        Side::North => [WIDTH * 0.5, 0.0],
+        Side::East => [WIDTH, WIDTH * 0.5],
+        Side::South => [WIDTH * 0.5, WIDTH],
+        Side::West => [0.0, WIDTH * 0.5],
+    };
+    Plan { middle, half: WIDTH * 0.5, top: crate::reach::HIGHEST, size: SIZES[1].1 }
+}
+
+/// An elevated perspective `Camera` looking along the shared border on `my_side` of tile `(0, 0)`
+/// so both areas and their join are clearly visible side by side.
+pub fn seam_camera(my_side: Side) -> Camera {
+    let (eye, at) = match my_side {
+        Side::West => ([0.0, 14.0, WIDTH + 8.0], [0.0, 0.0, WIDTH * 0.45]),
+        Side::East => ([WIDTH, 14.0, WIDTH + 8.0], [WIDTH, 0.0, WIDTH * 0.45]),
+        Side::North => ([-8.0, 14.0, 0.0], [WIDTH * 0.55, 0.0, 0.0]),
+        Side::South => ([-8.0, 14.0, WIDTH], [WIDTH * 0.55, 0.0, WIDTH]),
+    };
+    Camera { eye, at, fov: 60.0, size: SIZES[1].1 }
 }

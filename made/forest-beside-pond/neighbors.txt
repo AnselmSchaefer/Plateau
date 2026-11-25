@@ -1,0 +1,2 @@
+# Neighbouring areas for border continuity checks (side seed path)
+west 7 /home/anselm/Projects/plateau/make/../made/pond-sketched/area.wasm

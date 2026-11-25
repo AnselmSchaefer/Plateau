@@ -98,6 +98,29 @@ When a sketch is given, two extra laws hold:
   within 3 m, reached by the tiny and by nobody who is never tiny; every purple mark must have a
   `Size::Giant` place within 3 m, reached by giants and by nobody who is never a giant.
 
+## Neighbour borders (when given)
+
+Sometimes you are making an area that sits **beside an existing area** (north `z = 0`, east
+`x = 64`, south `z = 64`, or west `x = 0`). You will be given the neighbour's solid ground heights
+at every metre along the shared edge as a 65-element array, along with any water level and surface
+materials along that edge.
+
+When a neighbour border is given, the law **Borders match** holds along that shared edge:
+
+- **Match ground heights (within 15 cm)**: use `edge_height(&WEST_GROUND, p.z)` (or `p.x` for
+  north/south) right on the shared edge, and smoothly blend into your own interior terrain over
+  4–8 m using `between(dist_from_edge, 0.0, 6.0)`.
+- **Match water (within 5 cm)**: if the neighbour has water crossing the edge, continue that water
+  at the exact same level and shoreline; if the neighbour is dry land along the edge, keep your
+  edge dry too.
+- **Match surface materials**: match the neighbour's ground material along the shared edge and
+  transition naturally into your interior materials a few metres in.
+- **Fade roughness & keep obstacles back**: fade terrain `detail()` and pebbles smoothly to zero
+  at the edge (`between(dist_from_edge, 0.0, 2.0)`), and keep walls, boulders, trees, and sheer
+  cliffs at least 3 m back from the seam so tiny people, people, and giants walk straight across
+  with no step or seam.
+- **Report real heights**: return your actual ground height from `describe().borders`.
+
 ## What each size sees
 
 A viewer `view.size` tall sees detail down to `view.finest`, a tenth of their height.
@@ -209,6 +232,7 @@ the place and size where it broke and what to do.
 | NaNs unseen | The same answers whatever the machine's NaNs |
 | Distances never too long | No distance is longer than the way to the surface |
 | Surfaces have an inside | Wherever the distance comes to nought, something is solid right by it |
+| Borders match (when beside a neighbour) | Ground height (within 15 cm), water level (within 5 cm), and surface material are continuous along the shared edge |
 
 ## How finished
 
