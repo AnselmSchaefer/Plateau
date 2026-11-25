@@ -34,8 +34,9 @@ use place::{ElementGhost, PlaceMode, PreviewAssets, WorldAction};
 use plateau_engine::atlas::{Atlas, CompiledAtlas, Side, TileSpec};
 use plateau_engine::body::{self, Body, Intent};
 use plateau_engine::compose::{Composed, ComposedLog, ElementRuntime, PlacedElement, PlacementTransform};
-use plateau_engine::cut::{CarryDecision, check_carry, check_cut, choose_cut_plane, clip_scene, format_mass, toppled_transform, world_edit_to_local};
+use plateau_engine::cut::{CarryDecision, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass, toppled_transform, world_edit_to_local};
 use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, WorldSave, surface_normal};
+use plateau_engine::physics::{BuoyancyState, compute_buoyancy, player_mass_kg, step_floating_move};
 use plateau_engine::rules::{Action, LOCAL_PLAYER, RuleBook};
 use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld, is_area_owner};
 use plateau_engine::water::WaterLog;
@@ -426,6 +427,8 @@ impl EditCtx<'_, '_> {
             let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
             let _ = player.body.surface_from_solid(&mut combined, max_lift);
         } else {
+            // Check Archimedes buoyancy for newly placed un-rooted procedural objects (boats float, stones sink!).
+            let _ = self.settle_buoyancy_for(pl.id, 0.0);
             let max_lift = (pl.scale * 3.0) as f64 + player.body.size as f64;
             let mut combined = Combined { region: &mut self.physics.0, world: &self.live.world };
             let _ = player.body.surface_from_solid(&mut combined, max_lift);
@@ -433,8 +436,189 @@ impl EditCtx<'_, '_> {
         Ok(name)
     }
 
+    /// Evaluates Archimedes buoyancy for a placed un-rooted `Scene` element `id`, snapping it to
+    /// its waterline (if floating) or pond bed (if sinking) and updating `carry.floating`.
+    fn settle_buoyancy_for(&mut self, id: u32, extra_load_kg: f32) -> Option<BuoyancyState> {
+        let pos = self.place.placed.iter().position(|e| e.id == id)?;
+        let pl = &self.place.placed[pos];
+        if pl.is_promoted() || self.place.catalog.get(&pl.module).is_some_and(|c| c.is_sdf()) {
+            self.carry.floating.remove(&id);
+            return None;
+        }
+        let phys = self.elements.0.physics_of(id)?;
+        if phys.rooted {
+            self.carry.floating.remove(&id);
+            return None;
+        }
+        let old_tf = pl.transform();
+        let buoy = compute_buoyancy(&phys, old_tf, &mut self.physics.0, extra_load_kg).ok()?;
+        match buoy {
+            BuoyancyState::Floating { target_y, .. } => {
+                self.carry.floating.insert(id);
+                let mut tf = old_tf;
+                tf.pos[1] = target_y;
+                if (tf.pos[1] - old_tf.pos[1]).abs() > 1e-4 {
+                    self.relocate_placed(id, tf, None);
+                }
+            }
+            BuoyancyState::Sinking { target_y, .. } => {
+                self.carry.floating.remove(&id);
+                if self.carry.piloting == Some(id) {
+                    self.carry.piloting = None;
+                }
+                let mut tf = old_tf;
+                tf.pos[1] = target_y;
+                if (tf.pos[1] - old_tf.pos[1]).abs() > 1e-4 {
+                    self.relocate_placed(id, tf, None);
+                }
+            }
+            BuoyancyState::Dry { .. } => {
+                self.carry.floating.remove(&id);
+                if self.carry.piloting == Some(id) {
+                    self.carry.piloting = None;
+                }
+            }
+        }
+        Some(buoy)
+    }
+
+    /// Re-evaluates buoyancy for all placed un-rooted `Scene` elements (e.g. after expanding a pond
+    /// channel underneath a beached boat, or after loading a saved world).
+    fn refresh_all_buoyancy(&mut self) {
+        let ids: Vec<u32> = self.place.placed.iter().map(|e| e.id).collect();
+        for id in ids {
+            let _ = self.settle_buoyancy_for(id, 0.0);
+        }
+    }
+
+    /// Updates passive bobbing, rider weight draft, and active WASD boat/raft paddling each frame.
+    fn tick_buoyancy(&mut self, dt: f32, forward_in: f32, turn_in: f32, player: &mut Player) {
+        self.carry.float_time += dt;
+        let standing_id = self.live.world.standing_on_placed(player.body.feet, player.body.size);
+        let rider_kg = player_mass_kg(player.body.size);
+
+        // 1. Active piloting (`F` while standing on a floating boat/log).
+        if let Some(boat_id) = self.carry.piloting {
+            let still_exists = self.place.placed.iter().position(|e| e.id == boat_id);
+            let phys = self.elements.0.physics_of(boat_id);
+            if let (Some(pos), Some(phys)) = (still_exists, phys) {
+                let old_tf = self.place.placed[pos].transform();
+                let boat_scale = old_tf.scale.max(0.01);
+                let speed = forward_in * (2.8 * boat_scale);
+                let turn_rate = turn_in * 1.65;
+                if let Ok((new_tf, buoy)) = step_floating_move(
+                    &phys,
+                    old_tf,
+                    speed,
+                    turn_rate,
+                    dt,
+                    &mut self.physics.0,
+                    rider_kg,
+                    self.carry.float_time,
+                ) {
+                    if let BuoyancyState::Sinking { .. } = buoy {
+                        self.carry.piloting = None;
+                        self.carry.floating.remove(&boat_id);
+                        self.relocate_placed(boat_id, new_tf, None);
+                        let name = self
+                            .place
+                            .catalog
+                            .get(&self.place.placed[pos].module)
+                            .map_or_else(|| format!("#{boat_id}"), |c| c.name.clone());
+                        player.say(format!("too heavy — {name} is sinking!"));
+                        return;
+                    }
+                    let dyaw = turn_rate * dt;
+                    let dx = (new_tf.pos[0] - old_tf.pos[0]) as f64;
+                    let dy = (new_tf.pos[1] - old_tf.pos[1]) as f64;
+                    let dz = (new_tf.pos[2] - old_tf.pos[2]) as f64;
+                    // Rotate rider offset around the boat's yaw pivot so turning carries the rider cleanly.
+                    let rx = player.body.feet[0] - old_tf.pos[0] as f64;
+                    let rz = player.body.feet[2] - old_tf.pos[2] as f64;
+                    let (s, c) = (dyaw as f64).sin_cos();
+                    let nrx = rx * c + rz * s;
+                    let nrz = -rx * s + rz * c;
+                    player.body.feet[0] = old_tf.pos[0] as f64 + nrx + dx;
+                    player.body.feet[1] += dy;
+                    player.body.feet[2] = old_tf.pos[2] as f64 + nrz + dz;
+                    player.body.yaw += dyaw;
+                    self.relocate_placed(boat_id, new_tf, None);
+                }
+            } else {
+                self.carry.piloting = None;
+            }
+        }
+
+        // 2. Gentle bobbing & rider-weight draft for un-piloted floating objects.
+        let mut active_ids: Vec<u32> = self.carry.floating.iter().copied().collect();
+        if let Some(sid) = standing_id
+            && !active_ids.contains(&sid)
+        {
+            active_ids.push(sid);
+        }
+        for id in active_ids {
+            if self.carry.piloting == Some(id) || self.carry.held.as_ref().is_some_and(|h| h.id == id) {
+                continue;
+            }
+            if self.carry.falling.iter().any(|f| f.id == id) {
+                continue;
+            }
+            let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else {
+                self.carry.floating.remove(&id);
+                continue;
+            };
+            if self.place.placed[pos].is_promoted() {
+                self.carry.floating.remove(&id);
+                continue;
+            }
+            let Some(phys) = self.elements.0.physics_of(id) else { continue };
+            if phys.rooted {
+                self.carry.floating.remove(&id);
+                continue;
+            }
+            let old_tf = self.place.placed[pos].transform();
+            let load = if standing_id == Some(id) { rider_kg } else { 0.0 };
+            if let Ok(buoy) = compute_buoyancy(&phys, old_tf, &mut self.physics.0, load) {
+                match buoy {
+                    BuoyancyState::Floating { target_y, bob_amplitude, .. } => {
+                        self.carry.floating.insert(id);
+                        let phase = self.carry.float_time * 2.2 + id as f32 * 1.13;
+                        let desired_y = target_y + phase.sin() * bob_amplitude;
+                        let next_y = old_tf.pos[1] + (desired_y - old_tf.pos[1]) * (dt * 6.0).min(1.0);
+                        if (next_y - old_tf.pos[1]).abs() > 1e-4 {
+                            let mut tf = old_tf;
+                            tf.pos[1] = next_y;
+                            let dy = (next_y - old_tf.pos[1]) as f64;
+                            self.relocate_placed(id, tf, None);
+                            if standing_id == Some(id) {
+                                player.body.feet[1] += dy;
+                            }
+                        }
+                    }
+                    BuoyancyState::Sinking { target_y, .. } => {
+                        let next_y = old_tf.pos[1] + (target_y - old_tf.pos[1]) * (dt * 4.0).min(1.0);
+                        if (next_y - old_tf.pos[1]).abs() > 1e-4 {
+                            let mut tf = old_tf;
+                            tf.pos[1] = next_y;
+                            let dy = (next_y - old_tf.pos[1]) as f64;
+                            self.relocate_placed(id, tf, None);
+                            if standing_id == Some(id) {
+                                player.body.feet[1] += dy;
+                            }
+                        } else if load == 0.0 {
+                            self.carry.floating.remove(&id);
+                        }
+                    }
+                    BuoyancyState::Dry { .. } => {
+                        self.carry.floating.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
     fn remove_placed(&mut self, id: u32) -> Option<PlacedElement> {
-        self.carry.cancel_fall(id);
+        self.carry.forget_element(id);
         let idx = self.place.placed.iter().position(|e| e.id == id)?;
         let removed = self.place.placed.remove(idx);
         let sdf_bounds = self.place.sdf_bounds_of(&removed);
@@ -507,6 +691,7 @@ impl EditCtx<'_, '_> {
             let skip_solid = self.elements.0.should_skip_solid(item.id);
             scene::spawn_layer_filtered(&mut self.commands, &mut self.meshes, &mut self.visuals, item.id, &world_scene, &self.live.world, skip_solid);
         }
+        let _ = self.settle_buoyancy_for(item.id, 0.0);
         if let Some(bounds) = sdf_bounds {
             self.commit_composed(Invalidate::SdfElement(new_tf, bounds));
         }
@@ -557,6 +742,9 @@ impl EditCtx<'_, '_> {
         }
         for (id, tf, finished) in updates {
             self.relocate_placed(id, tf, if finished { Some(&mut *player) } else { None });
+            if finished {
+                let _ = self.settle_buoyancy_for(id, 0.0);
+            }
         }
     }
 
@@ -580,6 +768,10 @@ impl EditCtx<'_, '_> {
         let mut bounds_list = Vec::new();
         let mut names = Vec::new();
         for id in candidates {
+            // Never accidentally voxelize a floating boat/raft when sculpting nearby terrain!
+            if self.carry.floating.contains(&id) && aimed_owner != Some(id) {
+                continue;
+            }
             let Some(pos) = self.place.placed.iter().position(|e| e.id == id) else { continue };
             if self.place.placed[pos].is_promoted() {
                 continue;
@@ -638,6 +830,8 @@ impl EditCtx<'_, '_> {
     fn reload_world(&mut self) -> plateau_engine::Result<(usize, usize)> {
         self.carry.held = None;
         self.carry.falling.clear();
+        self.carry.floating.clear();
+        self.carry.piloting = None;
         let saved = self.sculpt.load_world()?;
         let edit_count = saved.edits.len();
         let water = WaterLog::from_bodies(saved.water)?;
@@ -671,6 +865,7 @@ impl EditCtx<'_, '_> {
             }
         }
         self.commit_composed(Invalidate::All);
+        self.refresh_all_buoyancy();
         Ok((edit_count, elem_count))
     }
 }
@@ -701,12 +896,33 @@ fn look_and_ask(
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
+    let dt = time.delta_secs().min(0.1);
+
+    // Cycle active material-aware tool (`C`: Workshop -> Saw -> Pickaxe -> Shovel -> Hands).
+    if !ctrl && keys.just_pressed(KeyCode::KeyC) {
+        ctx.sculpt.tool = ctx.sculpt.tool.next();
+        player.say(format!("tool: {}", ctx.sculpt.tool.name()));
+    }
+
+    // Handle active boat/raft piloting & passive floating buoyancy.
+    let boat_fwd = if ctx.carry.is_piloting() && !ctrl { held(KeyCode::KeyW) - held(KeyCode::KeyS) } else { 0.0 };
+    let boat_turn = if ctx.carry.is_piloting() { held(KeyCode::KeyA) - held(KeyCode::KeyD) } else { 0.0 };
+    if ctx.carry.is_piloting() && keys.just_pressed(KeyCode::Space) {
+        ctx.carry.piloting = None;
+        player.say("dismounted");
+    }
+    ctx.tick_buoyancy(dt, boat_fwd, boat_turn, &mut player);
+
     let carry_speed = ctx.carry.speed_factor();
-    player.intent = Intent {
-        forward: if ctrl { 0.0 } else { (held(KeyCode::KeyW) - held(KeyCode::KeyS)) * carry_speed },
-        right: (held(KeyCode::KeyD) - held(KeyCode::KeyA)) * carry_speed,
-        run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
-        jump: keys.pressed(KeyCode::Space),
+    player.intent = if ctx.carry.is_piloting() {
+        Intent::default()
+    } else {
+        Intent {
+            forward: if ctrl { 0.0 } else { (held(KeyCode::KeyW) - held(KeyCode::KeyS)) * carry_speed },
+            right: (held(KeyCode::KeyD) - held(KeyCode::KeyA)) * carry_speed,
+            run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+            jump: keys.pressed(KeyCode::Space),
+        }
     };
 
     // If shrinking made the carried object exceed current size's carry capacity, set it down safely.
@@ -770,10 +986,31 @@ fn look_and_ask(
 
     let tool_active = ctx.sculpt.active || ctx.place.active || ctx.carry.is_carrying();
     if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
-        let act = Action::Interact { at: player.body.feet.map(|c| c as f32) };
-        match ctx.sculpt.rules.check(&ctx.sculpt.player_id, &act) {
-            Ok(()) => ctx.live.interact_pressed = true,
-            Err(denial) => player.say(denial.reason),
+        if ctx.carry.is_piloting() {
+            ctx.carry.piloting = None;
+            player.say("released helm");
+        } else if let Some(boat_id) = ctx.live.world.standing_on_placed(player.body.feet, player.body.size)
+            && ctx.carry.floating.contains(&boat_id)
+        {
+            ctx.sculpt.active = false;
+            ctx.sculpt.aim = None;
+            ctx.place.active = false;
+            ctx.place.aim = None;
+            ctx.carry.piloting = Some(boat_id);
+            let name = ctx
+                .place
+                .placed
+                .iter()
+                .find(|e| e.id == boat_id)
+                .and_then(|pl| ctx.place.catalog.get(&pl.module))
+                .map_or_else(|| format!("#{boat_id}"), |c| c.name.clone());
+            player.say(format!("paddling {name} — W/S row, A/D steer, F/Space dismount"));
+        } else {
+            let act = Action::Interact { at: player.body.feet.map(|c| c as f32) };
+            match ctx.sculpt.rules.check(&ctx.sculpt.player_id, &act) {
+                Ok(()) => ctx.live.interact_pressed = true,
+                Err(denial) => player.say(denial.reason),
+            }
         }
     }
     ctx.live.holding_use = keys.pressed(KeyCode::KeyF) || (!tool_active && buttons.pressed(MouseButton::Right));
@@ -850,6 +1087,23 @@ fn look_and_ask(
                         d2 >= min_step * min_step
                     });
                 if spacing_ok {
+                    // Enforce material-aware tool rules when carving (`Op::Carve`): e.g. a Saw
+                    // carves Wood/foliage but refuses Stone; a Shovel digs earth/mud/sand only.
+                    let tool_carve_err = if op == Op::Carve {
+                        let mut sample_ans = Vec::new();
+                        let h32 = [h[0] as f32, h[1] as f32, h[2] as f32];
+                        let mat = {
+                            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                            combined.sample(&[h32], psize, &mut sample_ans).ok().and_then(|_| sample_ans.first().map(|a| a.material))
+                        };
+                        mat.and_then(|m| ctx.sculpt.tool.can_carve(m).err())
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = tool_carve_err {
+                        player.say(reason);
+                        ctx.sculpt.hold_timer = 0.35;
+                    } else {
                     // Check if the player is sculpting directly onto a discrete procedural `Scene`
                     // element (either unpromoted or already promoted). If so, store the edit in
                     // that element's `local_edits` so carved tunnels & notches travel and rotate
@@ -968,9 +1222,14 @@ fn look_and_ask(
                             } else {
                                 None
                             };
-                            // World terrain sculpt: lazily promote any solid `Scene` elements touched
-                            // by this world edit so carving/adding cuts into them seamlessly.
-                            let (promoted_ids, promo_bounds, promo_names) = ctx.promote_overlapping_scene_elements(&edit, aimed_unpromoted, edit_idx);
+                            // World terrain sculpt: only lazily promote overlapping solid `Scene`
+                            // elements when CARVING (`Op::Carve`) so adding land/islands next to a
+                            // boat, bridge, or tree never turns crisp procedural objects into voxels!
+                            let (promoted_ids, promo_bounds, promo_names) = if edit.op == Op::Carve {
+                                ctx.promote_overlapping_scene_elements(&edit, aimed_unpromoted, edit_idx)
+                            } else {
+                                (Vec::new(), Vec::new(), Vec::new())
+                            };
                             match ctx.sculpt.push_edit(edit) {
                                 Ok(()) => {
                                     ctx.place.undo_stack.push(WorldAction::SdfEdit { edit, promoted_ids });
@@ -982,6 +1241,9 @@ fn look_and_ask(
                                         if !promo_names.is_empty() {
                                             player.say(format!("{} converted to carvable solid", promo_names.join(", ")));
                                         }
+                                    }
+                                    if water_bounds.is_some() || !ctx.carry.floating.is_empty() {
+                                        ctx.refresh_all_buoyancy();
                                     }
                                     if edit.op == Op::Add {
                                         let (_, hi) = edit.influence_bounds();
@@ -995,6 +1257,7 @@ fn look_and_ask(
                                 Err(e) => player.say(format!("sculpt error: {e}")),
                             }
                         }
+                    }
                     }
                 }
             }
@@ -1057,9 +1320,14 @@ fn look_and_ask(
                 };
                 match ctx.spawn_placed(pl.clone(), &mut player) {
                     Ok(name) => {
+                        let floating = ctx.carry.floating.contains(&id);
                         ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
                         ctx.place.redo_stack.clear();
-                        player.say(format!("placed {name} ({scale:.2}x)"));
+                        if floating {
+                            player.say(format!("placed {name} ({scale:.2}x, floating — step aboard & press F to paddle)"));
+                        } else {
+                            player.say(format!("placed {name} ({scale:.2}x)"));
+                        }
                     }
                     Err(e) => player.say(format!("place error: {e}")),
                 }
@@ -1105,22 +1373,22 @@ fn look_and_ask(
         ctx.place.aim = None;
         let reach = psize * 10.0;
         let piv32 = pivot.map(|c| c as f32);
-        let scene_hit = ctx.live.world.raycast_placed_surface(piv32, dir, reach);
+        let scene_hit = ctx.live.world.raycast_placed_surface_material(piv32, dir, reach);
         let sdf_hit = ctx.place.raycast_placed_sdf(piv32, dir, reach).map(|(id, t)| {
             let exact = {
                 let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
                 body::look(&mut combined, pivot, dir, psize, reach).ok().flatten()
             };
             let hit_p = exact.map_or([piv32[0] + dir[0] * t, piv32[1] + dir[1] * t, piv32[2] + dir[2] * t], |h| [h[0] as f32, h[1] as f32, h[2] as f32]);
-            (id, t, hit_p)
+            (id, t, hit_p, None)
         });
         let target_hit = match (scene_hit, sdf_hit) {
-            (Some((a, ta, pa)), Some((b, tb, pb))) => Some(if ta <= tb { (a, pa) } else { (b, pb) }),
-            (Some((a, _, pa)), None) => Some((a, pa)),
-            (None, Some((b, _, pb))) => Some((b, pb)),
+            (Some((a, ta, pa, ma)), Some((b, tb, pb, mb))) => Some(if ta <= tb { (a, pa, Some(ma)) } else { (b, pb, mb) }),
+            (Some((a, _, pa, ma)), None) => Some((a, pa, Some(ma))),
+            (None, Some((b, _, pb, mb))) => Some((b, pb, mb)),
             (None, None) => None,
         };
-        if let Some((id, hit_world)) = target_hit {
+        if let Some((id, hit_world, hit_mat)) = target_hit {
             ctx.finish_all_falls(Some(&mut player));
             if let Some(original) = ctx.place.placed.iter().find(|e| e.id == id).cloned() {
                 if let Err(denial) = ctx.sculpt.rules.check(
@@ -1132,7 +1400,7 @@ fn look_and_ask(
                 let is_sdf = ctx.place.catalog.get(&original.module).is_some_and(|e| e.is_sdf());
                 let elem_name = ctx.place.catalog.get(&original.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
                 if let Some(phys) = ctx.elements.0.physics_of(id) {
-                    match check_cut(&phys, is_sdf, psize) {
+                    match check_cut_with_tool(&phys, is_sdf, psize, ctx.sculpt.tool, hit_mat) {
                         Err(reason) => player.say(reason),
                         Ok(()) => {
                             let orig_tf = original.transform();
@@ -1157,7 +1425,11 @@ fn look_and_ask(
                                         let was_upright = !CarriedItem::is_rot_horizontal(orig_tf.rot);
 
                                         // Compute target resting transform for the detached upper half.
-                                        let target_upper_tf = if was_upright {
+                                        // Probe strictly against terrain SDF (`ctx.physics.0`, NOT
+                                        // `Combined` while `original` is still standing!) so the
+                                        // detached half never lands on the uncut original's own roof,
+                                        // then settle via Archimedes buoyancy (wood floats, stone sinks!).
+                                        let mut target_upper_tf = if was_upright {
                                             let flen = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt();
                                             let (fx, fz) = if flen > 1e-3 {
                                                 (dir[0] / flen, dir[2] / flen)
@@ -1166,17 +1438,14 @@ fn look_and_ask(
                                             };
                                             let probe_x = orig_tf.pos[0] as f64 + (fx * upper_phys.world_span * 0.45) as f64;
                                             let probe_z = orig_tf.pos[2] as f64 + (fz * upper_phys.world_span * 0.45) as f64;
-                                            let ground_y = {
-                                                let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
-                                                let start_y = orig_tf.pos[1] as f64 + upper_phys.world_span as f64 + 1.0;
-                                                body::look(&mut combined, [probe_x, start_y, probe_z], [0.0, -1.0, 0.0], psize, upper_phys.world_span * 2.0 + 10.0)
-                                                    .ok()
-                                                    .flatten()
-                                                    .map_or(orig_tf.pos[1], |h| h[1] as f32)
-                                            };
+                                            let start_y = orig_tf.pos[1] as f64 + upper_phys.world_span as f64 + 1.0;
+                                            let ground_y = body::look(&mut ctx.physics.0, [probe_x, start_y, probe_z], [0.0, -1.0, 0.0], psize, upper_phys.world_span * 2.0 + 10.0)
+                                                .ok()
+                                                .flatten()
+                                                .map_or(orig_tf.pos[1], |h| h[1] as f32);
                                             toppled_transform(orig_tf, &upper_phys, [fx, fz], ground_y)
                                         } else {
-                                            // Cross-cutting an already lying log: nudge apart cleanly along cut normal.
+                                            // Cross-cutting an already lying log/stone: nudge apart cleanly along cut normal.
                                             let wn = orig_tf.local_to_world_dir(plane.normal);
                                             let gap = (0.14 * upper.scale).max(0.01);
                                             let shifted = [
@@ -1186,6 +1455,17 @@ fn look_and_ask(
                                             ];
                                             PlacementTransform::with_rot(shifted, orig_tf.rot, orig_tf.scale)
                                         };
+                                        if let Ok(buoy) = compute_buoyancy(&upper_phys, target_upper_tf, &mut ctx.physics.0, 0.0) {
+                                            match buoy {
+                                                BuoyancyState::Floating { target_y, .. } | BuoyancyState::Sinking { target_y, .. } => {
+                                                    target_upper_tf.pos[1] = target_y;
+                                                }
+                                                BuoyancyState::Dry { floor_y } => {
+                                                    let (min_y, _) = upper_phys.rotated_y_extents(target_upper_tf.rot, target_upper_tf.scale);
+                                                    target_upper_tf.pos[1] = floor_y - min_y - 0.02 * target_upper_tf.scale;
+                                                }
+                                            }
+                                        }
 
                                         let mut upper_settled = upper.clone();
                                         upper_settled.set_transform(target_upper_tf);
@@ -1884,8 +2164,9 @@ fn hud(
         String::new()
     };
     let mut s = format!(
-        "{}  /  {doing}{tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}  /  tool: {} (C){tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
+        sculpt.tool.short_name(),
         c.shown,
         c.waiting,
         c.ahead,
@@ -1896,7 +2177,15 @@ fn hud(
         feet[2]
     );
     let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
-    if let Some(item) = &carry.held {
+    if let Some(boat_id) = carry.piloting {
+        let name = place
+            .placed
+            .iter()
+            .find(|e| e.id == boat_id)
+            .and_then(|pl| place.catalog.get(&pl.module))
+            .map_or_else(|| format!("#{boat_id}"), |c| c.name.clone());
+        s += &format!("\nSAIL: {name}  (W/S row, A/D steer, F or Space dismount)");
+    } else if let Some(item) = &carry.held {
         let orient = if item.flat { "horizontal" } else { "upright" };
         let yaw_deg = item.yaw.to_degrees().rem_euclid(360.0).round() as i32;
         let tilt_deg = item.pitch.to_degrees().round() as i32;

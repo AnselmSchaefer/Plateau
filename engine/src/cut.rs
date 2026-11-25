@@ -13,6 +13,7 @@ use wasmtime::bail;
 
 use crate::compose::PlacementTransform;
 use crate::edit::{Edit, Shape};
+use crate::physics::{Tool, material_props};
 use crate::{Instance, Material, MeshData, Result, SIZES, Scene, Vertex};
 
 const PERSON_HEIGHT: f32 = SIZES[1].1;
@@ -56,13 +57,7 @@ impl ClipPlane {
 
 /// Physical density (kg/m³) per engine material for scale-aware carry/cut checks.
 pub fn material_density(mat: Material) -> f32 {
-    match mat {
-        Material::Wood => 600.0,
-        Material::Stone => 2200.0,
-        Material::Soil | Material::Mud | Material::Sand => 1400.0,
-        Material::Water => 1000.0,
-        Material::Grass | Material::Leaf | Material::Moss => 180.0,
-    }
+    material_props(mat).density_kg_m3
 }
 
 /// Fresh-cut interior RGB tint multiplier so chopped wood/stone faces look distinct and natural.
@@ -96,6 +91,10 @@ pub struct ObjectPhysics {
     pub rooted: bool,
     /// Number of solid triangles remaining.
     pub solid_triangles: usize,
+    /// Dominant solid material (by geometric volume) for tool-interaction and buoyancy physics.
+    pub dominant_material: Material,
+    /// Bitmask of all `Material` variants present in the object's solid geometry.
+    pub material_mask: u16,
 }
 
 impl ObjectPhysics {
@@ -110,6 +109,8 @@ impl ObjectPhysics {
         let mut total_vol = 0.0f32;
         let mut total_mass_unit = 0.0f32;
         let mut solid_triangles = 0usize;
+        let mut mat_vol = [0.0f32; 9];
+        let mut material_mask = 0u16;
 
         for inst in &scene.instances {
             if has_solid && !inst.solid {
@@ -168,6 +169,11 @@ impl ObjectPhysics {
                 let dv = v6 * (1.0 / 6.0);
                 signed_vol += dv;
                 weighted_vol += dv * material_density(va.material);
+                let mi = va.material as usize;
+                if mi < mat_vol.len() {
+                    mat_vol[mi] += abs_f32(dv);
+                    material_mask |= 1u16 << mi;
+                }
                 dominant_mat = va.material;
                 tri_count += 1;
             }
@@ -182,12 +188,26 @@ impl ObjectPhysics {
                 let aabb_v = max_f32(mhi[0] - mlo[0], 0.02) * max_f32(mhi[1] - mlo[1], 0.02) * max_f32(mhi[2] - mlo[2], 0.02) * 0.15;
                 total_vol += aabb_v;
                 total_mass_unit += aabb_v * material_density(dominant_mat);
+                let mi = dominant_mat as usize;
+                if mi < mat_vol.len() {
+                    mat_vol[mi] += aabb_v;
+                    material_mask |= 1u16 << mi;
+                }
             }
         }
 
         if !lo[0].is_finite() {
             lo = [0.0; 3];
             hi = [0.0; 3];
+        }
+        let mut dominant_material = Material::Wood;
+        let mut best_mv = -1.0f32;
+        for &m in &Material::ALL {
+            let v = mat_vol[m as usize];
+            if v > best_mv {
+                best_mv = v;
+                dominant_material = m;
+            }
         }
         let local_center = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
         let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
@@ -202,6 +222,8 @@ impl ObjectPhysics {
             world_span: local_span * scale,
             rooted: lo[1] < -0.15,
             solid_triangles,
+            dominant_material,
+            material_mask,
         }
     }
 
@@ -310,13 +332,28 @@ pub fn check_carry(phys: &ObjectPhysics, is_sdf: bool, player_size: f32) -> Carr
     CarryDecision::Allowed { speed_factor }
 }
 
-/// Checks whether a player of height `player_size` can chop/cut this element.
+/// Checks whether a player of height `player_size` can chop/cut this element (workshop/any tool).
 /// Native SDF landforms (`is_sdf == true`) are carved with `B`; discrete `Scene` elements
 /// (including lazily promoted ones with carved tunnels) can be chopped cleanly at scale.
 pub fn check_cut(phys: &ObjectPhysics, is_sdf: bool, player_size: f32) -> std::result::Result<(), String> {
+    check_cut_with_tool(phys, is_sdf, player_size, Tool::All, None)
+}
+
+/// Checks whether a player of height `player_size` wielding `tool` can cut this element at
+/// `hit_material` (falling back to `phys.dominant_material`), enforcing both material-tool rules
+/// (e.g. a Saw cuts wood but refuses Stone) and scale limits.
+pub fn check_cut_with_tool(
+    phys: &ObjectPhysics,
+    is_sdf: bool,
+    player_size: f32,
+    tool: Tool,
+    hit_material: Option<Material>,
+) -> std::result::Result<(), String> {
     if is_sdf {
         return Err("Terrain landform — carve with B".into());
     }
+    let target_mat = hit_material.unwrap_or(phys.dominant_material);
+    tool.can_cut(target_mat)?;
     let r = max_f32(player_size / PERSON_HEIGHT, 1e-4);
     let max_cut_mass = 5000.0 * r * r * r;
     let max_cut_span = 14.0 * r;

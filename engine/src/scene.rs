@@ -415,14 +415,20 @@ impl SceneWorld {
 
     /// Exact ray-triangle hit against any visible static or dynamic instance belonging to a placed
     /// element, returning `(placement_id, hit_t, hit_world_point)`.
+    pub fn raycast_placed_surface(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32, [f32; 3])> {
+        self.raycast_placed_surface_material(origin, dir, max_dist).map(|(o, t, p, _)| (o, t, p))
+    }
+
+    /// Exact ray-triangle hit against any visible static or dynamic instance belonging to a placed
+    /// element, returning `(placement_id, hit_t, hit_world_point, hit_material)`.
     /// Prefers solid triangles when a solid hit exists at or near the ray, falling back to
     /// non-solid triangles so both cutting trunks and grabbing decorative items work cleanly.
-    pub fn raycast_placed_surface(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32, [f32; 3])> {
-        let mut best_solid: Option<(u32, f32)> = None;
-        let mut best_any: Option<(u32, f32)> = None;
+    pub fn raycast_placed_surface_material(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32, [f32; 3], Material)> {
+        let mut best_solid: Option<(u32, f32, Material)> = None;
+        let mut best_any: Option<(u32, f32, Material)> = None;
 
         let mut test_live = |owner: u32, live: &LiveInstance| {
-            let max_t = best_any.map_or(max_dist, |(_, t)| t);
+            let max_t = best_any.map_or(max_dist, |(_, t, _)| t);
             if ray_aabb(origin, dir, live.world_lo, live.world_hi, max_dist).is_none() {
                 return;
             }
@@ -433,19 +439,21 @@ impl SceneWorld {
             let ro = world_to_local(origin, &live.instance);
             let rd = world_dir_to_local(dir, &live.instance);
             let mut local_best = max_dist;
+            let mut local_mat = Material::Wood;
             let mut hit_any = false;
-            for &(ta, tb, tc, _) in &b.tris {
+            for &(ta, tb, tc, mat) in &b.tris {
                 if let Some(t) = ray_triangle(ro, rd, ta, tb, tc, local_best) {
                     local_best = t;
+                    local_mat = mat;
                     hit_any = true;
                 }
             }
             if hit_any {
-                if live.instance.solid && best_solid.is_none_or(|(_, bt)| local_best < bt) {
-                    best_solid = Some((owner, local_best));
+                if live.instance.solid && best_solid.is_none_or(|(_, bt, _)| local_best < bt) {
+                    best_solid = Some((owner, local_best, local_mat));
                 }
                 if local_best < max_t {
-                    best_any = Some((owner, local_best));
+                    best_any = Some((owner, local_best, local_mat));
                 }
             }
         };
@@ -466,10 +474,21 @@ impl SceneWorld {
         }
 
         // Prefer a solid surface hit (e.g., oak trunk behind outer canopy leaves) over a non-solid hit.
-        let chosen = best_solid.or(best_any)?;
-        let (owner, t) = chosen;
+        let (owner, t, mat) = best_solid.or(best_any)?;
         let p = [origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t];
-        Some((owner, t, p))
+        Some((owner, t, p, mat))
+    }
+
+    /// Returns the `placement_id` of the solid placed element directly supporting a player's `feet`
+    /// (if any), for platform riding and piloting floating boats/logs.
+    pub fn standing_on_placed(&self, feet: [f64; 3], size: f32) -> Option<u32> {
+        let lift = (0.18 * size).max(0.005);
+        let reach = (0.45 * size).max(0.025);
+        let origin = [feet[0] as f32, feet[1] as f32 + lift, feet[2] as f32];
+        let (owner, t, _, _) = self.raycast_placed_surface_material(origin, [0.0, -1.0, 0.0], reach)?;
+        let is_solid = self.solid_static.contains_key(&owner)
+            || self.dynamic.iter().any(|(&(o, _), l)| o == owner && l.visible && l.instance.solid);
+        (is_solid && t <= reach).then_some(owner)
     }
 }
 
@@ -487,10 +506,17 @@ impl<R: Region + ?Sized> Region for Combined<'_, R> {
             return Ok(());
         }
         for (&p, ans) in points.iter().zip(out.iter_mut()) {
-            if ans.distance > 0.0
-                && let Some(hit) = self.world.distance_to_solids(p, ans.distance)
-            {
-                *ans = hit;
+            if ans.distance > 0.0 {
+                if let Some(hit) = self.world.distance_to_solids(p, ans.distance) {
+                    *ans = hit;
+                }
+            } else if ans.material == Material::Water {
+                // Solid procedural geometry (boat hulls, floating logs, submerged piers, sunken
+                // stone) displaces liquid water so wading players stand cleanly on submerged decks.
+                let reach = (size * 0.25).max(0.08);
+                if let Some(hit) = self.world.distance_to_solids(p, reach) {
+                    *ans = hit;
+                }
             }
         }
         Ok(())

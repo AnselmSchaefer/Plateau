@@ -89,16 +89,27 @@ impl FallingElement {
     }
 }
 
-/// Runtime resource holding the currently carried item (if any) and active topple animations.
+/// Runtime resource holding the currently carried item (if any), active topple animations,
+/// floating/sinking water-tracked elements, and active boat/raft piloting state.
 #[derive(Resource, Default)]
 pub struct CarryState {
     pub held: Option<CarriedItem>,
     pub falling: Vec<FallingElement>,
+    /// Placed element IDs currently floating in water (bobbing & pilotable).
+    pub floating: std::collections::HashSet<u32>,
+    /// Placed element ID currently being paddled/steered by the player (`F` while aboard).
+    pub piloting: Option<u32>,
+    /// Elapsed simulation time for smooth deterministic water bobbing.
+    pub float_time: f32,
 }
 
 impl CarryState {
     pub fn is_carrying(&self) -> bool {
         self.held.is_some()
+    }
+
+    pub fn is_piloting(&self) -> bool {
+        self.piloting.is_some()
     }
 
     pub fn speed_factor(&self) -> f32 {
@@ -107,6 +118,14 @@ impl CarryState {
 
     pub fn cancel_fall(&mut self, id: u32) {
         self.falling.retain(|f| f.id != id);
+    }
+
+    pub fn forget_element(&mut self, id: u32) {
+        self.cancel_fall(id);
+        self.floating.remove(&id);
+        if self.piloting == Some(id) {
+            self.piloting = None;
+        }
     }
 }
 

@@ -561,3 +561,80 @@ fn tiny_player_carving_at_shallow_shoreline_expands_water_without_receding_pond(
         assert!(a.distance < 0.0, "tiny shoreline sample {idx} should be submerged water: {a:?}");
     }
 }
+
+#[test]
+fn tiny_cave_breaching_gentle_pond_sketched_shoreline_fills_with_water() {
+    // Regression test against the real `made/pond-sketched/area.wasm` (`ground * 0.65`, gentle
+    // sloping mud/sand beach, LEVEL = -0.35): a tiny player digs a dry cave inland from the
+    // shoreline and then breaches the thin beach lip into the pond — water must flood the entire
+    // tiny cave cleanly without receding!
+    let wasm_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("made/pond-sketched/area.wasm");
+    if !wasm_path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(&wasm_path).unwrap();
+    let compiled = plateau_engine::Compiled::new(&bytes, plateau_engine::Limits::default()).unwrap();
+    let mut base = compiled.instantiate(7).unwrap();
+
+    // Walk north (-Z) from dry southern beach (29, -0.351, 53) inward until hitting pond water!
+    let mut shore_z = 53.0f32;
+    let mut probe = Vec::new();
+    for i in 0..1500 {
+        let z = 53.0 - i as f32 * 0.01;
+        base.sample(&[[29.0, -0.351, z]], SIZES[0].1, &mut probe).unwrap();
+        if probe[0].material == Material::Water && probe[0].distance <= 0.0 {
+            shore_z = z;
+            break;
+        }
+    }
+    assert!(shore_z < 52.5 && shore_z > 40.0, "expected south pond shore in (40, 52.5), found {shore_z}");
+
+    let r = 0.75 * SIZES[0].1; // 0.01275 m
+    let blend = r * 0.35;
+    let mut edits = EditLog::new();
+    let mut water = WaterLog::new();
+
+    // 1. Dig a tiny dry cave 3 cm inland from the water's edge first (separated by ~9 mm of solid mud: stays dry!).
+    let cave = Edit::carve(Shape::Sphere { radius: r }, [29.0, -0.354, shore_z + 0.030], blend, None, SIZES[0].1);
+    let mut world0 = Composed::new(compiled.instantiate(7).unwrap(), Arc::new(ComposedLog::empty()));
+    assert!(water.expand_from_carve(&mut world0, &edits, &cave, None).unwrap().is_none(), "inland tiny cave should start dry");
+    edits.push(cave).unwrap();
+
+    // 2. Breach the mud lip right at `shore_z + 0.012` (grazing the razor-thin shoreline and connecting to the cave!).
+    let breach = Edit::carve(Shape::Sphere { radius: r }, [29.0, -0.352, shore_z + 0.012], blend, None, SIZES[0].1);
+    let mut world1 = Composed::new(
+        compiled.instantiate(7).unwrap(),
+        Arc::new(ComposedLog::new_with_water(Arc::new(edits.clone()), Vec::new(), Arc::new(water.clone()), 1)),
+    );
+    let wb = water.expand_from_carve(&mut world1, &edits, &breach, None).unwrap();
+    assert!(wb.is_some(), "breaching pond-sketched gentle beach at tiny scale must trigger water expansion");
+    edits.push(breach).unwrap();
+
+    let level = water.bodies()[0].level;
+    assert!((level - (-0.35)).abs() < 0.002, "expected pond-sketched level ~ -0.35, got {level}");
+
+    // Verify BOTH the breach AND the previously dry tiny cave are now filled with water!
+    let mut composed = Composed::new(
+        compiled.instantiate(7).unwrap(),
+        Arc::new(ComposedLog::new_with_water(Arc::new(edits), Vec::new(), Arc::new(water), 2)),
+    );
+    let mut ans = Vec::new();
+    composed
+        .sample(
+            &[
+                [29.0, -0.354, shore_z - 0.01],
+                [29.0, -0.354, shore_z + 0.012],
+                [29.0, -0.354, shore_z + 0.030],
+            ],
+            SIZES[0].1,
+            &mut ans,
+        )
+        .unwrap();
+    for (idx, a) in ans.iter().enumerate() {
+        assert_eq!(a.material, Material::Water, "tiny cave sample {idx} stayed dry: {a:?}");
+        assert!(a.distance < 0.0, "tiny cave sample {idx} should be submerged water: {a:?}");
+    }
+}

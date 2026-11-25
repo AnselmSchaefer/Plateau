@@ -15,6 +15,7 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use plateau_engine::compose::PlacedElement;
 use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, Shape, WorldSave};
+use plateau_engine::physics::Tool;
 use plateau_engine::picture::colour;
 use plateau_engine::rules::RuleBook;
 use plateau_engine::water::WaterLog;
@@ -77,6 +78,8 @@ impl BrushPreset {
 pub struct Sculpt {
     pub active: bool,
     pub preset: BrushPreset,
+    /// Active material-aware tool governing cutting (`K`) and carving (`B`).
+    pub tool: Tool,
     pub material_idx: usize,
     /// Brush radius as a multiple of `player.body.size`.
     pub radius_mult: f32,
@@ -120,6 +123,7 @@ impl Sculpt {
         Sculpt {
             active: false,
             preset: BrushPreset::HillSphere,
+            tool: Tool::All,
             material_idx: 0, // Soil
             radius_mult: 0.75,
             edits,

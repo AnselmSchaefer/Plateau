@@ -18,6 +18,7 @@ pub mod cut;
 pub mod edit;
 pub mod laws;
 pub mod mesh_sdf;
+pub mod physics;
 pub mod picture;
 pub mod reach;
 pub mod rings;
@@ -32,6 +33,7 @@ pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, Elemen
 pub use cut::{CarryDecision, ClipPlane, ObjectPhysics};
 pub use edit::{Edit, EditLog, Edited, Op, SavedTile, Shape, WorldSave};
 pub use mesh_sdf::MeshSdf;
+pub use physics::{BuoyancyState, MaterialProps, Tool, WATER_DENSITY, compute_buoyancy, effective_displacement_m3, material_props, player_mass_kg, step_floating_move};
 pub use rules::{Action, AreaPolicy, CutCarryPolicy, Denial, LOCAL_PLAYER, Plot, Role, RolePolicy, RuleBook};
 pub use wasm::{Compiled, Limits, Wasm};
 pub use water::{WaterBasin, WaterBody, WaterLog};

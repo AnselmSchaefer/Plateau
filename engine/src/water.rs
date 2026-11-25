@@ -561,66 +561,132 @@ impl WaterLog {
     }
 }
 
-/// Probes a deterministic 3D lattice inside and just outside `edit` to find if it touches
+/// Probes deterministic vertical columns across and just outside `edit` to find if it touches
 /// `Material::Water`, and if so refines the exact hydrostatic water surface `level`.
-/// All search margins and steps scale strictly with `edit.shape.radius()` so tiny (1.7 cm),
-/// person (1.7 m), and giant (17 m) shoreline carves all detect shallow water cleanly.
+///
+/// Uses 17 horizontal columns (center + 8 inner ring + 8 outer ring) × 16 vertical strata plus a
+/// surface-transition pass at every air→solid crossing, so even a 0.5 mm razor-thin shoreline
+/// meniscus on a gently sloping `ground * 0.65` beach is detected reliably at Tiny (1.7 cm),
+/// Person (1.7 m), and Giant (17 m) scales.
 fn detect_connected_water(region: &mut dyn Region, edit: &Edit) -> Result<Option<(f32, [f32; 3])>> {
     let (lo, hi) = edit.influence_bounds();
     let r = edit.shape.radius();
-    let margin = max_f32(0.25 * r, 0.003);
+    let margin = max_f32(0.30 * r, 0.004);
     let plo = [lo[0] - margin, lo[1] - margin, lo[2] - margin];
     let phi = [hi[0] + margin, hi[1] + margin, hi[2] + margin];
-    const N: usize = 7;
-    let mut probes = Vec::with_capacity(N * N * N);
-    for iz in 0..N {
-        let tz = iz as f32 / (N - 1) as f32;
-        let z = plo[2] + (phi[2] - plo[2]) * tz;
-        for iy in 0..N {
-            let ty = iy as f32 / (N - 1) as f32;
+
+    // 17 deterministic XZ columns covering center, inner ring (0.5x), and outer rim (1.0x).
+    let cx = 0.5 * (plo[0] + phi[0]);
+    let cz = 0.5 * (plo[2] + phi[2]);
+    let rx = 0.5 * (phi[0] - plo[0]);
+    let rz = 0.5 * (phi[2] - plo[2]);
+    const DIAG: f32 = 0.707_106_77;
+    const DIRS: [[f32; 2]; 8] = [
+        [1.0, 0.0],
+        [DIAG, DIAG],
+        [0.0, 1.0],
+        [-DIAG, DIAG],
+        [-1.0, 0.0],
+        [-DIAG, -DIAG],
+        [0.0, -1.0],
+        [DIAG, -DIAG],
+    ];
+    let mut cols = Vec::with_capacity(17);
+    cols.push([cx, cz]);
+    for &[dx, dz] in &DIRS {
+        cols.push([cx + dx * rx * 0.5, cz + dz * rz * 0.5]);
+    }
+    for &[dx, dz] in &DIRS {
+        cols.push([cx + dx * rx, cz + dz * rz]);
+    }
+
+    const NY: usize = 16;
+    let mut probes = Vec::with_capacity(cols.len() * NY);
+    for &[x, z] in &cols {
+        for iy in 0..NY {
+            let ty = iy as f32 / (NY - 1) as f32;
             let y = plo[1] + (phi[1] - plo[1]) * ty;
-            for ix in 0..N {
-                let tx = ix as f32 / (N - 1) as f32;
-                let x = plo[0] + (phi[0] - plo[0]) * tx;
-                probes.push([x, y, z]);
-            }
+            probes.push([x, y, z]);
         }
     }
     let size = max_f32(edit.stamp_size, 0.017).min(17.0);
     let mut out = Vec::new();
     chunk::sample(region, &probes, size, &mut out)?;
 
-    // Pick the highest probe point that is strictly submerged inside `Material::Water`
-    // (`distance <= 0.0`), so upward bracketing always starts genuinely underwater.
+    // 1. Pick the highest probe point strictly submerged inside `Material::Water` (`distance <= 0.0`).
     let mut best_water: Option<[f32; 3]> = None;
     for (&p, ans) in probes.iter().zip(&out) {
         if ans.material == Material::Water && ans.distance <= 0.0 && best_water.is_none_or(|b| p[1] > b[1]) {
             best_water = Some(p);
         }
     }
-    // Fallback when shallow shoreline water falls between two vertical lattice planes: any air
-    // probe whose nearest surface is `Material::Water` tells us how far straight down the water
-    // lies. Step straight down by a scale-proportional dip (falling back to 0.2 mm for razor-thin
-    // shorelines) and confirm we land genuinely submerged within the carve's reach.
+
+    // 2. Surface-transition & shallow-water fallback:
+    //    - Any air probe seeing `Material::Water` directly below steps down by a tiny dip.
+    //    - Any vertical air→solid transition straddling a paper-thin (< y_step) beach meniscus
+    //      (where `ground * 0.65` can hide shallow water from the air probe above!) probes 3
+    //      sub-intervals right inside the transition bracket!
     if best_water.is_none() {
-        let y_step = (phi[1] - plo[1]) / (N - 1) as f32;
+        let y_step = (phi[1] - plo[1]) / (NY - 1) as f32;
         let reach_limit = edit.blend + margin;
-        let dip_primary = min_f32(max_f32(0.08 * r, 0.0005), 0.015);
-        let dips = [dip_primary, 0.0002];
-        let mut sub_out = Vec::new();
-        for (&p, ans) in probes.iter().zip(&out) {
-            if ans.material == Material::Water && ans.distance > 0.0 && ans.distance <= y_step {
-                for &dip in &dips {
-                    let sub = [p[0], p[1] - ans.distance - dip, p[2]];
-                    if edit.distance(sub) > reach_limit {
-                        continue;
-                    }
-                    chunk::sample(region, &[sub], size, &mut sub_out)?;
-                    if sub_out[0].material == Material::Water && sub_out[0].distance <= 0.0 {
-                        if best_water.is_none_or(|b| sub[1] > b[1]) {
-                            best_water = Some(sub);
+        let dip_primary = min_f32(max_f32(0.08 * r, 0.0004), 0.015);
+        let mut fine_pts: Vec<[f32; 3]> = Vec::new();
+
+        for ci in 0..cols.len() {
+            let base_i = ci * NY;
+            for iy in 0..NY {
+                let p = probes[base_i + iy];
+                let ans = out[base_i + iy];
+                if ans.material == Material::Water && ans.distance > 0.0 && ans.distance <= y_step * 1.5 {
+                    for dip in [dip_primary, 0.0002] {
+                        let sub = [p[0], p[1] - ans.distance - dip, p[2]];
+                        if edit.distance(sub) <= reach_limit {
+                            fine_pts.push(sub);
                         }
-                        break;
+                    }
+                }
+                if iy + 1 < NY {
+                    let ans_up = out[base_i + iy + 1];
+                    if ans.distance <= 0.0 && ans_up.distance > 0.0 {
+                        let y0 = p[1];
+                        let y1 = probes[base_i + iy + 1][1];
+                        for frac in [0.15f32, 0.35, 0.55, 0.75] {
+                            let sub = [p[0], y0 + (y1 - y0) * frac, p[2]];
+                            if edit.distance(sub) <= reach_limit {
+                                fine_pts.push(sub);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !fine_pts.is_empty() {
+            let mut fine_out = Vec::new();
+            chunk::sample(region, &fine_pts, size, &mut fine_out)?;
+            for (&p, ans) in fine_pts.iter().zip(&fine_out) {
+                if ans.material == Material::Water && ans.distance <= 0.0 && best_water.is_none_or(|b| p[1] > b[1]) {
+                    best_water = Some(p);
+                }
+            }
+            // One final micro-dip if a fine transition point landed just millimetres above water.
+            if best_water.is_none() {
+                let mut micro_pts = Vec::new();
+                for (&p, ans) in fine_pts.iter().zip(&fine_out) {
+                    if ans.material == Material::Water && ans.distance > 0.0 && ans.distance <= y_step {
+                        let sub = [p[0], p[1] - ans.distance - 0.0002, p[2]];
+                        if edit.distance(sub) <= reach_limit {
+                            micro_pts.push(sub);
+                        }
+                    }
+                }
+                if !micro_pts.is_empty() {
+                    let mut micro_out = Vec::new();
+                    chunk::sample(region, &micro_pts, size, &mut micro_out)?;
+                    for (&p, ans) in micro_pts.iter().zip(&micro_out) {
+                        if ans.material == Material::Water && ans.distance <= 0.0 && best_water.is_none_or(|b| p[1] > b[1]) {
+                            best_water = Some(p);
+                        }
                     }
                 }
             }
