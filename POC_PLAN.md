@@ -710,6 +710,23 @@ triangles in 1 draw call):
   while keeping non-solid swaying canopies/handrails in `Scene`, persisted as `promoted <idx>` in
   `WorldSave` and cleanly demoted on `Z` undo).
 
+*Step 8c done (2026-11-24): chopping/felling, carrying, rotating/tilting, and relocating discrete physical objects across scales.*
+
+- **Watertight mesh clipping & scale-aware object physics (`engine/src/cut.rs`)**: deterministic
+  `ClipPlane` Sutherland–Hodgman `clip_scene` with watertight cross-section caps, `ObjectPhysics`
+  (world mass, span, volume, center of mass), scale-aware `check_carry` / `check_cut`,
+  `toppled_transform`, and `world_edit_to_local` so element-local carved tunnels travel and rotate
+  with chopped/carried objects.
+- **Interactive felling & carrying (`engine/src/compose.rs`, `engine/src/edit.rs`, `play/src/carry.rs`, `play/src/main.rs`)**:
+  `K` chops discrete objects with animated toppling; `G` grabs/carries/places with `H` horizontal
+  bridge flip, `R`/`T` yaw, and scroll/`[`/`]` pitch tilt, carry-weight pace scaling,
+  `PROMOTED_SDF_MAX_SIZE_RATIO = 6.5` macro-LOD proxy so carved trunks stay solid at Giant scale,
+  and full `WorldSave` persistence (`rot`, `clip`, `el-sdf`) plus unified `Z`/`Y` undo/redo.
+- **Exact multi-component `MeshSdf` (`engine/src/mesh_sdf.rs`)**: connected-component exact union
+  `min_k d_k(p)`, outward triangle orientation, and hybrid strict BVH ray-winding with exact
+  generalized solid-angle winding fallback (eliminating internal seams and tiny-scale edge cracks).
+  Verified by 18 passing tests in `engine/tests/elements.rs`.
+
 ### 9. Two areas side by side (three or four days, if there is time)
 
 - Two areas made one after the other, the second told the first's border.
@@ -719,22 +736,60 @@ triangles in 1 draw call):
 **Done when** two of the test set's areas lie side by side with no seam a giant or a tiny person
 notices.
 
+*Done (2026-11-25): multi-area `Atlas`, `borders_match` law, neighbor-aware `plateau make`, and seamless multi-area walking.*
+
+- **Multi-area `Atlas<R>` & C¹ seam blending (`engine/src/atlas.rs`, `sdk/src/lib.rs`)**: places
+  one or more 64 m × 64 m areas on an integer grid `(gx, gz)` with zero overhead for single-tile
+  worlds and a deterministic 3 m (`SEAM_HALF = 1.5 m`) symmetric C¹ smoothstep SDF blend across
+  shared edges (bilinear at 4-tile corners), turning small height or detail-noise differences into
+  a gentle `< 5°` transition invisible at tiny, person, and giant scales. Added deterministic
+  `plateau_sdk::edge_height` / `Edge::height_at` helpers without altering `plateau:region@0.1.0`.
+- **Border extraction & `borders_match` law (`engine/src/atlas.rs`, `engine/src/laws.rs`)**:
+  `BorderProfile::extract` samples 65 columns along a neighbour's edge (ground height, underwater
+  bed height, water level, surface material) and formats a copy-pasteable `[f32; 65]` table for
+  Claude. `laws::borders_match` checks ground height (`<= 15 cm`), water continuity & level
+  (`<= 5 cm`), dry-land surface material continuity (`±1.5 m` along edge), and declared
+  `describe().borders` sanity across 129 edge stations.
+- **Multi-area engine & `plateau-play` (`engine/src/rings.rs`, `engine/src/scene.rs`, `engine/src/reach.rs`, `play/src/chunks.rs`, `play/src/scene.rs`, `play/src/main.rs`)**:
+  generalized chunk rings (`Rings::with_tiles`, `over_tiles`, `shown_over`), `reach::World::new_in`,
+  and `SceneWorld` area-tile owner isolation (`AREA_OWNER_BASE`, `is_area_owner`) so multiple
+  areas' procedural scenes, dynamic animations, lights, and `tick`/`interact` plugins run side by
+  side without colliding with Step 8a–8c edits or placed elements. `plateau-play` accepts
+  `--north`/`--east`/`--south`/`--west <area.wasm>` and `--tile <gx>,<gz>:<area.wasm>`, shows
+  the current area in the HUD, and supports cross-border sculpting, placing, chopping, and carrying.
+- **Neighbor-aware `plateau make` & real test-set pair (`make/src/lib.rs`, `make/src/main.rs`, `make/GUIDE.md`, `made/forest-beside-pond/`)**:
+  `plateau make ... --beside west:pond-sketched` generated `made/forest-beside-pond/` ("A forest
+  where the trees are houses for the tiny and stools for giants.") adjacent to `made/pond-sketched/`:
+  passed `borders match (west)` on round 1, kept every law after 4 rounds (2 fixes, 1 look with
+  stitched `seam-west.png` and `seam-view-west.png`, 26 min, reckoned $5.96), and passes
+  `plateau check-pair pond-sketched east forest-beside-pond`.
+- **Verified** (`engine/tests/atlas.rs`, `make/tests/make.rs`): 6 new engine tests (including
+  walking across `x = 64` between the real `pond-sketched` and `forest-beside-pond` `.wasm`
+  modules at tiny, person, and giant scales) + 1 new `make` stand-in test all passing.
+
 ### 10. What the PoC found (two days)
 
 - An hour's play at each size in the best areas; what was worth finding, what was not.
 - The two questions answered, with the numbers of step 5.
 - What the next stage needs: networking, creatures, the gallery, the browser.
 
+*Done (2026-11-25): written up in [`POC_FINDINGS.md`](POC_FINDINGS.md).* Both PoC questions are
+answered **yes**, backed by 9/9 (100%) Claude-generated areas keeping every law (within 0–2 fixes
+each), 66–256 FPS multi-scale rendering with zero-hole chunk streaming, multi-scale modifiable
+worlds (Steps 8a–8c), seamless multi-area walking (`pond-sketched` + `forest-beside-pond`, Step 9),
+106 passing offline tests, and a concrete next-stage roadmap for networking, creatures, the
+gallery/signing, and the browser.
+
 ## Measures
 
-| Measure | Target |
-|---|---|
-| Areas of the test set that keep every law | 3 of 5 or more |
-| Rounds of Claude per area | at most 3 fixes and 1 look |
-| Frames a second, at each size, on this machine | 60 |
-| A chunk made, near the player | under 20 ms |
-| Hashes the same on two runs and two optimization levels | always |
-| Moving between sizes worth it | judged in step 10 |
+| Measure | Target | PoC Result |
+|---|---|---|
+| Areas of the test set that keep every law | 3 of 5 or more | **5 of 5** unsketched (**9 of 9** total across sketched, interactive, and border-matched runs) |
+| Rounds of Claude per area | at most 3 fixes and 1 look | **0–2 fixes**, 1 look (mean 1.0 fix) |
+| Frames a second, at each size, on this machine | 60 | **66–159 FPS** (`pond-sketched`, 0 holes), **112–256 FPS** (`garden`) |
+| A chunk made, near the player | under 20 ms | **3 ms** mean (person), **13 ms** mean (tiny), off-thread |
+| Hashes the same on two runs and two optimization levels | always | **always** (`same_everywhere` + `nans_unseen` + `WorldSave` round-trip) |
+| Moving between sizes worth it | judged in step 10 | **yes** — especially paired with multi-scale sculpting, cutting, carrying, and seamless multi-area borders (`POC_FINDINGS.md`) |
 
 ## Risks
 
