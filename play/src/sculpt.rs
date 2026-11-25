@@ -14,8 +14,10 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use plateau_engine::compose::PlacedElement;
-use plateau_engine::edit::{Edit, EditLog, Op, Shape, WorldSave};
+use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, Shape, WorldSave};
 use plateau_engine::picture::colour;
+use plateau_engine::rules::RuleBook;
+use plateau_engine::water::WaterLog;
 use plateau_engine::{Material, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +82,16 @@ pub struct Sculpt {
     pub radius_mult: f32,
     /// Current immutable edit log snapshot shared with `ComposedLog`.
     pub edits: Arc<EditLog>,
+    /// Optional author list aligned with `edits` for attribution and ownership checks.
+    pub edit_authors: Vec<Option<String>>,
+    /// Current immutable hydrostatic water body log shared with `ComposedLog`.
+    pub water: Arc<WaterLog>,
+    /// Multi-scale ownership & permission rule book enforced on all world mutations.
+    pub rules: RuleBook,
+    /// Current player identifier checked against `rules` (default `"local"`).
+    pub player_id: String,
+    /// Multi-area tile manifest persisted in `WorldSave`.
+    pub tiles: Vec<SavedTile>,
     pub save_path: PathBuf,
     pub area_name: String,
     pub seed: u64,
@@ -93,13 +105,29 @@ pub struct Sculpt {
 }
 
 impl Sculpt {
-    pub fn new(edits: Arc<EditLog>, save_path: PathBuf, area_name: String, seed: u64) -> Sculpt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        edits: Arc<EditLog>,
+        edit_authors: Vec<Option<String>>,
+        water: Arc<WaterLog>,
+        rules: RuleBook,
+        player_id: String,
+        tiles: Vec<SavedTile>,
+        save_path: PathBuf,
+        area_name: String,
+        seed: u64,
+    ) -> Sculpt {
         Sculpt {
             active: false,
             preset: BrushPreset::HillSphere,
             material_idx: 0, // Soil
             radius_mult: 0.75,
             edits,
+            edit_authors,
+            water,
+            rules,
+            player_id,
+            tiles,
             save_path,
             area_name,
             seed,
@@ -140,6 +168,7 @@ impl Sculpt {
         let mut next = (*self.edits).clone();
         next.push(edit)?;
         self.edits = Arc::new(next);
+        self.edit_authors.push(Some(self.player_id.clone()));
         self.dirty = true;
         Ok(())
     }
@@ -148,19 +177,33 @@ impl Sculpt {
         let mut next = (*self.edits).clone();
         let removed = next.pop()?;
         self.edits = Arc::new(next);
+        self.edit_authors.pop();
         self.dirty = true;
         Some(removed)
     }
 
-    pub fn replace_edits(&mut self, edits: Vec<Edit>) -> Result<()> {
+    pub fn replace_world_state(
+        &mut self,
+        edits: Vec<Edit>,
+        edit_authors: Vec<Option<String>>,
+        water: WaterLog,
+        rules: RuleBook,
+    ) -> Result<()> {
         let next_rev = self.edits.revision() + 1;
         self.edits = Arc::new(EditLog::from_edits_with_revision(edits, next_rev)?);
+        self.edit_authors = edit_authors;
+        self.water = Arc::new(water);
+        self.rules = rules;
         self.dirty = false;
         Ok(())
     }
 
     pub fn save_world(&mut self, elements: &[PlacedElement]) -> Result<()> {
-        let world = WorldSave::with_elements(self.area_name.clone(), self.seed, self.edits.edits().to_vec(), elements.to_vec());
+        let mut world = WorldSave::with_elements(self.area_name.clone(), self.seed, self.edits.edits().to_vec(), elements.to_vec());
+        world.tiles = self.tiles.clone();
+        world.rules = self.rules.clone();
+        world.water = self.water.bodies().to_vec();
+        world.edit_authors = self.edit_authors.clone();
         world.save(&self.save_path)?;
         self.dirty = false;
         Ok(())

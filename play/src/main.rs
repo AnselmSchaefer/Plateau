@@ -35,9 +35,11 @@ use plateau_engine::atlas::{Atlas, CompiledAtlas, Side, TileSpec};
 use plateau_engine::body::{self, Body, Intent};
 use plateau_engine::compose::{Composed, ComposedLog, ElementRuntime, PlacedElement, PlacementTransform};
 use plateau_engine::cut::{CarryDecision, check_carry, check_cut, choose_cut_plane, clip_scene, format_mass, toppled_transform, world_edit_to_local};
-use plateau_engine::edit::{Edit, EditLog, Op, WorldSave, surface_normal};
+use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, WorldSave, surface_normal};
+use plateau_engine::rules::{Action, LOCAL_PLAYER, RuleBook};
 use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld, is_area_owner};
-use plateau_engine::{Compiled, ElementBounds, Limits, PlayerState, Region, SIZES, START, Scene, WIDTH, Wasm, rings};
+use plateau_engine::water::WaterLog;
+use plateau_engine::{Compiled, ElementBounds, Limits, Material, PlayerState, Region, SIZES, START, Scene, WIDTH, Wasm, rings};
 use scene::SceneVisuals;
 use sculpt::{BrushGhost, Sculpt};
 use surface::{Materials, SurfaceMaterial};
@@ -58,11 +60,13 @@ fn main() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut args = std::env::args().skip(1);
     let (mut module, mut seed, mut tour, mut behind, mut save_arg) = (here.join("areas/modules/garden.wasm"), 7u64, None, false, None);
+    let mut player_id = LOCAL_PLAYER.to_string();
     let mut extra_elements: Vec<PathBuf> = Vec::new();
     let mut extra_tiles: Vec<([i32; 2], PathBuf)> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
+            "--player" => player_id = args.next().expect("--player takes a player id"),
             "--tour" => tour = Some(PathBuf::from(args.next().expect("--tour takes a folder"))),
             "--behind" => behind = true,
             "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
@@ -82,7 +86,7 @@ fn main() {
             _ => module = PathBuf::from(arg),
         }
     }
-    let (initial_edits, initial_elements) = match &save_arg {
+    let (initial_edits, initial_edit_authors, initial_water, initial_rules, initial_elements) = match &save_arg {
         Some(path) if path.exists() => {
             let loaded = WorldSave::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             if loaded.seed != seed {
@@ -90,9 +94,10 @@ fn main() {
                 seed = loaded.seed;
             }
             let log = Arc::new(EditLog::from_edits(loaded.edits).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
-            (log, loaded.elements)
+            let water = Arc::new(WaterLog::from_bodies(loaded.water).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
+            (log, loaded.edit_authors, water, loaded.rules, loaded.elements)
         }
-        _ => (Arc::new(EditLog::new()), Vec::new()),
+        _ => (Arc::new(EditLog::new()), Vec::new(), Arc::new(WaterLog::new()), RuleBook::new(), Vec::new()),
     };
     let compile_tile = |path: &PathBuf, at: [i32; 2], seed: u64| -> TileSpec {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e} (areas/build.sh builds the areas)", path.display()));
@@ -100,8 +105,10 @@ fn main() {
         TileSpec { at, seed, compiled }
     };
     let mut tile_specs = vec![compile_tile(&module, [0, 0], seed)];
+    let mut saved_tiles = vec![SavedTile { at: [0, 0], module: module.to_string_lossy().into_owned(), seed }];
     for (at, path) in &extra_tiles {
         tile_specs.push(compile_tile(path, *at, seed));
+        saved_tiles.push(SavedTile { at: *at, module: path.to_string_lossy().into_owned(), seed });
     }
     let compiled_atlas = Arc::new(CompiledAtlas::new(tile_specs).expect("valid atlas tiles"));
     let stem = module
@@ -114,7 +121,7 @@ fn main() {
     let save_path = save_arg.unwrap_or_else(|| here.join("target/saves").join(format!("{stem}-seed{seed}.plateau")));
 
     let mut place_mode = PlaceMode::new(here.clone(), extra_elements, initial_elements);
-    let initial_composed = place_mode.build_composed(initial_edits.clone());
+    let initial_composed = place_mode.build_composed(initial_edits.clone(), initial_water.clone());
     let mut atlas_live = compiled_atlas.instantiate().expect("the area atlas made");
     let tile_names: Vec<([i32; 2], String)> = atlas_live
         .describe_tiles()
@@ -173,7 +180,17 @@ fn main() {
             initial_element_scenes,
             initial_composed: Some(initial_composed),
         })
-        .insert_resource(Sculpt::new(initial_edits, save_path, described.name.clone(), seed))
+        .insert_resource(Sculpt::new(
+            initial_edits,
+            initial_edit_authors,
+            initial_water,
+            initial_rules,
+            player_id,
+            saved_tiles,
+            save_path,
+            described.name.clone(),
+            seed,
+        ))
         .insert_resource(place_mode)
         .insert_resource(CarryState::default())
         .insert_resource(LiveScene { world, elapsed: 0.0, interact_pressed: false, holding_use: false })
@@ -371,7 +388,7 @@ impl EditCtx<'_, '_> {
 
     fn commit_composed(&mut self, inv: Invalidate<'_>) {
         let exclude = self.excluded_sdf_ids();
-        let composed = self.place.build_composed_excluding(self.sculpt.edits.clone(), &exclude);
+        let composed = self.place.build_composed_excluding(self.sculpt.edits.clone(), self.sculpt.water.clone(), &exclude);
         self.physics.0.log = composed.clone();
         self.physics.0.prune_instances();
         self.chunks.set_composed(composed, inv);
@@ -447,7 +464,7 @@ impl EditCtx<'_, '_> {
         }
         if !mid_fall && let Some(bounds) = old_bounds {
             let inv_bounds = [(old_tf, bounds), (tf, bounds)];
-            self.commit_composed(Invalidate::Combined { edit: None, bounds: &inv_bounds });
+            self.commit_composed(Invalidate::Combined { edit: None, bounds: &inv_bounds, water: None });
         }
         self.sculpt.dirty = true;
         if let Some(p) = player {
@@ -623,7 +640,8 @@ impl EditCtx<'_, '_> {
         self.carry.falling.clear();
         let saved = self.sculpt.load_world()?;
         let edit_count = saved.edits.len();
-        self.sculpt.replace_edits(saved.edits)?;
+        let water = WaterLog::from_bodies(saved.water)?;
+        self.sculpt.replace_world_state(saved.edits, saved.edit_authors, water, saved.rules)?;
         self.elements.0.clear(&mut self.live.world);
         scene::despawn_placed_layers(&mut self.commands, &mut self.visuals);
         self.place.placed.clear();
@@ -752,7 +770,11 @@ fn look_and_ask(
 
     let tool_active = ctx.sculpt.active || ctx.place.active || ctx.carry.is_carrying();
     if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
-        ctx.live.interact_pressed = true;
+        let act = Action::Interact { at: player.body.feet.map(|c| c as f32) };
+        match ctx.sculpt.rules.check(&ctx.sculpt.player_id, &act) {
+            Ok(()) => ctx.live.interact_pressed = true,
+            Err(denial) => player.say(denial.reason),
+        }
     }
     ctx.live.holding_use = keys.pressed(KeyCode::KeyF) || (!tool_active && buttons.pressed(MouseButton::Right));
 
@@ -866,61 +888,47 @@ fn look_and_ask(
                     if let Some(target_id) = direct_scene_target
                         && let Some(pos) = ctx.place.placed.iter().position(|e| e.id == target_id)
                     {
-                        let module = ctx.place.placed[pos].module.clone();
-                        let seed = ctx.place.placed[pos].seed;
-                        let clips = ctx.place.placed[pos].clips.clone();
-                        let tf = ctx.place.placed[pos].transform();
-                        if let Ok(Some(_)) = ctx.place.catalog.get_or_build_mesh_sdf(&module, seed, &clips) {
-                            let local_edit = world_edit_to_local(&edit, tf);
-                            let newly_promoted = if ctx.place.placed[pos].is_promoted() {
-                                None
-                            } else {
-                                ctx.place.placed[pos].promoted = Some(edit_idx);
-                                Some(edit_idx)
-                            };
-                            ctx.place.placed[pos].local_edits.push(local_edit);
-                            ctx.sculpt.dirty = true;
-                            if newly_promoted.is_some()
-                                && let Some(world_scene) = ctx.elements.0.set_promoted(target_id, Some(edit_idx), &mut ctx.live.world)
-                            {
-                                let skip = ctx.elements.0.should_skip_solid(target_id);
-                                scene::spawn_layer_filtered(&mut ctx.commands, &mut ctx.meshes, &mut ctx.visuals, target_id, &world_scene, &ctx.live.world, skip);
-                            }
-                            if newly_promoted.is_some() {
-                                let bounds = ctx.place.sdf_bounds_of(&ctx.place.placed[pos]);
-                                let promo_bounds: Vec<_> = bounds.into_iter().map(|b| (tf, b)).collect();
-                                ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
-                            } else {
-                                ctx.commit_composed(Invalidate::Edit(&edit));
-                            }
-                            ctx.place.undo_stack.push(WorldAction::ElementSdfEdit { id: target_id, edit: local_edit, newly_promoted });
-                            ctx.place.redo_stack.clear();
-                            if newly_promoted.is_some() {
-                                let name = ctx.place.catalog.get(&module).map_or_else(|| format!("#{target_id}"), |c| c.name.clone());
-                                player.say(format!("{name} sculpted (still choppable & carriable)"));
-                            }
-                            if edit.op == Op::Add {
-                                let (_, hi) = edit.influence_bounds();
-                                let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
-                                let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
-                                let _ = player.body.surface_from_solid(&mut combined, max_lift);
-                            }
-                            ctx.sculpt.last_stamp = Some(edit.center);
-                            ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
-                        }
-                    } else {
-                        // World terrain sculpt: lazily promote any solid `Scene` elements touched
-                        // by this world edit so carving/adding cuts into them seamlessly.
-                        let (promoted_ids, promo_bounds, promo_names) = ctx.promote_overlapping_scene_elements(&edit, aimed_unpromoted, edit_idx);
-                        match ctx.sculpt.push_edit(edit) {
-                            Ok(()) => {
-                                ctx.place.undo_stack.push(WorldAction::SdfEdit { edit, promoted_ids });
-                                ctx.place.redo_stack.clear();
-                                if promo_bounds.is_empty() {
-                                    ctx.commit_composed(Invalidate::Edit(&edit));
+                        let check_act = Action::SculptElement {
+                            at: edit.center,
+                            player_size: psize,
+                            author: ctx.place.placed[pos].author.as_deref(),
+                        };
+                        if let Err(denial) = ctx.sculpt.rules.check(&ctx.sculpt.player_id, &check_act) {
+                            player.say(denial.reason);
+                            ctx.sculpt.hold_timer = 0.35;
+                        } else {
+                            let module = ctx.place.placed[pos].module.clone();
+                            let seed = ctx.place.placed[pos].seed;
+                            let clips = ctx.place.placed[pos].clips.clone();
+                            let tf = ctx.place.placed[pos].transform();
+                            if let Ok(Some(_)) = ctx.place.catalog.get_or_build_mesh_sdf(&module, seed, &clips) {
+                                let local_edit = world_edit_to_local(&edit, tf);
+                                let newly_promoted = if ctx.place.placed[pos].is_promoted() {
+                                    None
                                 } else {
-                                    ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
-                                    player.say(format!("{} converted to carvable solid", promo_names.join(", ")));
+                                    ctx.place.placed[pos].promoted = Some(edit_idx);
+                                    Some(edit_idx)
+                                };
+                                ctx.place.placed[pos].local_edits.push(local_edit);
+                                ctx.sculpt.dirty = true;
+                                if newly_promoted.is_some()
+                                    && let Some(world_scene) = ctx.elements.0.set_promoted(target_id, Some(edit_idx), &mut ctx.live.world)
+                                {
+                                    let skip = ctx.elements.0.should_skip_solid(target_id);
+                                    scene::spawn_layer_filtered(&mut ctx.commands, &mut ctx.meshes, &mut ctx.visuals, target_id, &world_scene, &ctx.live.world, skip);
+                                }
+                                if newly_promoted.is_some() {
+                                    let bounds = ctx.place.sdf_bounds_of(&ctx.place.placed[pos]);
+                                    let promo_bounds: Vec<_> = bounds.into_iter().map(|b| (tf, b)).collect();
+                                    ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds, water: None });
+                                } else {
+                                    ctx.commit_composed(Invalidate::Edit(&edit));
+                                }
+                                ctx.place.undo_stack.push(WorldAction::ElementSdfEdit { id: target_id, edit: local_edit, newly_promoted });
+                                ctx.place.redo_stack.clear();
+                                if newly_promoted.is_some() {
+                                    let name = ctx.place.catalog.get(&module).map_or_else(|| format!("#{target_id}"), |c| c.name.clone());
+                                    player.say(format!("{name} sculpted (still choppable & carriable)"));
                                 }
                                 if edit.op == Op::Add {
                                     let (_, hi) = edit.influence_bounds();
@@ -931,7 +939,61 @@ fn look_and_ask(
                                 ctx.sculpt.last_stamp = Some(edit.center);
                                 ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
                             }
-                            Err(e) => player.say(format!("sculpt error: {e}")),
+                        }
+                    } else {
+                        // Enforce RuleBook before altering terrain or expanding water.
+                        let (elo, ehi) = edit.influence_bounds();
+                        let sculpt_act = Action::Sculpt {
+                            lo: elo,
+                            hi: ehi,
+                            player_size: psize,
+                            is_water: edit.material == Some(Material::Water),
+                        };
+                        if let Err(denial) = ctx.sculpt.rules.check(&ctx.sculpt.player_id, &sculpt_act) {
+                            player.say(denial.reason);
+                            ctx.sculpt.hold_timer = 0.35;
+                        } else {
+                            // If carving touches existing water (and water editing is permitted), expand the pond!
+                            let water_bounds = if edit.op == Op::Carve
+                                && ctx.sculpt.rules.check(&ctx.sculpt.player_id, &Action::ModifyWater { lo: elo, hi: ehi, player_size: psize }).is_ok()
+                            {
+                                let mut next_water = (*ctx.sculpt.water).clone();
+                                match next_water.expand_from_carve(&mut ctx.physics.0, &ctx.sculpt.edits, &edit, Some(ctx.sculpt.player_id.clone())) {
+                                    Ok(Some(wb)) => {
+                                        ctx.sculpt.water = Arc::new(next_water);
+                                        Some(wb)
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            // World terrain sculpt: lazily promote any solid `Scene` elements touched
+                            // by this world edit so carving/adding cuts into them seamlessly.
+                            let (promoted_ids, promo_bounds, promo_names) = ctx.promote_overlapping_scene_elements(&edit, aimed_unpromoted, edit_idx);
+                            match ctx.sculpt.push_edit(edit) {
+                                Ok(()) => {
+                                    ctx.place.undo_stack.push(WorldAction::SdfEdit { edit, promoted_ids });
+                                    ctx.place.redo_stack.clear();
+                                    if promo_bounds.is_empty() && water_bounds.is_none() {
+                                        ctx.commit_composed(Invalidate::Edit(&edit));
+                                    } else {
+                                        ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds, water: water_bounds });
+                                        if !promo_names.is_empty() {
+                                            player.say(format!("{} converted to carvable solid", promo_names.join(", ")));
+                                        }
+                                    }
+                                    if edit.op == Op::Add {
+                                        let (_, hi) = edit.influence_bounds();
+                                        let max_lift = (hi[1] as f64 - player.body.feet[1]).max(0.0) + player.body.size as f64 * 2.0;
+                                        let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                                        let _ = player.body.surface_from_solid(&mut combined, max_lift);
+                                    }
+                                    ctx.sculpt.last_stamp = Some(edit.center);
+                                    ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
+                                }
+                                Err(e) => player.say(format!("sculpt error: {e}")),
+                            }
                         }
                     }
                 }
@@ -972,29 +1034,35 @@ fn look_and_ask(
         if grabbed && buttons.just_pressed(MouseButton::Left)
             && let (Some(elem), Some((h, _))) = (ctx.place.current().cloned(), ctx.place.aim)
         {
-            let id = ctx.place.alloc_id();
-            let scale = ctx.place.placement_scale(psize);
-            let pl = PlacedElement {
-                id,
-                module: elem.module.clone(),
-                seed: ctx.sculpt.seed.wrapping_mul(31).wrapping_add(id as u64),
-                pos: [h[0] as f32, h[1] as f32, h[2] as f32],
-                yaw: ctx.place.yaw,
-                rot: None,
-                scale,
-                stamp_size: psize,
-                after_edits: ctx.sculpt.edits.len(),
-                promoted: None,
-                clips: Vec::new(),
-                local_edits: Vec::new(),
-            };
-            match ctx.spawn_placed(pl.clone(), &mut player) {
-                Ok(name) => {
-                    ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
-                    ctx.place.redo_stack.clear();
-                    player.say(format!("placed {name} ({scale:.2}x)"));
+            let at = [h[0] as f32, h[1] as f32, h[2] as f32];
+            if let Err(denial) = ctx.sculpt.rules.check(&ctx.sculpt.player_id, &Action::PlaceElement { at, player_size: psize }) {
+                player.say(denial.reason);
+            } else {
+                let id = ctx.place.alloc_id();
+                let scale = ctx.place.placement_scale(psize);
+                let pl = PlacedElement {
+                    id,
+                    module: elem.module.clone(),
+                    seed: ctx.sculpt.seed.wrapping_mul(31).wrapping_add(id as u64),
+                    pos: at,
+                    yaw: ctx.place.yaw,
+                    rot: None,
+                    scale,
+                    stamp_size: psize,
+                    after_edits: ctx.sculpt.edits.len(),
+                    promoted: None,
+                    clips: Vec::new(),
+                    local_edits: Vec::new(),
+                    author: Some(ctx.sculpt.player_id.clone()),
+                };
+                match ctx.spawn_placed(pl.clone(), &mut player) {
+                    Ok(name) => {
+                        ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
+                        ctx.place.redo_stack.clear();
+                        player.say(format!("placed {name} ({scale:.2}x)"));
+                    }
+                    Err(e) => player.say(format!("place error: {e}")),
                 }
-                Err(e) => player.say(format!("place error: {e}")),
             }
         }
 
@@ -1009,7 +1077,15 @@ fn look_and_ask(
                 (None, None) => None,
             };
             if let Some(id) = target_id {
-                if let Some(removed) = ctx.remove_placed(id) {
+                let denial = ctx.place.placed.iter().find(|e| e.id == id).and_then(|pl| {
+                    ctx.sculpt
+                        .rules
+                        .check(&ctx.sculpt.player_id, &Action::RemoveElement { at: pl.pos, author: pl.author.as_deref() })
+                        .err()
+                });
+                if let Some(denial) = denial {
+                    player.say(denial.reason);
+                } else if let Some(removed) = ctx.remove_placed(id) {
                     ctx.place.undo_stack.push(WorldAction::RemoveElement(removed));
                     ctx.place.redo_stack.clear();
                     player.say(format!("removed element #{id}"));
@@ -1047,6 +1123,12 @@ fn look_and_ask(
         if let Some((id, hit_world)) = target_hit {
             ctx.finish_all_falls(Some(&mut player));
             if let Some(original) = ctx.place.placed.iter().find(|e| e.id == id).cloned() {
+                if let Err(denial) = ctx.sculpt.rules.check(
+                    &ctx.sculpt.player_id,
+                    &Action::CutOrCarry { at: original.pos, author: original.author.as_deref() },
+                ) {
+                    player.say(denial.reason);
+                } else {
                 let is_sdf = ctx.place.catalog.get(&original.module).is_some_and(|e| e.is_sdf());
                 let elem_name = ctx.place.catalog.get(&original.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
                 if let Some(phys) = ctx.elements.0.physics_of(id) {
@@ -1152,6 +1234,7 @@ fn look_and_ask(
                         }
                     }
                 }
+                }
             }
         } else {
             player.say("aim at a placed object within reach to chop (K)");
@@ -1188,10 +1271,13 @@ fn look_and_ask(
             }
         }
         if keys.just_pressed(KeyCode::KeyG) || (grabbed && buttons.just_pressed(MouseButton::Left)) {
-            if let Some(target_aim) = ctx.carry.held.as_ref().and_then(|h| h.aim)
-                && let Some(name) = ctx.drop_carried_at(target_aim, &mut player, true)
-            {
-                player.say(format!("placed {name} down"));
+            if let Some(target_aim) = ctx.carry.held.as_ref().and_then(|h| h.aim) {
+                let at = [target_aim[0] as f32, target_aim[1] as f32, target_aim[2] as f32];
+                if let Err(denial) = ctx.sculpt.rules.check(&ctx.sculpt.player_id, &Action::PlaceElement { at, player_size: psize }) {
+                    player.say(denial.reason);
+                } else if let Some(name) = ctx.drop_carried_at(target_aim, &mut player, true) {
+                    player.say(format!("placed {name} down"));
+                }
             }
         } else if (grabbed && buttons.just_pressed(MouseButton::Right)) || keys.just_pressed(KeyCode::KeyX) {
             if let Some(name) = ctx.cancel_carry() {
@@ -1217,6 +1303,12 @@ fn look_and_ask(
         if let Some(id) = target_id {
             ctx.finish_all_falls(Some(&mut player));
             if let Some(pl) = ctx.place.placed.iter().find(|e| e.id == id).cloned() {
+                if let Err(denial) = ctx.sculpt.rules.check(
+                    &ctx.sculpt.player_id,
+                    &Action::CutOrCarry { at: pl.pos, author: pl.author.as_deref() },
+                ) {
+                    player.say(denial.reason);
+                } else {
                 let is_sdf = ctx.place.catalog.get(&pl.module).is_some_and(|e| e.is_sdf());
                 let name = ctx.place.catalog.get(&pl.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
                 let phys = ctx.elements.0.physics_of(id);
@@ -1260,6 +1352,7 @@ fn look_and_ask(
                 } else {
                     player.say("rooted in terrain — sculpt with B");
                 }
+                }
             }
         } else {
             player.say("aim at a placed object within reach to grab (G)");
@@ -1276,12 +1369,25 @@ fn look_and_ask(
             match action.clone() {
                 WorldAction::SdfEdit { edit, promoted_ids } => {
                     if ctx.sculpt.pop_edit().is_some() {
+                        let water_diff = if edit.op == Op::Carve && !ctx.sculpt.water.is_empty() {
+                            if let Ok(rebuilt) = WaterLog::recompute_from_edits(&mut ctx.physics.0.region, &ctx.sculpt.edits) {
+                                let diff = ctx.sculpt.water.diff_bounds(&rebuilt);
+                                if rebuilt.bodies() != ctx.sculpt.water.bodies() {
+                                    ctx.sculpt.water = Arc::new(rebuilt);
+                                }
+                                diff
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                         let demote: Vec<_> = promoted_ids.iter().map(|&(id, _)| (id, None)).collect();
                         let promo_bounds = ctx.set_elements_promoted(&demote);
-                        if promo_bounds.is_empty() {
+                        if promo_bounds.is_empty() && water_diff.is_none() {
                             ctx.commit_composed(Invalidate::Edit(&edit));
                         } else {
-                            ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
+                            ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds, water: water_diff });
                         }
                         ctx.place.redo_stack.push(action);
                         player.say(format!("undo sculpt ({} edits)", ctx.sculpt.edits.len()));
@@ -1350,10 +1456,23 @@ fn look_and_ask(
                     let repromote: Vec<_> = promoted_ids.iter().map(|&(id, idx)| (id, Some(idx))).collect();
                     let promo_bounds = ctx.set_elements_promoted(&repromote);
                     if ctx.sculpt.push_edit(edit).is_ok() {
-                        if promo_bounds.is_empty() {
+                        let water_diff = if edit.op == Op::Carve {
+                            if let Ok(rebuilt) = WaterLog::recompute_from_edits(&mut ctx.physics.0.region, &ctx.sculpt.edits) {
+                                let diff = ctx.sculpt.water.diff_bounds(&rebuilt);
+                                if rebuilt.bodies() != ctx.sculpt.water.bodies() {
+                                    ctx.sculpt.water = Arc::new(rebuilt);
+                                }
+                                diff
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if promo_bounds.is_empty() && water_diff.is_none() {
                             ctx.commit_composed(Invalidate::Edit(&edit));
                         } else {
-                            ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds });
+                            ctx.commit_composed(Invalidate::Combined { edit: Some(&edit), bounds: &promo_bounds, water: water_diff });
                         }
                         if edit.op == Op::Add {
                             let (_, hi) = edit.influence_bounds();
@@ -1695,7 +1814,7 @@ fn draw(
     let ahead: Vec<_> = ahead.into_iter().map(|(e, s)| (e, s, open(e, s))).collect();
     let scale = (DRAWN_AS / size) as f64;
     chunks.materials.sync_eye(&mut surface_materials, eye, scale);
-    chunks.update(eye, look_dir, size, here, &ahead, time.delta_secs(), &mut commands, &mut meshes);
+    chunks.update(eye, look_dir, size, scale, here, &ahead, time.delta_secs(), &mut commands, &mut meshes);
     chunks.place(eye, scale, &mut transforms);
     scene::sync(&mut commands, &mut visuals, &live.world, eye, scale, &mut static_q, &mut dynamic_q, &mut light_q);
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());

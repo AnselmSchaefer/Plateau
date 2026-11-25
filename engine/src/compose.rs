@@ -28,6 +28,7 @@ use crate::edit::{Edit, EditLog, Op};
 use crate::mesh_sdf::MeshSdf;
 use crate::scene::{Applied, SceneWorld};
 use crate::wasm::MAX_IMPULSE;
+use crate::water::WaterLog;
 use crate::{Answer, Command, Compiled, Description, ElementBounds, Instance, LARGEST, Light, Limits, PlayerState, Region, Result, SMALLEST, Scene, Wasm, chunk};
 
 /// Maximum number of clip planes stored on one `PlacedElement`.
@@ -230,6 +231,8 @@ pub struct PlacedElement {
     /// Optional element-local SDF edits (tunnels, notches, additions) sculpted directly onto this
     /// promoted `Scene` element so they travel and rotate with the object when chopped or carried!
     pub local_edits: Vec<Edit>,
+    /// Optional creator/owner player identifier (`None` for legacy saves / unclaimed elements).
+    pub author: Option<String>,
 }
 
 impl PlacedElement {
@@ -298,6 +301,11 @@ impl PlacedElement {
         }
         for e in &self.local_edits {
             e.validate()?;
+        }
+        if let Some(a) = &self.author
+            && (a.is_empty() || a.chars().any(char::is_whitespace))
+        {
+            bail!("placed element author must be non-empty without whitespace, got {:?}", a);
         }
         Ok(())
     }
@@ -515,13 +523,16 @@ impl SdfElementEntry {
     }
 }
 
-/// Immutable, thread-safe snapshot of all terrain edits (`EditLog`) and placed SDF elements
-/// (both native SDF landforms and lazily promoted `Scene` meshes), shared via `Arc<ComposedLog>`.
+/// Immutable, thread-safe snapshot of all terrain edits (`EditLog`), placed SDF elements
+/// (both native SDF landforms and lazily promoted `Scene` meshes), and engine-managed hydrostatic
+/// water bodies (`WaterLog`), shared via `Arc<ComposedLog>`.
 #[derive(Clone)]
 pub struct ComposedLog {
     pub edits: Arc<EditLog>,
     /// Chronologically ordered by `(placed.sdf_after_edits(), placed.id)`.
     pub sdf_elements: Vec<SdfElementEntry>,
+    /// Hydrostatic water bodies composited after all solid edits and SDF elements.
+    pub water: Arc<WaterLog>,
     revision: u64,
 }
 
@@ -533,12 +544,17 @@ impl Default for ComposedLog {
 
 impl ComposedLog {
     pub fn empty() -> ComposedLog {
-        ComposedLog { edits: Arc::new(EditLog::new()), sdf_elements: Vec::new(), revision: 0 }
+        ComposedLog { edits: Arc::new(EditLog::new()), sdf_elements: Vec::new(), water: Arc::new(WaterLog::new()), revision: 0 }
     }
 
     pub fn new(edits: Arc<EditLog>, mut sdf_elements: Vec<SdfElementEntry>, revision: u64) -> ComposedLog {
         sdf_elements.sort_by_key(|e| (e.placed.sdf_after_edits(), e.placed.id));
-        ComposedLog { edits, sdf_elements, revision }
+        ComposedLog { edits, sdf_elements, water: Arc::new(WaterLog::new()), revision }
+    }
+
+    pub fn new_with_water(edits: Arc<EditLog>, mut sdf_elements: Vec<SdfElementEntry>, water: Arc<WaterLog>, revision: u64) -> ComposedLog {
+        sdf_elements.sort_by_key(|e| (e.placed.sdf_after_edits(), e.placed.id));
+        ComposedLog { edits, sdf_elements, water, revision }
     }
 
     pub fn revision(&self) -> u64 {
@@ -547,7 +563,7 @@ impl ComposedLog {
 
     pub fn with_edits(edits: Arc<EditLog>) -> ComposedLog {
         let rev = edits.revision();
-        ComposedLog { edits, sdf_elements: Vec::new(), revision: rev }
+        ComposedLog { edits, sdf_elements: Vec::new(), water: Arc::new(WaterLog::new()), revision: rev }
     }
 }
 
@@ -582,6 +598,7 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
         let log = self.log.borrow();
         if log.sdf_elements.is_empty() {
             log.edits.apply_batch(points, out);
+            log.water.apply_batch(points, out);
             return Ok(());
         }
         if points.is_empty() {
@@ -707,6 +724,7 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
         if cursor < log.edits.len() {
             log.edits.apply_batch_range(cursor, log.edits.len(), points, out);
         }
+        log.water.apply_batch(points, out);
         Ok(())
     }
 

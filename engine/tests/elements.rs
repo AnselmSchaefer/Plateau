@@ -99,6 +99,7 @@ fn placed_sdf_hill_carves_tiny_cave_and_preserves_chronological_order() {
         promoted: None,
         clips: Vec::new(),
         local_edits: Vec::new(),
+        author: None,
     };
 
     // 3. Carve a tiny cave right into the placed hill's flank (`after_edits = 1`, so `edits[1]` runs AFTER hill!).
@@ -166,6 +167,7 @@ fn placed_bridge_is_walkable_solid_geometry_at_every_scale() {
             promoted: None,
             clips: Vec::new(),
             local_edits: Vec::new(),
+        author: None,
         };
         runtime.spawn(pl, &bridge, &mut world).unwrap();
 
@@ -203,6 +205,7 @@ fn multiple_lantern_placements_isolate_state_transforms_and_scale_lights() {
         promoted: None,
         clips: Vec::new(),
         local_edits: Vec::new(),
+        author: None,
     };
     let pl2 = PlacedElement {
         id: 2,
@@ -217,6 +220,7 @@ fn multiple_lantern_placements_isolate_state_transforms_and_scale_lights() {
         promoted: None,
         clips: Vec::new(),
         local_edits: Vec::new(),
+        author: None,
     };
     runtime.spawn(pl1, &lantern, &mut world).unwrap();
     runtime.spawn(pl2, &lantern, &mut world).unwrap();
@@ -268,8 +272,8 @@ fn world_save_round_trip_is_bit_exact_and_backward_compatible() {
         Edit::carve(Shape::Sphere { radius: 0.4 }, [32.0, 0.8, 48.0], 0.1, Some(Material::Stone), 1.7),
     ];
     let elements = vec![
-        PlacedElement { id: 1, module: hill.module.clone(), seed: 55, pos: [32.0, 0.0, 48.0], yaw: 0.75, rot: None, scale: 1.15, stamp_size: 1.7, after_edits: 1, promoted: None, clips: Vec::new(), local_edits: Vec::new() },
-        PlacedElement { id: 2, module: tree.module.clone(), seed: 77, pos: [25.0, 0.0, 42.0], yaw: 1.2, rot: None, scale: 0.85, stamp_size: 1.7, after_edits: 2, promoted: Some(2), clips: Vec::new(), local_edits: Vec::new() },
+        PlacedElement { id: 1, module: hill.module.clone(), seed: 55, pos: [32.0, 0.0, 48.0], yaw: 0.75, rot: None, scale: 1.15, stamp_size: 1.7, after_edits: 1, promoted: None, clips: Vec::new(), local_edits: Vec::new(), author: None },
+        PlacedElement { id: 2, module: tree.module.clone(), seed: 77, pos: [25.0, 0.0, 42.0], yaw: 1.2, rot: None, scale: 0.85, stamp_size: 1.7, after_edits: 2, promoted: Some(2), clips: Vec::new(), local_edits: Vec::new(), author: None },
     ];
     let save = WorldSave::with_elements("The walled garden", 7, edits, elements);
     let tmp = std::env::temp_dir().join(format!("plateau-8b-save-{}.plateau", std::process::id()));
@@ -305,7 +309,7 @@ fn world_save_round_trip_is_bit_exact_and_backward_compatible() {
 fn targeted_chunk_invalidation_for_sdf_element_is_sound_and_local() {
     let hill = load_element("hill");
     let bounds = hill.sdf_bounds.unwrap();
-    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 11, pos: [32.0, 0.0, 48.0], yaw: 0.3, rot: None, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None, clips: Vec::new(), local_edits: Vec::new() };
+    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 11, pos: [32.0, 0.0, 48.0], yaw: 0.3, rot: None, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None, clips: Vec::new(), local_edits: Vec::new(), author: None };
     let entry = SdfElementEntry::new(pl, hill.compiled.clone(), bounds);
 
     let mut base = garden(7);
@@ -335,7 +339,7 @@ fn sdf_hill_keeps_distance_laws_and_nans_unseen_when_composed() {
     let pts = plateau_engine::points_near([0.0, 0.0, 0.0], 3.0, 2000, 1);
     assert_eq!(laws::nans_unseen(&bytes, 7, &pts).unwrap(), Ok(()));
 
-    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 7, pos: [32.0, 0.0, 48.0], yaw: 0.2, rot: None, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None, clips: Vec::new(), local_edits: Vec::new() };
+    let pl = PlacedElement { id: 1, module: hill.module.clone(), seed: 7, pos: [32.0, 0.0, 48.0], yaw: 0.2, rot: None, scale: 1.0, stamp_size: 1.7, after_edits: 0, promoted: None, clips: Vec::new(), local_edits: Vec::new(), author: None };
     let mut composed = Composed::new(
         garden(7),
         Arc::new(ComposedLog::new(Arc::new(EditLog::new()), vec![SdfElementEntry::new(pl, hill.compiled.clone(), bounds)], 1)),
@@ -404,6 +408,7 @@ fn lazy_scene_to_sdf_promotion_carves_tiny_home_inside_oak_tree_while_keeping_ca
         promoted: None,
         clips: Vec::new(),
         local_edits: Vec::new(),
+        author: None,
     };
     runtime.spawn(pl.clone(), &tree, &mut world).unwrap();
     // Both trunk (id=1, solid) and canopy (id=2, non-solid) live in SceneWorld initially.
@@ -505,6 +510,7 @@ fn lazy_scene_to_sdf_promotion_carves_bridge_deck_and_keeps_distance_laws() {
         promoted: Some(0),
         clips: Vec::new(),
         local_edits: Vec::new(),
+        author: None,
     };
 
     // Uncarved promoted bridge holds a person at the arch crest (y ≈ 2.5 + 0.48 = 2.98).
@@ -550,6 +556,7 @@ fn chop_oak_tree_splits_into_watertight_stump_and_felled_log_and_second_cut_trim
         promoted: None,
         clips: Vec::new(),
         local_edits: Vec::new(),
+        author: None,
     };
     runtime.spawn(standing.clone(), &tree, &mut world).unwrap();
 
@@ -678,6 +685,7 @@ fn felled_tree_laid_horizontally_acts_as_walkable_solid_bridge_across_gap() {
         promoted: None,
         clips,
         local_edits: Vec::new(),
+        author: None,
     };
     runtime.spawn(log.clone(), &tree, &mut world).unwrap();
 
@@ -728,6 +736,7 @@ fn clipped_horizontal_felled_tree_promotes_lazily_to_carvable_mesh_sdf() {
         promoted: Some(0),
         clips: clips.clone(),
         local_edits: Vec::new(),
+        author: None,
     };
 
     // Build MeshSdf of the CLIPPED oak log!
@@ -790,6 +799,7 @@ fn world_save_step_8c_round_trip_preserves_cuts_quaternions_and_backward_compat(
         promoted: None,
         clips: vec![ClipPlane::new([0.0, -1.0, 0.0], -0.7)],
         local_edits: Vec::new(),
+        author: None,
     };
     let bridge_log = PlacedElement {
         id: 2,
@@ -804,6 +814,7 @@ fn world_save_step_8c_round_trip_preserves_cuts_quaternions_and_backward_compat(
         promoted: Some(0),
         clips: vec![ClipPlane::new([0.0, 1.0, 0.0], 0.7), ClipPlane::new([0.0, -1.0, 0.0], -3.6)],
         local_edits: vec![Edit::carve(Shape::Sphere { radius: 0.12 }, [0.0, 1.8, 0.0], 0.02, Some(Material::Wood), 0.17)],
+        author: None,
     };
     let edits = vec![Edit::carve(Shape::Sphere { radius: 0.35 }, [32.0, 2.0, 46.0], 0.02, Some(Material::Wood), 1.7)];
     let save = WorldSave::with_elements("The walled garden", 7, edits, vec![stump, bridge_log.clone()]);
@@ -854,6 +865,7 @@ fn carved_trunk_stays_solid_at_giant_scale_and_tunnel_travels_when_chopped_and_r
         promoted: Some(0),
         clips: Vec::new(),
         local_edits: vec![local_tunnel],
+        author: None,
     };
 
     let mut world = SceneWorld::default();
@@ -932,6 +944,7 @@ fn giant_tree_carved_by_person_has_no_coarse_pass_or_winding_distortions() {
         promoted: Some(0),
         clips: Vec::new(),
         local_edits: vec![local_carve],
+        author: None,
     };
     let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &[]).unwrap().unwrap();
     let mut composed = Composed::new(
@@ -1044,6 +1057,7 @@ fn tiny_carving_person_scale_tree_at_grass_level_has_no_chunk_holes() {
         promoted: Some(0),
         clips: Vec::new(),
         local_edits,
+        author: None,
     };
     let mesh_sdf = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &[]).unwrap().unwrap();
     let mut composed = Composed::new(

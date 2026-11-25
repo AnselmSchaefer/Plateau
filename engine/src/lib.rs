@@ -21,16 +21,20 @@ pub mod mesh_sdf;
 pub mod picture;
 pub mod reach;
 pub mod rings;
+pub mod rules;
 pub mod scene;
 pub mod sketch;
 pub mod wasm;
+pub mod water;
 
 pub use atlas::{Atlas, AtlasTile, BorderProfile, BorderSample, CompiledAtlas, SEAM_HALF, Side, TileSpec};
 pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, SdfSource};
 pub use cut::{CarryDecision, ClipPlane, ObjectPhysics};
-pub use edit::{Edit, EditLog, Edited, Op, Shape, WorldSave};
+pub use edit::{Edit, EditLog, Edited, Op, SavedTile, Shape, WorldSave};
 pub use mesh_sdf::MeshSdf;
+pub use rules::{Action, AreaPolicy, CutCarryPolicy, Denial, LOCAL_PLAYER, Plot, Role, RolePolicy, RuleBook};
 pub use wasm::{Compiled, Limits, Wasm};
+pub use water::{WaterBasin, WaterBody, WaterLog};
 pub use wasmtime::{Error, Result};
 
 /// An area, to the engine: an answer for each point, at a size, what it says it is, any procedural

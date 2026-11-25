@@ -22,6 +22,8 @@ use wasmtime::bail;
 
 use crate::compose::PlacedElement;
 use crate::cut::ClipPlane;
+use crate::rules::RuleBook;
+use crate::water::{WaterBody, WaterLog};
 use crate::{Answer, Command, Description, ElementBounds, Material, PlayerState, Region, Result, Scene, chunk};
 
 /// Whether an SDF edit adds material or carves space away.
@@ -223,7 +225,7 @@ impl Edit {
             }
             Op::Carve => {
                 let mat = match self.material {
-                    Some(m) if -d > cur.distance => m,
+                    Some(m) if cur.material != Material::Water && -d > cur.distance => m,
                     _ => cur.material,
                 };
                 let dist = if self.blend > 0.0 { smooth_cut(cur.distance, d, self.blend) } else { max_f32(cur.distance, -d) };
@@ -541,24 +543,61 @@ pub fn surface_normal(area: &mut dyn Region, at: [f64; 3], size: f32) -> Result<
 /// Current save file format version.
 pub const SAVE_VERSION: u32 = 1;
 
-/// Composable world save file: base area + seed + chronological SDF edit log + placed standalone
-/// `.wasm` elements (extensible for future relocated `Scene` objects).
+/// One base area tile in a multi-area world manifest (`tile <gx> <gz> <module> seed <u64>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedTile {
+    pub at: [i32; 2],
+    pub module: String,
+    pub seed: u64,
+}
+
+/// Composable world save & manifest: base area(s) + seed + ownership `RuleBook` + engine-managed
+/// hydrostatic `WaterBody` list + chronological SDF edit log + placed standalone `.wasm` elements.
+/// Backward-compatible with earlier Step 8a/8b/8c `plateau-world 1` files.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSave {
     pub version: u32,
     pub area: String,
     pub seed: u64,
+    /// Optional explicit multi-area tile manifest (`tile` records). Empty for legacy single-area saves.
+    pub tiles: Vec<SavedTile>,
+    /// Multi-scale ownership & permission rule book (`policy` and `plot` records).
+    pub rules: RuleBook,
+    /// Engine-managed hydrostatic water bodies (`water` and `water-basin` records).
+    pub water: Vec<WaterBody>,
     pub edits: Vec<Edit>,
+    /// Optional per-edit author list aligned with `edits` (`None` or shorter vector = unattributed).
+    pub edit_authors: Vec<Option<String>>,
     pub elements: Vec<PlacedElement>,
 }
 
 impl WorldSave {
     pub fn new(area: impl Into<String>, seed: u64, edits: Vec<Edit>) -> WorldSave {
-        WorldSave { version: SAVE_VERSION, area: area.into(), seed, edits, elements: Vec::new() }
+        WorldSave {
+            version: SAVE_VERSION,
+            area: area.into(),
+            seed,
+            tiles: Vec::new(),
+            rules: RuleBook::new(),
+            water: Vec::new(),
+            edits,
+            edit_authors: Vec::new(),
+            elements: Vec::new(),
+        }
     }
 
     pub fn with_elements(area: impl Into<String>, seed: u64, edits: Vec<Edit>, elements: Vec<PlacedElement>) -> WorldSave {
-        WorldSave { version: SAVE_VERSION, area: area.into(), seed, edits, elements }
+        WorldSave {
+            version: SAVE_VERSION,
+            area: area.into(),
+            seed,
+            tiles: Vec::new(),
+            rules: RuleBook::new(),
+            water: Vec::new(),
+            edits,
+            edit_authors: Vec::new(),
+            elements,
+        }
     }
 
     /// Serializes to a human-readable, deterministic, bit-exact text representation.
@@ -567,8 +606,18 @@ impl WorldSave {
         s.push_str(&format!("plateau-world {}\n", self.version));
         s.push_str(&format!("area {}\n", self.area.replace(['\n', '\r'], " ")));
         s.push_str(&format!("seed {}\n", self.seed));
-        for e in &self.edits {
-            write_sdf_record(&mut s, "sdf", e);
+        for t in &self.tiles {
+            s.push_str(&format!("tile {} {} {} seed {}\n", t.at[0], t.at[1], t.module, t.seed));
+        }
+        self.rules.write_records(&mut s);
+        if !self.water.is_empty()
+            && let Ok(wl) = WaterLog::from_bodies(self.water.clone())
+        {
+            wl.write_records(&mut s);
+        }
+        for (idx, e) in self.edits.iter().enumerate() {
+            let author = self.edit_authors.get(idx).and_then(|a| a.as_deref());
+            write_sdf_record(&mut s, "sdf", e, author);
         }
         for el in &self.elements {
             let [px, py, pz] = el.pos;
@@ -585,9 +634,12 @@ impl WorldSave {
             for c in &el.clips {
                 s.push_str(&format!(" clip {} {} {} {}", c.normal[0], c.normal[1], c.normal[2], c.offset));
             }
+            if let Some(author) = &el.author {
+                s.push_str(&format!(" author {author}"));
+            }
             s.push('\n');
             for le in &el.local_edits {
-                write_sdf_record(&mut s, &format!("el-sdf {}", el.id), le);
+                write_sdf_record(&mut s, &format!("el-sdf {}", el.id), le, None);
             }
         }
         s
@@ -598,7 +650,12 @@ impl WorldSave {
         let mut version = None;
         let mut area = String::new();
         let mut seed = None;
+        let mut tiles = Vec::new();
+        let mut rules = RuleBook::new();
+        let mut water: Vec<WaterBody> = Vec::new();
         let mut edits = Vec::new();
+        let mut edit_authors: Vec<Option<String>> = Vec::new();
+        let mut any_edit_author = false;
         let mut elements: Vec<PlacedElement> = Vec::new();
         for (line_no, raw) in text.lines().enumerate() {
             let line = raw.trim();
@@ -615,10 +672,29 @@ impl WorldSave {
                 area = rest.trim().to_string();
             } else if let Some(rest) = line.strip_prefix("seed ") {
                 seed = Some(rest.trim().parse::<u64>().map_err(|e| wasmtime::format_err!("line {}: invalid seed: {e}", line_no + 1))?);
+            } else if line.starts_with("tile ") {
+                tiles.push(parse_tile_line(line, line_no + 1)?);
+            } else if line.starts_with("policy ") {
+                rules.set_area(RuleBook::parse_policy_line(line, line_no + 1)?);
+            } else if line.starts_with("plot ") {
+                rules.set_plot(RuleBook::parse_plot_line(line, line_no + 1)?);
+            } else if line.starts_with("water ") {
+                water.push(WaterLog::parse_water_line(line, line_no + 1)?);
+            } else if line.starts_with("water-basin ") {
+                let (id, basin) = WaterLog::parse_basin_line(line, line_no + 1)?;
+                let body = water
+                    .iter_mut()
+                    .find(|b| b.id == id)
+                    .ok_or_else(|| wasmtime::format_err!("line {}: water-basin references unknown water body {id}", line_no + 1))?;
+                body.basins.push(basin);
             } else if line.starts_with("sdf ") {
-                let edit = parse_sdf_line(line, line_no + 1)?;
+                let (edit, author) = parse_sdf_line(line, line_no + 1)?;
                 edit.validate()?;
+                if author.is_some() {
+                    any_edit_author = true;
+                }
                 edits.push(edit);
+                edit_authors.push(author);
             } else if line.starts_with("element ") {
                 let el = parse_element_line(line, line_no + 1)?;
                 el.validate()?;
@@ -628,7 +704,7 @@ impl WorldSave {
                 let id_str = parts.next().ok_or_else(|| wasmtime::format_err!("line {}: missing element id", line_no + 1))?;
                 let id: u32 = id_str.parse().map_err(|e| wasmtime::format_err!("line {}: bad element id: {e}", line_no + 1))?;
                 let sdf_tail = parts.next().ok_or_else(|| wasmtime::format_err!("line {}: missing el-sdf payload", line_no + 1))?.trim();
-                let edit = parse_sdf_line(&format!("sdf {sdf_tail}"), line_no + 1)?;
+                let (edit, _) = parse_sdf_line(&format!("sdf {sdf_tail}"), line_no + 1)?;
                 edit.validate()?;
                 let target = elements
                     .iter_mut()
@@ -641,7 +717,10 @@ impl WorldSave {
         }
         let version = version.ok_or_else(|| wasmtime::format_err!("missing `plateau-world` header"))?;
         let seed = seed.ok_or_else(|| wasmtime::format_err!("missing `seed` field"))?;
-        Ok(WorldSave { version, area, seed, edits, elements })
+        if !any_edit_author {
+            edit_authors.clear();
+        }
+        Ok(WorldSave { version, area, seed, tiles, rules, water, edits, edit_authors, elements })
     }
 
     /// Writes the save file atomically (write temp file in same directory, then rename).
@@ -663,13 +742,26 @@ impl WorldSave {
     }
 }
 
-fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit) {
+fn parse_tile_line(line: &str, line_no: usize) -> Result<SavedTile> {
+    let tok: Vec<&str> = line.split_whitespace().collect();
+    if tok.len() != 6 || tok[4] != "seed" {
+        bail!("line {line_no}: expected `tile <gx> <gz> <module> seed <u64>`, got `{line}`");
+    }
+    let gx: i32 = tok[1].parse().map_err(|e| wasmtime::format_err!("line {line_no}: bad tile gx: {e}"))?;
+    let gz: i32 = tok[2].parse().map_err(|e| wasmtime::format_err!("line {line_no}: bad tile gz: {e}"))?;
+    let module = tok[3].to_string();
+    let seed: u64 = tok[5].parse().map_err(|e| wasmtime::format_err!("line {line_no}: bad tile seed: {e}"))?;
+    Ok(SavedTile { at: [gx, gz], module, seed })
+}
+
+fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit, author: Option<&str>) {
     let mat = e.material.map_or("none", Material::name);
     let [cx, cy, cz] = e.center;
+    let auth = author.map_or_else(String::new, |a| format!(" author {a}"));
     match e.shape {
         Shape::Sphere { radius } => {
             s.push_str(&format!(
-                "{prefix} {} sphere {} {} {} {} blend {} mat {} size {}\n",
+                "{prefix} {} sphere {} {} {} {} blend {} mat {} size {}{auth}\n",
                 e.op.name(),
                 cx,
                 cy,
@@ -682,7 +774,7 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit) {
         }
         Shape::Box { half: [hx, hy, hz], round } => {
             s.push_str(&format!(
-                "{prefix} {} box {} {} {} {} {} {} round {} blend {} mat {} size {}\n",
+                "{prefix} {} box {} {} {} {} {} {} round {} blend {} mat {} size {}{auth}\n",
                 e.op.name(),
                 cx,
                 cy,
@@ -698,7 +790,7 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit) {
         }
         Shape::Cylinder { radius, half_height, round } => {
             s.push_str(&format!(
-                "{prefix} {} cyl {} {} {} {} {} round {} blend {} mat {} size {}\n",
+                "{prefix} {} cyl {} {} {} {} {} round {} blend {} mat {} size {}{auth}\n",
                 e.op.name(),
                 cx,
                 cy,
@@ -714,7 +806,7 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit) {
     }
 }
 
-fn parse_sdf_line(line: &str, line_no: usize) -> Result<Edit> {
+fn parse_sdf_line(line: &str, line_no: usize) -> Result<(Edit, Option<String>)> {
     let tok: Vec<&str> = line.split_whitespace().collect();
     let pf = |i: usize| -> Result<f32> {
         tok.get(i)
@@ -764,10 +856,14 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<Edit> {
     };
     expect(tail + 4, "size")?;
     let stamp_size = pf(tail + 5)?;
-    if tok.len() != tail + 6 {
+    let author = if tok.len() == tail + 6 {
+        None
+    } else if tok.len() == tail + 8 && tok[tail + 6] == "author" {
+        Some(tok[tail + 7].to_string())
+    } else {
         bail!("line {line_no}: trailing tokens in sdf record");
-    }
-    Ok(Edit { op, shape, center, blend, material, stamp_size })
+    };
+    Ok((Edit { op, shape, center, blend, material, stamp_size }, author))
 }
 
 fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
@@ -805,6 +901,7 @@ fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
     let mut rot = None;
     let mut promoted = None;
     let mut clips = Vec::new();
+    let mut author = None;
     let mut idx = 17;
     while idx < tok.len() {
         match tok[idx] {
@@ -827,10 +924,15 @@ fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
                 clips.push(ClipPlane { normal, offset });
                 idx += 5;
             }
+            "author" => {
+                let a = tok.get(idx + 1).ok_or_else(|| wasmtime::format_err!("line {line_no}: missing element author"))?;
+                author = Some((*a).to_string());
+                idx += 2;
+            }
             other => bail!("line {line_no}: unknown element field `{other}`"),
         }
     }
-    Ok(PlacedElement { id, module, seed, pos, yaw, rot, scale, stamp_size, after_edits, promoted, clips, local_edits: Vec::new() })
+    Ok(PlacedElement { id, module, seed, pos, yaw, rot, scale, stamp_size, after_edits, promoted, clips, local_edits: Vec::new(), author })
 }
 
 fn material_from_name(name: &str) -> Option<Material> {

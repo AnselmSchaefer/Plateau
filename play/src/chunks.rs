@@ -17,6 +17,7 @@ use plateau_engine::chunk::{self, Key, Made};
 use plateau_engine::compose::{Composed, ComposedLog, PlacementTransform};
 use plateau_engine::edit::Edit;
 use plateau_engine::picture::colour;
+use plateau_engine::water::bounds_affect_chunk;
 use plateau_engine::{ElementBounds, Wasm, rings};
 
 use crate::surface::{FADE_SECONDS, Materials, SurfaceMaterial, properties};
@@ -32,8 +33,12 @@ pub enum Invalidate<'a> {
     Edit(&'a Edit),
     /// Rebuild only chunks affected by one placed or removed SDF `.wasm` element.
     SdfElement(PlacementTransform, ElementBounds),
-    /// Rebuild chunks affected by an edit and/or one or more lazily promoted elements.
-    Combined { edit: Option<&'a Edit>, bounds: &'a [(PlacementTransform, ElementBounds)] },
+    /// Rebuild chunks affected by an edit, water expansion AABB, and/or lazily promoted elements.
+    Combined {
+        edit: Option<&'a Edit>,
+        bounds: &'a [(PlacementTransform, ElementBounds)],
+        water: Option<([f32; 3], [f32; 3])>,
+    },
 }
 
 impl Invalidate<'_> {
@@ -42,8 +47,10 @@ impl Invalidate<'_> {
             Invalidate::All => true,
             Invalidate::Edit(e) => e.affects_chunk(key),
             Invalidate::SdfElement(tf, bounds) => tf.affects_chunk(bounds, key),
-            Invalidate::Combined { edit, bounds } => {
-                edit.is_some_and(|e| e.affects_chunk(key)) || bounds.iter().any(|&(tf, b)| tf.affects_chunk(b, key))
+            Invalidate::Combined { edit, bounds, water } => {
+                edit.is_some_and(|e| e.affects_chunk(key))
+                    || bounds.iter().any(|&(tf, b)| tf.affects_chunk(b, key))
+                    || water.is_some_and(|(lo, hi)| bounds_affect_chunk(lo, hi, key))
             }
         }
     }
@@ -103,6 +110,11 @@ pub struct Chunks {
     /// Cached chunks invalidated by SDF edits/elements that need rebuilding to at least `min_revision`.
     /// Their old mesh stays visible until the rebuilt mesh arrives, preventing flicker.
     stale: HashMap<Key, u64>,
+    /// Completed rebuilds for invalidated chunks held until every visible chunk of the same
+    /// edit/undo is ready, so `Shown -> Empty` despawns and `Empty -> Shown` spawns commit
+    /// atomically in the same frame (preventing 1-frame rectangular sky holes).
+    pending_stale: HashMap<Key, Done>,
+    stale_wait_frames: u32,
     tiles: Vec<[i32; 2]>,
     rings: rings::Rings,
     wanted: HashSet<Key>,
@@ -132,6 +144,8 @@ impl Chunks {
             done: Mutex::new(done),
             known: HashMap::new(),
             stale: HashMap::new(),
+            pending_stale: HashMap::new(),
+            stale_wait_frames: 0,
             rings: rings::Rings::with_tiles(tiles.clone()),
             tiles,
             wanted: HashSet::new(),
@@ -166,14 +180,25 @@ impl Chunks {
         for key in in_flight {
             self.stale.insert(key, rev);
         }
+        self.pending_stale.retain(|&key, done| {
+            if done.revision < rev && inv.affects(key) {
+                self.stale.insert(key, rev);
+                false
+            } else {
+                true
+            }
+        });
+        self.stale_wait_frames = 0;
         self.queue.more.notify_all();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         eye: [f64; 3],
         look: [f64; 3],
         size: f32,
+        scale: f64,
         open: i32,
         ahead: &[([f64; 3], f32, i32)],
         dt: f32,
@@ -219,6 +244,8 @@ impl Chunks {
             let needs = |k: &Key| -> bool {
                 if let Some(&need_rev) = self.stale.get(k) {
                     making.get(k).is_none_or(|&r| r < need_rev)
+                } else if self.pending_stale.contains_key(k) {
+                    false
                 } else {
                     !self.known.contains_key(k) && !making.contains_key(k)
                 }
@@ -241,7 +268,9 @@ impl Chunks {
             }
         }
         let mut fresh = HashSet::new();
+        let mut spawned_this_frame: Vec<(Key, Entity)> = Vec::new();
         let made: Vec<Done> = self.done.lock().unwrap().try_iter().take(MOST_A_FRAME).collect();
+        let mut ready_to_apply: Vec<Done> = Vec::with_capacity(made.len());
         for done in made {
             {
                 let mut jobs = self.queue.jobs.lock().unwrap();
@@ -256,40 +285,94 @@ impl Chunks {
             if self.known.get(&done.key).is_some_and(|k| k.revision() > done.revision) {
                 continue;
             }
-            if let Some(&need) = self.stale.get(&done.key) {
+            let was_stale = if let Some(&need) = self.stale.get(&done.key) {
                 if done.revision >= need {
                     self.stale.remove(&done.key);
+                    true
                 } else if self.known.contains_key(&done.key) {
                     // Discard superseded in-flight build rather than flashing a stale empty/old mesh.
                     continue;
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
 
+            if was_stale && self.known.contains_key(&done.key) {
+                self.pending_stale.insert(done.key, done);
+            } else {
+                ready_to_apply.push(done);
+            }
+        }
+
+        // Commit all buffered edit/undo rebuilds atomically once every visible stale chunk is done
+        // (or after a short frame cap for huge reloads) so `Shown -> Empty` never despawns before
+        // its neighbor's `Empty -> Shown` mesh is ready!
+        if !self.pending_stale.is_empty() {
+            let any_wanted_stale = self.wanted.iter().any(|k| self.stale.contains_key(k));
+            if !any_wanted_stale || self.stale_wait_frames >= 8 {
+                ready_to_apply.extend(self.pending_stale.drain().map(|(_, d)| d));
+                self.stale_wait_frames = 0;
+            } else {
+                self.stale_wait_frames += 1;
+            }
+        }
+
+        for done in ready_to_apply {
             let was_known = self.known.contains_key(&done.key);
-            let known = match done.made {
+            // When updating an already-shown chunk with a new mesh, swap `Mesh3d` in place on the
+            // existing entity instead of despawning + respawning `Visibility::Hidden`.
+            match done.made {
                 Ok(Made { mesh: Some(mesh), .. }) => {
                     let triangles = mesh.indices.len() / 3;
-                    let entity = commands
-                        .spawn((
-                            Mesh3d(meshes.add(to_bevy(mesh))),
-                            MeshMaterial3d(self.materials.opaque.clone()),
-                            Transform::default(),
-                            Visibility::Hidden,
-                        ))
-                        .id();
-                    if !was_known {
-                        fresh.insert(done.key);
+                    let bevy_mesh = meshes.add(to_bevy(mesh));
+                    if let Some(Known::Shown { entity, triangles: cur_tris, wanted, revision }) = self.known.get_mut(&done.key) {
+                        commands.entity(*entity).insert(Mesh3d(bevy_mesh));
+                        *cur_tris = triangles;
+                        *wanted = self.frame;
+                        *revision = done.revision;
+                    } else {
+                        let o = done.key.origin();
+                        let tf = Transform {
+                            translation: Vec3::new(
+                                ((o[0] - eye[0]) * scale) as f32,
+                                ((o[1] - eye[1]) * scale) as f32,
+                                ((o[2] - eye[2]) * scale) as f32,
+                            ),
+                            scale: Vec3::splat(scale as f32),
+                            ..default()
+                        };
+                        let entity = commands
+                            .spawn((
+                                Mesh3d(bevy_mesh),
+                                MeshMaterial3d(self.materials.opaque.clone()),
+                                tf,
+                                Visibility::Hidden,
+                            ))
+                            .id();
+                        if !was_known {
+                            fresh.insert(done.key);
+                        } else {
+                            // Previously `Known::Empty` becoming `Known::Shown` during an atomic
+                            // edit/undo swap: make it visible on THIS exact frame once `shown_over`
+                            // confirms it is shown!
+                            spawned_this_frame.push((done.key, entity));
+                        }
+                        self.known.insert(done.key, Known::Shown { entity, triangles, wanted: self.frame, revision: done.revision });
                     }
-                    Known::Shown { entity, triangles, wanted: self.frame, revision: done.revision }
                 }
-                Ok(Made { mesh: None, .. }) => Known::Empty { revision: done.revision },
+                Ok(Made { mesh: None, .. }) => {
+                    if let Some(Known::Shown { entity: old_entity, .. }) = self.known.insert(done.key, Known::Empty { revision: done.revision }) {
+                        commands.entity(old_entity).despawn();
+                    }
+                }
                 Err(why) => {
                     error!("chunk {:?} could not be made: {why}", done.key);
-                    Known::Empty { revision: done.revision }
+                    if let Some(Known::Shown { entity: old_entity, .. }) = self.known.insert(done.key, Known::Empty { revision: done.revision }) {
+                        commands.entity(old_entity).despawn();
+                    }
                 }
-            };
-            if let Some(Known::Shown { entity: old_entity, .. }) = self.known.insert(done.key, known) {
-                commands.entity(old_entity).despawn();
             }
             if was_known {
                 self.fading_in.remove(&done.key);
@@ -299,6 +382,11 @@ impl Chunks {
         let prev_shown = std::mem::take(&mut self.shown);
         let (shown, holes) = rings::shown_over(&wanted, &self.tiles, &|k| self.known.contains_key(&k) && !fresh.contains(&k));
         self.shown = shown.into_iter().collect();
+        for (key, entity) in spawned_this_frame {
+            if self.shown.contains(&key) {
+                commands.entity(entity).insert(Visibility::Visible);
+            }
+        }
 
         let step = if FADE_SECONDS > 0.0 { dt / FADE_SECONDS } else { 1.0 };
         self.fading_in.retain(|k, t| {
@@ -339,6 +427,7 @@ impl Chunks {
             old.sort_unstable();
             for (_, key) in old.into_iter().take(self.known.len() - MOST_KEPT / 2) {
                 self.stale.remove(&key);
+                self.pending_stale.remove(&key);
                 if let Some(Known::Shown { entity, .. }) = self.known.remove(&key) {
                     commands.entity(entity).despawn();
                 }

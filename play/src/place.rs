@@ -150,14 +150,19 @@ impl PlaceMode {
         id
     }
 
-    /// Rebuilds an immutable `ComposedLog` snapshot from `edits` + all currently placed SDF
+    /// Rebuilds an immutable `ComposedLog` snapshot from `edits` + `water` + all currently placed SDF
     /// elements (both native SDF landforms and lazily promoted `Scene` meshes), optionally
     /// excluding element ids that are currently carried in-hand or mid-fall.
-    pub fn build_composed(&mut self, edits: Arc<plateau_engine::EditLog>) -> Arc<ComposedLog> {
-        self.build_composed_excluding(edits, &[])
+    pub fn build_composed(&mut self, edits: Arc<plateau_engine::EditLog>, water: Arc<plateau_engine::WaterLog>) -> Arc<ComposedLog> {
+        self.build_composed_excluding(edits, water, &[])
     }
 
-    pub fn build_composed_excluding(&mut self, edits: Arc<plateau_engine::EditLog>, exclude_ids: &[u32]) -> Arc<ComposedLog> {
+    pub fn build_composed_excluding(
+        &mut self,
+        edits: Arc<plateau_engine::EditLog>,
+        water: Arc<plateau_engine::WaterLog>,
+        exclude_ids: &[u32],
+    ) -> Arc<ComposedLog> {
         self.revision += 1;
         let mut sdf_elements = Vec::new();
         for pl in &self.placed {
@@ -174,7 +179,7 @@ impl PlaceMode {
                 }
             }
         }
-        Arc::new(ComposedLog::new(edits, sdf_elements, self.revision))
+        Arc::new(ComposedLog::new_with_water(edits, sdf_elements, water, self.revision))
     }
 
     /// Returns the local SDF bounds of a placed element if it is currently represented in the SDF
