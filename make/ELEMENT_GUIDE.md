@@ -52,6 +52,46 @@ A Plateau **element** is a single Rust file (`element.rs`) that compiles to a st
 - Stay well within engine caps (`<= 256` meshes, `<= 200_000` vertices, `<= 600_000` indices,
   `<= 16_384` instances, `<= 64` lights, `<= 256` commands per tick).
 
+## Fitting a measured site (when a site is given)
+
+When authoring for a measured site (`plateau make-element "<words>" --site FILE.site` or `--at X,Y,Z`),
+every measurement in the prompt is already converted into your element's **local metres** so the
+measuring player is **1.7 m tall** in your coordinate system (`+X` right, `+Y` up, `+Z` facing out
+toward whoever approaches). The engine scales, rotates, and translates your element into the world
+via `site.frame`.
+
+### Fitting an opening
+
+When the site has a measured cavity/opening (such as a carved cave, tunnel, or hollowed tree trunk):
+
+- **Use procedural `Scene` meshes (`sdf_bounds() == None`)** — never an SDF landform that would fill
+  the carved opening back in.
+- **Origin & rim plane**: `(0, 0, 0)` lies on the opening's sill (bottom-center) in the rim plane
+  `z = 0`. The surrounding wall lies at `z <= 0`; open air outside is `z > 0`.
+- **Static solid frame (`id = 0`, `solid = true`)**: trace the provided `const OPENING: [(f32, f32); 48]`
+  outline around the rim in `z = 0` (spanning slightly in and out, e.g. `z = -0.20..0.12`). Its outer
+  edge MUST overlap into the surrounding wall by **1% to 35%** of the opening's mean radius (aim for
+  **6% to 12%**) all the way around, with no floating gaps and without burying the inner edge inside
+  the wall. The floor edge may be left to a sill or the bottom of a door leaf (within 5% of mean radius).
+- **Non-solid decorative trim (`solid = false`)**: keep surround stones, molding, iron straps, hinges,
+  handles, and small ornaments on separate `solid = false` meshes so collision stays clean.
+- **Movable doors, shutters, and gates (if a leaf fills the opening)**:
+  - Spawn the solid leaf with `id > 0` (`solid = true`), overlapping slightly past the frame's inner
+    edge so no light or sightlines leak around the rim when shut (at most 3% keyhole opening in the
+    interior, zero gaps beside the rim).
+  - On `interact(player)` (`F` with crosshair aimed at the leaf or standing before it), animate the
+    leaf open within **4 seconds** (temporarily setting `solid = false` while swinging so it never
+    shoves the player). If the bare opening is walkable, the open doorway MUST leave clear walkable
+    passage for a `1.7 m` tall (`0.51 m` wide) body. Pressing `F` again must shut it tightly again.
+
+### Fitting open ground, slopes, and shorelines
+
+When the site has no opening (a slope, clearing, cliff edge, or pond shore):
+
+- Use the provided `7×7` local ground height grid (in local `y`) to seat foundations, posts, walls,
+  or ramps into the terrain in every dry quarter of your element's footprint so nothing floats or is
+  buried. Over water (docks, piers, bridges), structures may extend out above the surface cleanly.
+
 ## Skeleton
 
 ```rust

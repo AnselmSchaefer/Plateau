@@ -7,7 +7,9 @@
 //! What the engine makes of an area, without a window: the surface in chunks at the detail each
 //! size needs (`chunk`, `rings`), a player's body walking it at their size (`body`), where each
 //! size can go (`reach`), pictures (`picture`), sketched maps (`sketch`), and the laws an area
-//! must keep (`laws`). The window is `play/`.
+//! must keep (`laws`). What players make of it: sculpting (`edit`), placed elements (`compose`,
+//! `scene`, `cut`, `physics`), water (`water`), and measured sites (`site`) for elements made to fit
+//! them (`fit`). The window is `play/`.
 
 pub mod atlas;
 pub mod body;
@@ -16,6 +18,7 @@ pub mod chunk;
 pub mod compose;
 pub mod cut;
 pub mod edit;
+pub mod fit;
 pub mod laws;
 pub mod mesh_sdf;
 pub mod physics;
@@ -24,19 +27,24 @@ pub mod reach;
 pub mod rings;
 pub mod rules;
 pub mod scene;
+pub mod site;
 pub mod sketch;
 pub mod wasm;
 pub mod water;
+pub mod world;
 
 pub use atlas::{Atlas, AtlasTile, BorderProfile, BorderSample, CompiledAtlas, SEAM_HALF, Side, TileSpec};
 pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, SdfSource};
 pub use cut::{CarryDecision, ClipPlane, ObjectPhysics};
 pub use edit::{Edit, EditLog, Edited, Op, SavedTile, Shape, WorldSave};
+pub use fit::{CavityFit, RimFit, SiteRegion, cavity_fit, fit_check, fit_transform, ground_fit};
 pub use mesh_sdf::MeshSdf;
 pub use physics::{BuoyancyState, MaterialProps, Tool, WATER_DENSITY, compute_buoyancy, effective_displacement_m3, material_props, player_mass_kg, step_floating_move};
 pub use rules::{Action, AreaPolicy, CutCarryPolicy, Denial, LOCAL_PLAYER, Plot, Role, RolePolicy, RuleBook};
+pub use site::{Cavity, SiteContext, SiteProbe};
 pub use wasm::{Compiled, Limits, Wasm};
 pub use water::{WaterBasin, WaterBody, WaterLog};
+pub use world::{OpenWorld, Solids};
 pub use wasmtime::{Error, Result};
 
 /// An area, to the engine: an answer for each point, at a size, what it says it is, any procedural
@@ -66,6 +74,32 @@ pub trait Region {
 }
 
 impl<R: Region + ?Sized> Region for &mut R {
+    fn sample(&mut self, points: &[[f32; 3]], size: f32, out: &mut Vec<Answer>) -> Result<()> {
+        (**self).sample(points, size, out)
+    }
+
+    fn describe(&mut self) -> Result<Description> {
+        (**self).describe()
+    }
+
+    fn scene(&mut self) -> Result<Scene> {
+        (**self).scene()
+    }
+
+    fn tick(&mut self, dt: f32, player: &PlayerState) -> Result<Vec<Command>> {
+        (**self).tick(dt, player)
+    }
+
+    fn interact(&mut self, player: &PlayerState) -> Result<Vec<Command>> {
+        (**self).interact(player)
+    }
+
+    fn element_bounds(&mut self) -> Result<Option<ElementBounds>> {
+        (**self).element_bounds()
+    }
+}
+
+impl<R: Region + ?Sized> Region for Box<R> {
     fn sample(&mut self, points: &[[f32; 3]], size: f32, out: &mut Vec<Answer>) -> Result<()> {
         (**self).sample(points, size, out)
     }

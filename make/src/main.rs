@@ -9,18 +9,32 @@
 //! - `plateau check NAME [--sketch MAP.png]`: `made/NAME/area.rs`, changed by hand, built, checked
 //!   and held to the laws (including `made/NAME/sketch.png` or `--sketch` if present); if it keeps
 //!   every law, its module and pictures are made again.
+//! - `plateau make-element "<words>" [--name NAME]`: Claude makes a standalone element of the words,
+//!   into `made/elements/NAME/`. With a site (below), it is made for that site: told its measures,
+//!   shown it, and held to fit it.
+//! - `plateau check-element NAME`: an element changed by hand, built and held to the laws, and to the
+//!   site it was made for (`element.site` beside it) or one given.
+//! - `plateau measure [--out FILE.site]`: a site measured and printed, nothing made.
+//!
+//! A site is `--site FILE.site` (as `plateau-play` writes them with `I`; the world beside it, as
+//! `FILE.plateau`, is used if it is there), or `--at X,Y,Z` in `--save WORLD.plateau` and/or `--area
+//! AREA`, seen `--from X,Y,Z` (or from nowhere), by someone `--size tiny|person|giant` (or metres
+//! tall). `--fit auto|cavity|ground|none` says which law of fitting it is held to; `--place` puts the
+//! element made into `--save`'s world, where it was made to go.
 //!
 //! Claude is asked through the Claude Code command line with the owner's own login (`claude -p`).
 
 use std::path::{Path, PathBuf};
 
 use plateau_engine::atlas::Side;
+use plateau_engine::compose::PlacedElement;
+use plateau_engine::edit::{WorldSave, surface_normal};
 use plateau_engine::sketch::Sketch;
-use plateau_engine::{Limits, Wasm, laws};
+use plateau_engine::{Limits, OpenWorld, SiteContext, SiteProbe, Size, Wasm, laws};
 use plateau_make::claude::Claude;
 use plateau_make::{
-    Builder, Made, Neighbor, SEED, Settings, element_guide, guide, judge_element, judge_with_neighbors, load_neighbors, log, make_element,
-    make_with_neighbors, pictures, save_neighbors, seam_pictures,
+    Builder, FitLaw, Made, Neighbor, SEED, Settings, Site, element_guide, element_guide_at, guide, judge_element, judge_element_at,
+    judge_with_neighbors, load_neighbors, log, make_element, make_element_at, make_with_neighbors, pictures, save_neighbors, seam_pictures, site_pictures,
 };
 
 /// The test set (POC_PLAN.md, step 5): five requests, kept, made again whenever the guide or the
@@ -148,12 +162,27 @@ fn main() {
             let name = flag(&args, "--name").unwrap_or_else(|| {
                 words.split_whitespace().take(4).collect::<Vec<_>>().join("-").to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "")
             });
-            one_element(&repo, &name, &words).map(|made| println!("{}", log(&words, &made)))
+            site_of(&repo, &args).and_then(|site| {
+                let made = one_element(&repo, &name, &words, site.as_ref())?;
+                println!("{}", log(&words, &made));
+                match &site {
+                    Some(site) if made.kept.is_some() => place(&args, &name, site),
+                    _ => Ok(()),
+                }
+            })
         }
         Some("check-element") => {
             let name = args.get(1).cloned().unwrap_or_else(|| usage());
-            check_element(&repo, &name)
+            site_of(&repo, &args).and_then(|site| check_element(&repo, &name, site))
         }
+        Some("measure") => site_of(&repo, &args).and_then(|site| {
+            let site = site.ok_or("measure needs a site: --site FILE.site, or --at X,Y,Z with --save and/or --area")?;
+            println!("{}\n\n{}", site.context.summary(), site.context.describe_for_prompt());
+            match flag(&args, "--out") {
+                Some(out) => site.context.save(Path::new(&out)).map_err(|e| format!("{out}: {e:#}")),
+                None => Ok(()),
+            }
+        }),
         _ => usage(),
     };
     if let Err(e) = result {
@@ -165,11 +194,13 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "plateau make \"<words>\" [--sketch MAP.png] [--name NAME] [--beside SIDE:AREA ...]\n\
-         plateau make-element \"<words>\" [--name NAME]\n\
+         plateau make-element \"<words>\" [--name NAME] [SITE [--fit auto|cavity|ground|none] [--place]]\n\
          plateau test-set [NAME ...]\n\
          plateau check NAME [--sketch MAP.png] [--beside SIDE:AREA ...]\n\
          plateau check-pair AREA_A SIDE AREA_B\n\
-         plateau check-element NAME"
+         plateau check-element NAME [SITE [--fit auto|cavity|ground|none]]\n\
+         plateau measure SITE [--out FILE.site]\n\
+         SITE: --site FILE.site | --at X,Y,Z [--save WORLD.plateau] [--area AREA] [--seed N] [--from X,Y,Z] [--size tiny|person|giant|METRES]"
     );
     std::process::exit(2)
 }
@@ -241,8 +272,92 @@ fn check_pair(repo: &Path, area_a: &str, side_s: &str, area_b: &str) -> Result<(
     }
 }
 
-/// One standalone composable element made into `made/elements/NAME/`.
-fn one_element(repo: &Path, name: &str, words: &str) -> Result<Made, String> {
+fn point(s: &str) -> Result<[f32; 3], String> {
+    let c: Vec<f32> = s.split(',').map(|c| c.trim().parse().map_err(|e| format!("`{s}`: {e}"))).collect::<Result<_, _>>()?;
+    c.try_into().map_err(|_| format!("`{s}`: a point is X,Y,Z"))
+}
+
+/// The site the arguments name, if they name one: measured now (`--at`), or as it was (`--site`).
+fn site_of(repo: &Path, args: &[String]) -> Result<Option<Site>, String> {
+    let e = |e: plateau_engine::Error| format!("{e:#}");
+    let law = match flag(args, "--fit") {
+        Some(name) => FitLaw::from_name(&name).ok_or(format!("unknown fit `{name}` (expected auto, cavity, ground or none)"))?,
+        None => FitLaw::Auto,
+    };
+    let area = flag(args, "--area").map(|a| resolve_area(repo, &a)).transpose()?;
+    let save = flag(args, "--save").map(PathBuf::from);
+    let seed = match flag(args, "--seed") {
+        Some(s) => s.parse().map_err(|e| format!("--seed {s}: {e}"))?,
+        None => SEED,
+    };
+    let open = |save: Option<&Path>, size: f32| -> Result<Option<OpenWorld>, String> {
+        match (save, &area) {
+            (Some(save), area) => {
+                let world = WorldSave::load(save).map_err(|e| format!("{}: {e:#}", save.display()))?;
+                OpenWorld::open(world, repo, area.as_deref(), size, Limits::default()).map(Some).map_err(|e| format!("{}: {e:#}", save.display()))
+            }
+            (None, Some(area)) => OpenWorld::bare(area, seed, size, Limits::default()).map(Some).map_err(e),
+            (None, None) => Ok(None),
+        }
+    };
+    if let Some(file) = flag(args, "--site") {
+        let file = PathBuf::from(file);
+        let context = SiteContext::load(&file).map_err(|e| format!("{}: {e:#}", file.display()))?;
+        let beside = file.with_extension("plateau");
+        let save = save.or_else(|| beside.exists().then_some(beside));
+        let world = open(save.as_deref(), context.size)?;
+        return Ok(Some(Site { context, world, law }));
+    }
+    let Some(at) = flag(args, "--at") else { return Ok(None) };
+    let target = point(&at)?;
+    let from = flag(args, "--from").map(|f| point(&f)).transpose()?;
+    let size = match flag(args, "--size") {
+        None => Size::Person.height(),
+        Some(s) => match Size::ALL.into_iter().find(|z| z.name() == s) {
+            Some(z) => z.height(),
+            None => s.parse().map_err(|e| format!("--size {s}: {e}"))?,
+        },
+    };
+    let world = open(save.as_deref(), size)?.ok_or("--at needs the world it is in: --save WORLD.plateau and/or --area AREA")?;
+    let mut region = world.solid().map_err(e)?;
+    let normal = surface_normal(&mut region, target.map(|c| c as f64), size).map_err(e)?;
+    let mut context = SiteContext::measure(&mut region, &SiteProbe { target, normal, from, size }).map_err(e)?;
+    context.area = world.save.area.clone();
+    eprintln!("site: {}", context.summary());
+    Ok(Some(Site { context, world: Some(world), law }))
+}
+
+/// With `--place`, the element `NAME` put into `--save`'s world where it was made to go.
+fn place(args: &[String], name: &str, site: &Site) -> Result<(), String> {
+    if !args.iter().any(|a| a == "--place") {
+        return Ok(());
+    }
+    let path = flag(args, "--save").map(PathBuf::from).ok_or("--place needs the world to place it in: --save WORLD.plateau")?;
+    let mut save = WorldSave::load(&path).map_err(|e| format!("{}: {e:#}", path.display()))?;
+    let tf = site.context.frame;
+    let id = save.elements.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+    save.elements.push(PlacedElement {
+        id,
+        module: format!("made/elements/{name}/element.wasm"),
+        seed: SEED,
+        pos: tf.pos,
+        yaw: 0.0,
+        rot: Some(tf.rot),
+        scale: tf.scale,
+        stamp_size: site.context.size,
+        after_edits: save.edits.len(),
+        promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
+        author: None,
+    });
+    save.save(&path).map_err(|e| format!("{}: {e:#}", path.display()))?;
+    println!("placed as element {id} in {}", path.display());
+    Ok(())
+}
+
+/// One standalone composable element made into `made/elements/NAME/`, for `site` if there is one.
+fn one_element(repo: &Path, name: &str, words: &str, site: Option<&Site>) -> Result<Made, String> {
     let dir = repo.join("made/elements").join(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -251,16 +366,28 @@ fn one_element(repo: &Path, name: &str, words: &str) -> Result<Made, String> {
     let work = repo.join("target/plateau-make/elements").join(name);
     let builder = Builder::new(repo, &work)?;
     let guide_file = work.join("element-guide.md");
-    std::fs::write(&guide_file, element_guide(repo)?).map_err(|e| e.to_string())?;
+    let guide = if site.is_some() { element_guide_at(repo)? } else { element_guide(repo)? };
+    std::fs::write(&guide_file, guide).map_err(|e| e.to_string())?;
     let mut claude = Claude::new(&guide_file, &dir);
-    let made = make_element(&mut claude, &builder, words, &dir, Settings::default(), &mut |line| eprintln!("{name}: {line}"))?;
+    let mut say = |line: &str| eprintln!("{name}: {line}");
+    let made = match site {
+        Some(site) => {
+            // The world it was measured in, to judge it in again.
+            if let Some(world) = &site.world {
+                world.save.save(&dir.join("element.plateau")).map_err(|e| format!("{e:#}"))?;
+            }
+            make_element_at(&mut claude, &builder, words, site, &dir, Settings::default(), &mut say)?
+        }
+        None => make_element(&mut claude, &builder, words, &dir, Settings::default(), &mut say)?,
+    };
     std::fs::write(dir.join("log.md"), log(words, &made)).map_err(|e| e.to_string())?;
     std::fs::remove_dir_all(dir.join("build")).ok();
     Ok(made)
 }
 
-/// Verifies `made/elements/NAME/element.rs` (or `elements/NAME/element.rs`) and writes its `.wasm`.
-fn check_element(repo: &Path, name: &str) -> Result<(), String> {
+/// Verifies `made/elements/NAME/element.rs` (or `elements/NAME/element.rs`), against the site given or
+/// the one it was made for too, and writes its `.wasm` (and, for a site, its pictures).
+fn check_element(repo: &Path, name: &str, given: Option<Site>) -> Result<(), String> {
     let made_dir = repo.join("made/elements").join(name);
     let carried_dir = repo.join("elements").join(name);
     let (src_path, out_wasm) = if made_dir.join("element.rs").exists() {
@@ -273,7 +400,15 @@ fn check_element(repo: &Path, name: &str) -> Result<(), String> {
     let source = std::fs::read_to_string(&src_path).map_err(|e| format!("{}: {e}", src_path.display()))?;
     let work = repo.join("target/plateau-make/elements").join(name);
     let module = Builder::new(repo, &work)?.build_element(&source, &work.join("check"))?;
-    let judged = judge_element(&module, Settings::default());
+    let kept_site = made_dir.join("element.site");
+    let site = match given {
+        None if kept_site.exists() => site_of(repo, &["--site".to_string(), kept_site.display().to_string()])?,
+        given => given,
+    };
+    let judged = match &site {
+        Some(site) => judge_element_at(&module, site, Settings::default()),
+        None => judge_element(&module, Settings::default()),
+    };
     if !judged.kept() {
         let broken: String = judged.broken.iter().map(|(law, why)| format!("\n- {law}: {why}")).collect();
         return Err(format!("{name} breaks:{broken}"));
@@ -282,6 +417,9 @@ fn check_element(repo: &Path, name: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&out_wasm, &module).map_err(|e| e.to_string())?;
+    if let Some(site) = &site {
+        site_pictures(site, Some(&module), &made_dir.join("pictures"), Settings::default())?;
+    }
     println!("{name} keeps every element law ({:.2} s); wrote {}", judged.seconds, out_wasm.display());
     Ok(())
 }

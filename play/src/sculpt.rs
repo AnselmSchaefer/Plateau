@@ -202,13 +202,18 @@ impl Sculpt {
         Ok(())
     }
 
-    pub fn save_world(&mut self, elements: &[PlacedElement]) -> Result<()> {
+    pub fn save_world_to(&self, path: &std::path::Path, elements: &[PlacedElement]) -> Result<()> {
         let mut world = WorldSave::with_elements(self.area_name.clone(), self.seed, self.edits.edits().to_vec(), elements.to_vec());
         world.tiles = self.tiles.clone();
         world.rules = self.rules.clone();
         world.water = self.water.bodies().to_vec();
         world.edit_authors = self.edit_authors.clone();
-        world.save(&self.save_path)?;
+        world.save(path)?;
+        Ok(())
+    }
+
+    pub fn save_world(&mut self, elements: &[PlacedElement]) -> Result<()> {
+        self.save_world_to(&self.save_path, elements)?;
         self.dirty = false;
         Ok(())
     }

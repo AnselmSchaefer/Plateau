@@ -22,9 +22,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use plateau_engine::atlas::{BorderProfile, CompiledAtlas, Side, TileSpec};
-use plateau_engine::picture::{Camera, map, picture, plan, plans, seam_camera, seam_plan, tint, views};
+use plateau_engine::compose::CompiledElement;
+use plateau_engine::fit::{SiteRegion, cavity_fit, ground_fit, staged};
+use plateau_engine::picture::{Camera, Plan, map, picture, plan, plans, seam_camera, seam_plan, tint, views};
 use plateau_engine::reach::World;
+use plateau_engine::scene::{Combined, SceneWorld};
+use plateau_engine::site::SiteContext;
 use plateau_engine::sketch::Sketch;
+use plateau_engine::world::{OpenWorld, Solids};
 use plateau_engine::{Compiled, Description, Limits, PlayerState, Region, Size, Wasm, check, laws, points};
 
 /// The seed every area is made and judged with.
@@ -94,6 +99,13 @@ pub fn element_guide(repo: &Path) -> Result<String, String> {
         read("elements/lantern/element.rs")?,
         read("elements/hill/element.rs")?
     ))
+}
+
+/// The same, for an element made for a measured site: with the round door, made for openings, as its
+/// example of a frame and a leaf.
+pub fn element_guide_at(repo: &Path) -> Result<String, String> {
+    let door = std::fs::read_to_string(repo.join("elements/hobbit-door/element.rs")).map_err(|e| format!("elements/hobbit-door/element.rs: {e}"))?;
+    Ok(format!("{}\n\n# Example fitted Scene element: `elements/hobbit-door/element.rs`\n\n```rust\n{door}```\n", element_guide(repo)?))
 }
 
 /// The area's source in an answer: its last ```rust block.
@@ -532,6 +544,175 @@ pub fn judge_element(module: &[u8], _settings: Settings) -> Judged {
     judged
 }
 
+/// Which law of `fit` an element made for a site is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitLaw {
+    /// The opening's if the site has one, else the ground's.
+    Auto,
+    Cavity,
+    Ground,
+    /// None: the element is only told of the site (a lamp beside a door, a rug within).
+    Free,
+}
+
+impl FitLaw {
+    pub fn from_name(s: &str) -> Option<FitLaw> {
+        match s {
+            "auto" => Some(FitLaw::Auto),
+            "cavity" => Some(FitLaw::Cavity),
+            "ground" => Some(FitLaw::Ground),
+            "none" => Some(FitLaw::Free),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FitLaw::Auto => "auto",
+            FitLaw::Cavity => "cavity",
+            FitLaw::Ground => "ground",
+            FitLaw::Free => "none",
+        }
+    }
+}
+
+/// A site an element is made for: its measure, the world it was measured in if that is there (else
+/// it is judged and pictured in what its measure tells of it, `fit::SiteRegion`), and which law of
+/// fitting it is held to.
+pub struct Site {
+    pub context: SiteContext,
+    pub world: Option<OpenWorld>,
+    pub law: FitLaw,
+}
+
+impl Site {
+    /// The site's surroundings, for one thread, with `scene`'s solid geometry in them.
+    fn region(&self, scene: Arc<SceneWorld>) -> plateau_engine::Result<Solids<Box<dyn Region>>> {
+        let region: Box<dyn Region> = match &self.world {
+            Some(w) => Box::new(w.region()?),
+            None => Box::new(SiteRegion::new(self.context.clone())),
+        };
+        Ok(Solids { region, world: scene })
+    }
+
+    fn scene(&self) -> Arc<SceneWorld> {
+        self.world.as_ref().map_or_else(|| Arc::new(SceneWorld::default()), |w| w.scene.clone())
+    }
+
+    /// The law it comes to.
+    fn held_to(&self) -> FitLaw {
+        match self.law {
+            FitLaw::Auto if self.context.cavity.is_some() => FitLaw::Cavity,
+            FitLaw::Auto => FitLaw::Ground,
+            law => law,
+        }
+    }
+}
+
+/// `judge_element`, and the element held to its site as well, where it is placed for it.
+pub fn judge_element_at(module: &[u8], site: &Site, settings: Settings) -> Judged {
+    let mut judged = judge_element(module, settings);
+    if !judged.kept() {
+        return judged;
+    }
+    let started = Instant::now();
+    let (name, verdict) = match site.held_to() {
+        FitLaw::Cavity => ("cavity fit", held_to_site(module, site, true)),
+        FitLaw::Ground => ("ground fit", held_to_site(module, site, false)),
+        _ => return judged,
+    };
+    match verdict {
+        Ok(Ok(())) => {}
+        Ok(Err(why)) => judged.broken.push((name.into(), why)),
+        Err(e) => judged.broken.push((name.into(), format!("asking the element for this law failed: {e:#}"))),
+    }
+    judged.seconds += started.elapsed().as_secs_f64();
+    judged
+}
+
+fn held_to_site(module: &[u8], site: &Site, cavity: bool) -> plateau_engine::Result<laws::Verdict> {
+    let element = CompiledElement::load("element", module, Limits::default())?;
+    let scene = site.scene();
+    let mut region = site.region(scene.clone())?;
+    if cavity {
+        return Ok(cavity_fit(&mut region.region, &scene, &site.context, &element, SEED, site.context.frame)?.map(|_| ()));
+    }
+    if element.is_sdf() {
+        return Ok(Ok(())); // A landform goes into the ground as it likes.
+    }
+    let made = element.compiled.instantiate(SEED)?.scene()?;
+    let mut combined = Combined { region: &mut region.region, world: &scene };
+    ground_fit(&mut combined, site.context.size, &made, site.context.frame)
+}
+
+/// Pictures of a site as whoever measured it sees it, bare or (`module`) with an element placed there
+/// and, if `F` changes it, once more after `F`: each its file name and what it shows, for Claude.
+pub fn site_pictures(site: &Site, module: Option<&[u8]>, into: &Path, settings: Settings) -> Result<Vec<(String, String)>, String> {
+    let e = |e: plateau_engine::Error| format!("{e:#}");
+    std::fs::create_dir_all(into).map_err(|e| e.to_string())?;
+    let c = &site.context;
+    let h = c.size;
+    let tf = c.frame;
+    let (w, high) = (settings.view_width, settings.view_width * 9 / 16);
+    // Local metres: whoever measured it is 1.7 m tall in them.
+    let at = |p: [f32; 3]| tf.local_to_world_point(p);
+    let (middle, wide) = match &c.cavity {
+        Some(cavity) => (c.local(cavity.drop()), c.local(cavity.width().max(cavity.height()))),
+        None => (0.6, 3.0),
+    };
+    let off = (1.1 * wide).max(2.0);
+    let camera = |eye: [f32; 3], look: [f32; 3]| Camera { eye: at(eye), at: at(look), fov: 70.0, size: h };
+    let mut views = vec![
+        ("ahead", camera([0.0, middle.max(0.9) + 0.2, off], [0.0, middle, 0.0]), "seen from straight before it".to_string()),
+        ("aside", camera([0.75 * off, middle.max(0.9) + 0.6, 0.8 * off], [0.0, middle, 0.0]), "seen from the right before it".to_string()),
+    ];
+    if let Some(cavity) = &c.cavity
+        && c.local(cavity.depth) > 1.6
+    {
+        let deep = -(0.8 * c.local(cavity.depth)).min(2.5);
+        views.push(("within", camera([0.0, middle, deep], [0.0, middle, 1.0]), "seen from within, looking out".to_string()));
+    }
+    let mut stages: Vec<(&str, &str, Arc<SceneWorld>)> = Vec::new();
+    match module {
+        None => stages.push(("site", "the site as it is", site.scene())),
+        Some(module) => {
+            let element = CompiledElement::load("element", module, Limits::default()).map_err(e)?;
+            let moves = element.preview_scene.instances.iter().any(|i| i.id > 0);
+            let stage = |pressed| staged(&site.scene(), c, &element, SEED, tf, pressed).map(Arc::new).map_err(e);
+            stages.push(("fitted", "your element in its place", stage(false)?));
+            if moves {
+                stages.push(("pressed", "your element after F was pressed before it", stage(true)?));
+            }
+        }
+    }
+    let mut shown = Vec::new();
+    for (stage, what, scene) in stages {
+        let make = || site.region(scene.clone());
+        for (view, camera, seen) in &views {
+            let pixels = picture(&make, camera, w, high).map_err(e)?;
+            let file = format!("{stage}-{view}.png");
+            write_png(&into.join(&file), &pixels, w, high)?;
+            shown.push((file, format!("{what}, {seen}")));
+        }
+        if c.cavity.is_none() {
+            let p = Plan { middle: [tf.pos[0], tf.pos[2]], half: 3.5 * h, top: tf.pos[1] + c.overhead.map_or(4.0 * h, |o| o * 0.9), size: h };
+            let side = settings.plan_width;
+            let pixels = plan(&make, &p, side).map_err(e)?;
+            let file = format!("{stage}-plan.png");
+            write_png(&into.join(&file), &pixels, side, side)?;
+            shown.push((file, format!("{what}, straight down, north (-z of the world) at the top")));
+        }
+    }
+    Ok(shown)
+}
+
+fn write_png(path: &Path, pixels: &[[u8; 3]], width: usize, height: usize) -> Result<(), String> {
+    let w = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    let mut encoder = png::Encoder::new(w, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.write_header().and_then(|mut h| h.write_image_data(pixels.as_flattened())).map_err(|e| e.to_string())
+}
+
 /// The area's pictures and reach maps, written into `into` as PNGs: each its file name and what it
 /// shows, in words for Claude.
 pub fn pictures(module: &[u8], into: &Path, settings: Settings) -> Result<Vec<(String, String)>, String> {
@@ -887,18 +1068,86 @@ pub fn make_element(
     settings: Settings,
     say: &mut dyn FnMut(&str),
 ) -> Result<Made, String> {
+    make_element_with(writer, builder, words, None, dir, settings, say)
+}
+
+/// Makes an element for `site`: Claude is given its measures and pictures of it (`dir/site/`), the
+/// element is held to the site's law of fitting too (`judge_element_at`), and, kept, Claude is shown
+/// it in its place (`dir/pictures/`) once, to make it better. The site's file goes beside the element
+/// (`dir/element.site`), so it can be placed and judged there again.
+pub fn make_element_at(
+    writer: &mut dyn Writer,
+    builder: &Builder,
+    words: &str,
+    site: &Site,
+    dir: &Path,
+    settings: Settings,
+    say: &mut dyn FnMut(&str),
+) -> Result<Made, String> {
+    make_element_with(writer, builder, words, Some(site), dir, settings, say)
+}
+
+/// The first prompt for an element made for a site.
+fn site_prompt(words: &str, site: &Site, dir: &Path, shown: &[(String, String)]) -> String {
+    let list: String = shown.iter().map(|(file, what)| format!("- `{}`: {what}\n", dir.join(file).display())).collect();
+    let law = match site.held_to() {
+        FitLaw::Cavity => {
+            "It is made **for this opening** and is held to it (\"Fitting an opening\" in your guide): its frame meets the wall all the way round, going a \
+             little into it; a leaf, if it has one, shuts it all, and `F` opens and shuts it; and whoever could walk in through the bare opening still can.\n\n"
+        }
+        FitLaw::Ground => "It is made **for this ground** and is held to it: it stands on the ground in every quarter of its footprint, where that is not water.\n\n",
+        _ => "It is made to go here, at the frame's origin; nothing holds it to the site but sense.\n\n",
+    };
+    format!(
+        "Make this standalone composable Plateau element: {words}\n\n## Its site\n\n{}\n{law}Pictures of the site (read them with your Read tool before \
+         writing):\n\n{list}\nAnswer with the whole of `element.rs` in one ```rust block.",
+        site.context.describe_for_prompt()
+    )
+}
+
+/// What to say when a site's element keeps every law: look at it in its place.
+fn fitted_said(dir: &Path, shown: &[(String, String)]) -> String {
+    let list: String = shown.iter().map(|(file, what)| format!("- `{}`: {what}\n", dir.join(file).display())).collect();
+    format!(
+        "It builds, keeps every law, and fits. These are pictures of it in its place, as the engine draws its solid parts (read them with your Read tool; \
+         tints and what is not solid are not drawn):\n\n{list}\nLook at them as the one who asked for it would. Does it look like what was asked, and as if it \
+         had always been there? Is anything missing, wrong, or too plain? Then answer with the whole of `element.rs` again, made better, in one ```rust block, \
+         keeping every law. If it is already as good as you can make it, answer with it unchanged."
+    )
+}
+
+fn make_element_with(
+    writer: &mut dyn Writer,
+    builder: &Builder,
+    words: &str,
+    site: Option<&Site>,
+    dir: &Path,
+    settings: Settings,
+    say: &mut dyn FnMut(&str),
+) -> Result<Made, String> {
     let started = Instant::now();
     let rounds_dir = dir.join("rounds");
     std::fs::create_dir_all(&rounds_dir).map_err(|e| e.to_string())?;
     let mut made = Made { kept: None, rounds: Vec::new(), fixes: 0, looked: false, seconds: 0.0 };
-    let mut prompt = format!(
-        "Make this standalone composable Plateau element: {words}\n\n\
-         Answer with the whole of `element.rs` in one ```rust block."
-    );
+    let mut pictures_for: Option<PathBuf> = None;
+    let mut prompt = match site {
+        None => format!(
+            "Make this standalone composable Plateau element: {words}\n\n\
+             Answer with the whole of `element.rs` in one ```rust block."
+        ),
+        Some(site) => {
+            site.context.save(&dir.join("element.site")).map_err(|e| format!("{e:#}"))?;
+            let folder = dir.join("site");
+            let shown = site_pictures(site, None, &folder, settings)?;
+            let prompt = site_prompt(words, site, &folder, &shown);
+            pictures_for = Some(folder);
+            prompt
+        }
+    };
     let mut asked = "write";
     loop {
         say(&format!("round {}: asking Claude ({asked})", made.rounds.len() + 1));
-        let reply = match writer.write(&prompt, None) {
+        let reply = match writer.write(&prompt, pictures_for.as_deref()) {
             Ok(reply) => reply,
             Err(e) if made.kept.is_some() => {
                 say(&format!("round {}: stopped ({e}); keeping the last valid version", made.rounds.len() + 1));
@@ -910,6 +1159,10 @@ pub fn make_element(
         std::fs::write(rounds_dir.join(format!("{n}-{asked}-asked.md")), &prompt).ok();
         std::fs::write(rounds_dir.join(format!("{n}-{asked}-answer.md")), &reply.text).ok();
         say(&format!("round {n}: answered in {:.0} s, reckoned at ${:.2}", reply.seconds, reply.cost));
+        pictures_for = None;
+        if asked == "look" {
+            made.looked = true;
+        }
 
         let (came, next): (String, Option<(&'static str, String)>) = match source_of(&reply.text) {
             None => (
@@ -927,12 +1180,27 @@ pub fn make_element(
                         )),
                     ),
                     Ok(module) => {
-                        let judged = judge_element(&module, settings);
+                        let judged = match site {
+                            Some(site) => judge_element_at(&module, site, settings),
+                            None => judge_element(&module, settings),
+                        };
                         if judged.kept() {
                             std::fs::write(dir.join("element.rs"), &source).map_err(|e| e.to_string())?;
                             std::fs::write(dir.join("element.wasm"), &module).map_err(|e| e.to_string())?;
                             made.kept = Some(source);
-                            ("keeps every law".into(), None)
+                            match site {
+                                Some(site) => {
+                                    let folder = dir.join("pictures");
+                                    let shown = site_pictures(site, Some(&module), &folder, settings)?;
+                                    if made.looked {
+                                        ("keeps every law".into(), None)
+                                    } else {
+                                        pictures_for = Some(folder.clone());
+                                        ("keeps every law".into(), Some(("look", fitted_said(&folder, &shown))))
+                                    }
+                                }
+                                None => ("keeps every law".into(), None),
+                            }
                         } else {
                             let names: Vec<_> = judged.broken.iter().map(|b| b.0.clone()).collect();
                             let list: String = judged.broken.iter().map(|(law, why)| format!("- **{law}**: {why}\n")).collect();
@@ -951,10 +1219,12 @@ pub fn make_element(
         say(&format!("round {n}: {came}"));
         made.rounds.push(Round { asked, reply, came });
         let Some((kind, words)) = next else { break };
-        if made.fixes >= MOST_FIXES {
-            break;
+        if kind != "look" {
+            if made.fixes >= MOST_FIXES {
+                break;
+            }
+            made.fixes += 1;
         }
-        made.fixes += 1;
         asked = kind;
         prompt = words;
     }

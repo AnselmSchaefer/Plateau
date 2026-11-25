@@ -1077,7 +1077,7 @@ fn abs_f32(a: f32) -> f32 {
 }
 
 #[inline]
-fn sin_f32(x: f32) -> f32 {
+pub(crate) fn sin_f32(x: f32) -> f32 {
     let turns = x * (1.0 / TAU);
     let mut r = (turns - (turns + 0.5).floor()) * TAU;
     if r > PI / 2.0 {
@@ -1090,7 +1090,7 @@ fn sin_f32(x: f32) -> f32 {
 }
 
 #[inline]
-fn cos_f32(x: f32) -> f32 {
+pub(crate) fn cos_f32(x: f32) -> f32 {
     sin_f32(x + PI / 2.0)
 }
 

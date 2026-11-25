@@ -1,8 +1,9 @@
-//! Interactive standalone `.wasm` element placement & preview ghost in `plateau-play` (Step 8b).
+//! Interactive standalone `.wasm` element placement, cavity fitting & preview ghost in `plateau-play` (Step 8b / Phase C).
 //!
 //! Toggle Place Element mode with `P`:
-//! - **Left-click**: place selected element at aimed surface, scaled to current player size
+//! - **Left-click**: place selected element at aimed surface (or snapped cavity fit), scaled to current player size
 //! - **Right-click** or **`X`**: remove aimed placed element
+//! - **`O`**: auto-fit / snap selected element to the aimed carved opening (or its authored `element.site`)
 //! - **`Tab`**: cycle element palette (`elements/modules/*.wasm`, `made/elements/*/element.wasm`, `--element`)
 //! - **`R` / `T`**: rotate placement yaw (-15° / +15°)
 //! - **Mouse wheel** or **`[` / `]`**: fine-adjust placement scale relative to player size
@@ -10,7 +11,7 @@
 //! - **`Z` / `Y`** (or **`Ctrl+Z` / `Ctrl+Y`**): unified undo/redo across sculpt edits & placed elements
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
@@ -18,6 +19,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::compose::{CompiledElement, ComposedLog, ElementCatalog, PlacedElement, PlacementTransform, SdfElementEntry};
 use plateau_engine::edit::Edit;
+use plateau_engine::site::SiteContext;
 use plateau_engine::{ElementBounds, Limits, Region, SIZES};
 
 use crate::scene::build_merged_mesh;
@@ -54,6 +56,14 @@ pub enum WorldAction {
     },
 }
 
+/// Active cavity/site auto-fit snap locked in Place Mode via `O`.
+#[derive(Clone, Debug)]
+pub struct FittedSnap {
+    pub module: String,
+    pub transform: PlacementTransform,
+    pub summary: String,
+}
+
 #[derive(Resource)]
 pub struct PlaceMode {
     pub active: bool,
@@ -68,6 +78,8 @@ pub struct PlaceMode {
     pub undo_stack: Vec<WorldAction>,
     pub redo_stack: Vec<WorldAction>,
     pub aim: Option<([f64; 3], [f32; 3])>,
+    pub fitted: Option<FittedSnap>,
+    pub last_site: Option<SiteContext>,
     pub revision: u64,
 }
 
@@ -97,6 +109,8 @@ impl PlaceMode {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             aim: None,
+            fitted: None,
+            last_site: None,
             revision: 1,
         }
     }
@@ -122,6 +136,7 @@ impl PlaceMode {
         self.selected = prev_mod
             .and_then(|m| self.palette.iter().position(|e| e.module == m))
             .unwrap_or(0);
+        self.fitted = None;
         self.palette.len()
     }
 
@@ -132,11 +147,21 @@ impl PlaceMode {
     pub fn next_element(&mut self) {
         if !self.palette.is_empty() {
             self.selected = (self.selected + 1) % self.palette.len();
+            self.fitted = None;
         }
     }
 
     pub fn adjust_scale(&mut self, factor: f32) {
         self.scale_mult = (self.scale_mult * factor).clamp(0.25, 4.0);
+        self.fitted = None;
+    }
+
+    /// Returns the `element.site` file beside a site-authored element module, if one exists.
+    pub fn element_site_path(&self, module: &str) -> Option<PathBuf> {
+        let p = Path::new(module);
+        let full = if p.is_absolute() { p.to_path_buf() } else { self.catalog.root().join(p) };
+        let site = full.with_extension("site");
+        site.exists().then_some(site)
     }
 
     /// World placement scale for the player's current height (`1.0` at person height with `scale_mult = 1.0`).
@@ -393,16 +418,24 @@ pub fn place_ghost(
         vis.set_if_neq(Visibility::Hidden);
         return;
     }
-    let (Some(elem), Some((hit, _normal))) = (place.current(), place.aim) else {
+    let Some(elem) = place.current() else {
         vis.set_if_neq(Visibility::Hidden);
         return;
     };
+    let snapped = place.fitted.as_ref().filter(|s| s.module == elem.module);
+    if snapped.is_none() && place.aim.is_none() {
+        vis.set_if_neq(Visibility::Hidden);
+        return;
+    }
     let handle = preview_mesh_for(elem, &mut meshes, &mut assets);
     if mesh3d.0 != handle {
         mesh3d.0 = handle;
     }
     if let Some(mut mat) = materials.get_mut(&assets.material) {
-        if elem.is_sdf() {
+        if snapped.is_some() {
+            mat.base_color = Color::srgba(0.98, 0.84, 0.42, 0.44);
+            mat.emissive = LinearRgba::rgb(0.36, 0.26, 0.06);
+        } else if elem.is_sdf() {
             mat.base_color = Color::srgba(0.55, 0.85, 0.95, 0.36);
             mat.emissive = LinearRgba::rgb(0.14, 0.30, 0.42);
         } else {
@@ -413,13 +446,24 @@ pub fn place_ghost(
     let player_size = player.body.size;
     let eye = player.eye.unwrap_or(player.body.eye());
     let draw_scale = (crate::DRAWN_AS / player_size) as f64;
-    let elem_scale = place.placement_scale(player_size);
-    tf.translation = Vec3::new(
-        ((hit[0] - eye[0]) * draw_scale) as f32,
-        ((hit[1] - eye[1]) * draw_scale) as f32,
-        ((hit[2] - eye[2]) * draw_scale) as f32,
-    );
-    tf.rotation = Quat::from_rotation_y(place.yaw);
-    tf.scale = Vec3::splat(elem_scale * draw_scale as f32);
+    if let Some(snap) = snapped {
+        let stf = snap.transform;
+        tf.translation = Vec3::new(
+            ((stf.pos[0] as f64 - eye[0]) * draw_scale) as f32,
+            ((stf.pos[1] as f64 - eye[1]) * draw_scale) as f32,
+            ((stf.pos[2] as f64 - eye[2]) * draw_scale) as f32,
+        );
+        tf.rotation = Quat::from_array(stf.rot).normalize();
+        tf.scale = Vec3::splat(stf.scale * draw_scale as f32);
+    } else if let Some((hit, _normal)) = place.aim {
+        let elem_scale = place.placement_scale(player_size);
+        tf.translation = Vec3::new(
+            ((hit[0] - eye[0]) * draw_scale) as f32,
+            ((hit[1] - eye[1]) * draw_scale) as f32,
+            ((hit[2] - eye[2]) * draw_scale) as f32,
+        );
+        tf.rotation = Quat::from_rotation_y(place.yaw);
+        tf.scale = Vec3::splat(elem_scale * draw_scale as f32);
+    }
     vis.set_if_neq(Visibility::Visible);
 }

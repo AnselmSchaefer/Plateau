@@ -30,15 +30,18 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 use carry::{CachedBuoyancy, CarriedItem, CarryAssets, CarryGhost, CarryState, FallingElement, HeldVisual};
 use chunks::{Chunks, Invalidate};
-use place::{ElementGhost, PlaceMode, PreviewAssets, WorldAction};
+use place::{ElementGhost, FittedSnap, PlaceMode, PreviewAssets, WorldAction};
 use plateau_engine::atlas::{Atlas, CompiledAtlas, Side, TileSpec};
 use plateau_engine::body::{self, Body, Intent};
 use plateau_engine::compose::{Composed, ComposedLog, ElementRuntime, PlacedElement, PlacementTransform};
 use plateau_engine::cut::{CarryDecision, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass, toppled_transform, world_edit_to_local};
 use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, WorldSave, surface_normal};
+use plateau_engine::fit::fit_transform;
+use plateau_engine::laws::length;
 use plateau_engine::physics::{BuoyancyState, compute_buoyancy, player_mass_kg, step_floating_move};
 use plateau_engine::rules::{Action, LOCAL_PLAYER, RuleBook};
 use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld, is_area_owner};
+use plateau_engine::site::{SiteContext, SiteProbe};
 use plateau_engine::water::WaterLog;
 use plateau_engine::{Compiled, ElementBounds, Limits, Material, PlayerState, Region, SIZES, START, Scene, WIDTH, Wasm, rings};
 use scene::SceneVisuals;
@@ -332,8 +335,8 @@ fn setup(
     commands.spawn((Text::new(""), text(18.0), TextColor(Color::WHITE), Node { position_type: PositionType::Absolute, top: px(10.0), left: px(12.0), ..default() }, Hud));
     commands.spawn((
         Text::new(
-            "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  K chop  /  G grab & carry (H flat, R/T turn, Wheel tilt)  /  B sculpt  /  P place\n\
-             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  C sit  /  V view  /  M flags  /  F12 shot",
+            "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  K chop  /  G grab & carry (H flat, R/T turn, Wheel tilt)  /  B sculpt  /  P place (O fit cavity)  /  I measure site\n\
+             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  C tool/sit  /  V view  /  M flags  /  F12 shot",
         ),
         text(14.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
@@ -994,6 +997,7 @@ fn look_and_ask(
         if ctx.sculpt.active {
             ctx.place.active = false;
             ctx.place.aim = None;
+            ctx.place.fitted = None;
             player.say(format!("sculpt mode: {} / {}", ctx.sculpt.preset.name(), ctx.sculpt.material().name()));
         } else {
             ctx.sculpt.aim = None;
@@ -1006,12 +1010,13 @@ fn look_and_ask(
             let _ = ctx.cancel_carry();
         }
         ctx.place.active = !ctx.place.active;
+        ctx.place.fitted = None;
         if ctx.place.active {
             ctx.sculpt.active = false;
             ctx.sculpt.aim = None;
             if let Some(el) = ctx.place.current() {
                 let kind = if el.is_sdf() { "SDF" } else { "Scene" };
-                player.say(format!("place mode: {} [{kind}]", el.name));
+                player.say(format!("place mode: {} [{kind}] (O fits an opening)", el.name));
             } else {
                 player.say("place mode: no .wasm elements found (run ./elements/build.sh)");
             }
@@ -1068,6 +1073,73 @@ fn look_and_ask(
     } else {
         eye
     };
+
+    // Inspect / capture a site or cavity at the crosshair (`I`: writes `.site` + companion `.plateau`).
+    if !ctrl && keys.just_pressed(KeyCode::KeyI) {
+        ctx.finish_all_falls(None);
+        let reach = psize * 45.0;
+        let measured = {
+            let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+            match body::look(&mut combined, pivot, dir, psize, reach).ok().flatten() {
+                Some(hit) => {
+                    let normal = surface_normal(&mut combined, hit, psize).unwrap_or([0.0, 1.0, 0.0]);
+                    let probe = SiteProbe {
+                        target: [hit[0] as f32, hit[1] as f32, hit[2] as f32],
+                        normal,
+                        from: Some([pivot[0] as f32, pivot[1] as f32, pivot[2] as f32]),
+                        size: psize,
+                    };
+                    Some(SiteContext::measure(&mut combined, &probe))
+                }
+                None => None,
+            }
+        };
+        match measured {
+            None => player.say("aim at a surface or opening to measure a site (I)"),
+            Some(Err(e)) => player.say(format!("site measure failed: {e}")),
+            Some(Ok(mut site)) => {
+                site.area = ctx.sculpt.area_name.clone();
+                let summary = site.summary();
+                ctx.place.last_site = Some(site.clone());
+                let stem = ctx
+                    .sculpt
+                    .save_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("world");
+                let since = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let sites_dir = ctx
+                    .sculpt
+                    .save_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap_or_else(|| std::path::Path::new("target"))
+                    .join("sites");
+                let site_path = sites_dir.join(format!("{stem}-{since}.site"));
+                let world_path = site_path.with_extension("plateau");
+                match (site.save(&site_path), ctx.sculpt.save_world_to(&world_path, &ctx.place.placed)) {
+                    (Ok(()), Ok(())) => {
+                        println!("site: {summary}");
+                        println!("saved: {} (+ {})", site_path.display(), world_path.display());
+                        println!(
+                            "make an element for it:\n  cargo run --release -p plateau-make --bin plateau -- make-element \"<words>\" --site {} --save {} --place",
+                            site_path.display(),
+                            ctx.sculpt.save_path.display()
+                        );
+                        let short = site_path.file_name().and_then(|s| s.to_str()).unwrap_or("site");
+                        player.say(format!("site: {summary} (saved {short})"));
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        eprintln!("site save failed: {e}");
+                        player.say(format!("site: {summary} (save failed: {e})"));
+                    }
+                }
+            }
+        }
+    }
 
     // Sculpting controls (Step 8a: scale-stamped SDF edits).
     if ctx.sculpt.active {
@@ -1307,7 +1379,7 @@ fn look_and_ask(
         }
     }
 
-    // Place Element controls (Step 8b: standalone composable .wasm elements).
+    // Place Element controls (Step 8b / Phase C: standalone composable .wasm elements + cavity auto-fit).
     if ctx.place.active {
         if keys.just_pressed(KeyCode::Tab) {
             ctx.place.next_element();
@@ -1318,9 +1390,11 @@ fn look_and_ask(
         }
         if !ctrl && keys.just_pressed(KeyCode::KeyR) {
             ctx.place.yaw -= std::f32::consts::FRAC_PI_6 * 0.5; // -15 deg
+            ctx.place.fitted = None;
         }
         if keys.just_pressed(KeyCode::KeyT) {
             ctx.place.yaw += std::f32::consts::FRAC_PI_6 * 0.5; // +15 deg
+            ctx.place.fitted = None;
         }
         if scroll.delta.y > 0.0 || keys.just_pressed(KeyCode::BracketRight) {
             ctx.place.adjust_scale(1.15);
@@ -1328,51 +1402,125 @@ fn look_and_ask(
             ctx.place.adjust_scale(1.0 / 1.15);
         }
         let reach = psize * 45.0;
-        let hit = {
+        let aim_hit = {
             let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
-            body::look(&mut combined, pivot, dir, psize, reach).ok().flatten()
+            body::look(&mut combined, pivot, dir, psize, reach).ok().flatten().map(|h| {
+                let n = surface_normal(&mut combined, h, psize).unwrap_or([0.0, 1.0, 0.0]);
+                (h, n)
+            })
         };
-        ctx.place.aim = hit.map(|h| {
-            let n = surface_normal(&mut ctx.physics.0, h, psize).unwrap_or([0.0, 1.0, 0.0]);
-            (h, n)
-        });
+        ctx.place.aim = aim_hit;
 
-        if grabbed && buttons.just_pressed(MouseButton::Left)
-            && let (Some(elem), Some((h, _))) = (ctx.place.current().cloned(), ctx.place.aim)
+        // `O`: auto-fit / snap selected element to aimed carved opening (or its authored `element.site`).
+        if !ctrl && keys.just_pressed(KeyCode::KeyO)
+            && let Some(elem) = ctx.place.current().cloned()
         {
-            let at = [h[0] as f32, h[1] as f32, h[2] as f32];
-            if let Err(denial) = ctx.sculpt.rules.check(&ctx.sculpt.player_id, &Action::PlaceElement { at, player_size: psize }) {
-                player.say(denial.reason);
-            } else {
-                let id = ctx.place.alloc_id();
-                let scale = ctx.place.placement_scale(psize);
-                let pl = PlacedElement {
-                    id,
-                    module: elem.module.clone(),
-                    seed: ctx.sculpt.seed.wrapping_mul(31).wrapping_add(id as u64),
-                    pos: at,
-                    yaw: ctx.place.yaw,
-                    rot: None,
-                    scale,
-                    stamp_size: psize,
-                    after_edits: ctx.sculpt.edits.len(),
-                    promoted: None,
-                    clips: Vec::new(),
-                    local_edits: Vec::new(),
-                    author: Some(ctx.sculpt.player_id.clone()),
+            let cavity_attempt = aim_hit.map(|(h, n)| {
+                let probe = SiteProbe {
+                    target: [h[0] as f32, h[1] as f32, h[2] as f32],
+                    normal: n,
+                    from: Some([pivot[0] as f32, pivot[1] as f32, pivot[2] as f32]),
+                    size: psize,
                 };
-                match ctx.spawn_placed(pl.clone(), &mut player) {
-                    Ok(name) => {
-                        let floating = ctx.carry.floating.contains_key(&id);
-                        ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
-                        ctx.place.redo_stack.clear();
-                        if floating {
-                            player.say(format!("placed {name} ({scale:.2}x, floating — step aboard & press F to paddle)"));
-                        } else {
-                            player.say(format!("placed {name} ({scale:.2}x)"));
+                let site = {
+                    let mut combined = Combined { region: &mut ctx.physics.0, world: &ctx.live.world };
+                    SiteContext::measure(&mut combined, &probe)
+                };
+                site.and_then(|s| {
+                    let fitted = fit_transform(&mut ctx.physics.0, &ctx.live.world, &s, &elem.preview_scene)?;
+                    Ok((s, fitted))
+                })
+            });
+            match cavity_attempt {
+                Some(Ok((site, Ok((tf, rim))))) => {
+                    let summary = site.summary();
+                    ctx.place.last_site = Some(site);
+                    ctx.place.fitted = Some(FittedSnap {
+                        module: elem.module.clone(),
+                        transform: tf,
+                        summary: summary.clone(),
+                    });
+                    player.say(format!(
+                        "fitted {} ({} to {} into rim) — LMB to place",
+                        elem.name,
+                        length(rim.least),
+                        length(rim.most)
+                    ));
+                }
+                other => {
+                    // Fallback: if this element was authored for a specific site (`element.site` beside `.wasm`), snap to it.
+                    let authored = ctx
+                        .place
+                        .element_site_path(&elem.module)
+                        .and_then(|p| SiteContext::load(&p).ok());
+                    if let Some(saved_site) = authored {
+                        let summary = saved_site.summary();
+                        ctx.place.fitted = Some(FittedSnap {
+                            module: elem.module.clone(),
+                            transform: saved_site.frame,
+                            summary,
+                        });
+                        player.say(format!("snapped {} to its authored site — LMB to place", elem.name));
+                    } else {
+                        ctx.place.fitted = None;
+                        match other {
+                            Some(Ok((_, Err(why)))) => player.say(format!("cannot fit {}: {why}", elem.name)),
+                            Some(Err(e)) => player.say(format!("fit measure failed: {e}")),
+                            None => player.say("aim at a carved opening to auto-fit (O)"),
+                            _ => {}
                         }
                     }
-                    Err(e) => player.say(format!("place error: {e}")),
+                }
+            }
+        }
+
+        if grabbed && buttons.just_pressed(MouseButton::Left)
+            && let Some(elem) = ctx.place.current().cloned()
+        {
+            let fitted_snap = ctx.place.fitted.clone().filter(|s| s.module == elem.module);
+            let placement = if let Some(snap) = fitted_snap {
+                Some((snap.transform.pos, 0.0, Some(snap.transform.rot), snap.transform.scale, true))
+            } else {
+                ctx.place.aim.map(|(h, _)| {
+                    ([h[0] as f32, h[1] as f32, h[2] as f32], ctx.place.yaw, None, ctx.place.placement_scale(psize), false)
+                })
+            };
+            if let Some((at, yaw, rot, scale, was_fitted)) = placement {
+                if let Err(denial) = ctx.sculpt.rules.check(&ctx.sculpt.player_id, &Action::PlaceElement { at, player_size: psize }) {
+                    player.say(denial.reason);
+                } else {
+                    let id = ctx.place.alloc_id();
+                    let pl = PlacedElement {
+                        id,
+                        module: elem.module.clone(),
+                        seed: ctx.sculpt.seed.wrapping_mul(31).wrapping_add(id as u64),
+                        pos: at,
+                        yaw,
+                        rot,
+                        scale,
+                        stamp_size: psize,
+                        after_edits: ctx.sculpt.edits.len(),
+                        promoted: None,
+                        clips: Vec::new(),
+                        local_edits: Vec::new(),
+                        author: Some(ctx.sculpt.player_id.clone()),
+                    };
+                    match ctx.spawn_placed(pl.clone(), &mut player) {
+                        Ok(name) => {
+                            let floating = ctx.carry.floating.contains_key(&id);
+                            ctx.place.undo_stack.push(WorldAction::PlaceElement(pl));
+                            ctx.place.redo_stack.clear();
+                            if was_fitted {
+                                ctx.place.fitted = None;
+                                player.say(format!("placed fitted {name} ({scale:.3}x — press F to interact)"));
+                            } else if floating {
+                                player.say(format!("placed {name} ({scale:.2}x, floating — step aboard & press F to paddle)"));
+                            } else {
+                                player.say(format!("placed {name} ({scale:.2}x)"));
+                            }
+                        }
+                        Err(e) => player.say(format!("place error: {e}")),
+                    }
                 }
             }
         }
@@ -1414,6 +1562,7 @@ fn look_and_ask(
         ctx.sculpt.aim = None;
         ctx.place.active = false;
         ctx.place.aim = None;
+        ctx.place.fitted = None;
         let reach = psize * 10.0;
         let piv32 = pivot.map(|c| c as f32);
         let scene_hit = ctx.live.world.raycast_placed_surface_material(piv32, dir, reach);
@@ -1612,6 +1761,7 @@ fn look_and_ask(
         ctx.sculpt.aim = None;
         ctx.place.active = false;
         ctx.place.aim = None;
+        ctx.place.fitted = None;
         let reach = psize * 10.0;
         let piv32 = pivot.map(|c| c as f32);
         let scene_hit = ctx.live.world.raycast_placed_surface(piv32, dir, reach).map(|(o, t, _)| (o, t))
@@ -2269,12 +2419,19 @@ fn hud(
         };
         if let Some(el) = place.current() {
             let kind = if el.is_sdf() { "SDF" } else { "Scene" };
-            let sc = place.placement_scale(b.size);
-            let deg = (place.yaw.to_degrees().rem_euclid(360.0)).round() as i32;
-            s += &format!(
-                "\nPLACE: {} [{kind}]  /  scale {sc:.2}x  /  yaw {deg}°{hint}  (LMB place, RMB/X remove, Tab next, R/T rotate, Wheel scale, Ctrl+R rescan)",
-                el.name
-            );
+            if let Some(snap) = place.fitted.as_ref().filter(|s| s.module == el.module) {
+                s += &format!(
+                    "\nPLACE: {} [FITTED {:.3}x]  /  {}  (LMB place, O re-fit, R/T or Wheel free)",
+                    el.name, snap.transform.scale, snap.summary
+                );
+            } else {
+                let sc = place.placement_scale(b.size);
+                let deg = (place.yaw.to_degrees().rem_euclid(360.0)).round() as i32;
+                s += &format!(
+                    "\nPLACE: {} [{kind}]  /  scale {sc:.2}x  /  yaw {deg}°{hint}  (LMB place, O fit opening, RMB/X remove, Tab next, R/T rotate, Wheel scale, Ctrl+R rescan)",
+                    el.name
+                );
+            }
         } else {
             s += "\nPLACE: (no .wasm elements found — run ./elements/build.sh or plateau make-element)";
         }

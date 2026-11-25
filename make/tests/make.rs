@@ -8,7 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use plateau_engine::atlas::Side;
-use plateau_make::{Builder, Made, Neighbor, Reply, SEED, Settings, Writer, judge_element, load_neighbors, make, make_element, make_with_neighbors, source_of};
+use plateau_engine::edit::{Edit, EditLog, Edited, Shape, surface_normal};
+use plateau_engine::site::{SiteContext, SiteProbe};
+use plateau_engine::{Material, SIZES, body};
+use plateau_make::{
+    Builder, FitLaw, Made, Neighbor, Reply, SEED, Settings, Site, Writer, element_guide_at, judge_element, load_neighbors, make, make_element,
+    make_element_at, make_with_neighbors, source_of,
+};
 
 /// The area, with the pillar `PILLAR` metres high: 3 m keeps every law; half a metre, a person
 /// jumps onto it.
@@ -252,13 +258,128 @@ fn make_element_catches_clipped_bounds_and_keeps_fixed_element() {
     assert!(made.kept.is_some());
     assert!(dir.join("element.rs").exists() && dir.join("element.wasm").exists());
 
-    // Also verify all four carried showcase elements pass `judge_element`.
+    // Also verify all seven carried showcase elements pass `judge_element`.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    for name in ["tree", "bridge", "lantern", "hill"] {
+    for name in ["tree", "bridge", "lantern", "hill", "boat", "pillar", "hobbit-door"] {
         let bytes = std::fs::read(root.join(format!("elements/modules/{name}.wasm"))).unwrap();
         let judged = judge_element(&bytes, QUICK);
         assert!(judged.kept(), "{name} broke element laws: {:?}", judged.broken);
     }
+}
+
+#[test]
+fn make_element_at_cavity_holds_element_to_cavity_fit_and_shows_pictures() {
+    // Carve a round doorway into a soil block in a flat world and measure its SiteContext.
+    let person = SIZES[1].1;
+    let mut edits = vec![Edit::add(Shape::Box { half: [3.0, 2.5, 3.0], round: 0.1 }, [32.0, 1.5, 46.0], 0.0, Material::Soil, person)];
+    let r = 0.75 * person;
+    for k in 0..8 {
+        edits.push(Edit::carve(Shape::Sphere { radius: r }, [32.0, 1.15, 49.0 - 0.45 * r * k as f32], 0.35 * r, None, person));
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let garden_bytes = std::fs::read(root.join("areas/modules/garden.wasm")).unwrap();
+    let garden = plateau_engine::Wasm::new(&garden_bytes, SEED, plateau_engine::Limits::default()).unwrap();
+    let mut world = Edited::new(garden, std::sync::Arc::new(EditLog::from_edits(edits).unwrap()));
+
+    let from = [32.0f32, 1.6, 53.0];
+    let hit = body::look(&mut world, from.map(|c| c as f64), [0.0, 0.0, -1.0], person, person * 45.0).unwrap().unwrap();
+    let normal = surface_normal(&mut world, hit, person).unwrap();
+    let context = SiteContext::measure(&mut world, &SiteProbe { target: hit.map(|c| c as f32), normal, from: Some(from), size: person }).unwrap();
+    let cavity = context.cavity.as_ref().expect("round doorway measured");
+    let local_r = context.local(cavity.mean_radius());
+    let local_drop = context.local(cavity.drop());
+
+    // Verify element_guide_at embeds both the fitting section and the hobbit-door example.
+    let guide_text = element_guide_at(&root).unwrap();
+    assert!(guide_text.contains("### Fitting an opening") && guide_text.contains("struct HobbitDoor"));
+
+    // Adapt `elements/hobbit-door/element.rs` to the measured opening's exact local centre & radius.
+    let base_door = std::fs::read_to_string(root.join("elements/hobbit-door/element.rs")).unwrap();
+    let fitted_door = base_door
+        .replace("const MIDDLE: Point = Point { x: 0.0, y: 1.05, z: 0.0 };", &format!("const MIDDLE: Point = Point {{ x: 0.0, y: {local_drop:.4}, z: 0.0 }};"))
+        .replace("const OUTER: f32 = 1.13;", &format!("const OUTER: f32 = {:.4};", local_r * 1.10))
+        .replace("const INNER: f32 = 0.95;", &format!("const INNER: f32 = {:.4};", local_r * 0.92))
+        .replace("const LEAF: f32 = 0.985;", &format!("const LEAF: f32 = {:.4};", local_r * 0.96))
+        .replace("const HINGE: Point = Point { x: -INNER, y: 1.05, z: 0.0 };", &format!("const HINGE: Point = Point {{ x: -INNER, y: {local_drop:.4}, z: 0.0 }};"));
+    // Round 1: frame too small -> leaves a gap around the opening rim -> breaks `cavity fit`.
+    let too_small_door = base_door
+        .replace("const MIDDLE: Point = Point { x: 0.0, y: 1.05, z: 0.0 };", &format!("const MIDDLE: Point = Point {{ x: 0.0, y: {local_drop:.4}, z: 0.0 }};"))
+        .replace("const OUTER: f32 = 1.13;", &format!("const OUTER: f32 = {:.4};", local_r * 0.80))
+        .replace("const INNER: f32 = 0.95;", &format!("const INNER: f32 = {:.4};", local_r * 0.65))
+        .replace("const LEAF: f32 = 0.985;", &format!("const LEAF: f32 = {:.4};", local_r * 0.68))
+        .replace("const HINGE: Point = Point { x: -INNER, y: 1.05, z: 0.0 };", &format!("const HINGE: Point = Point {{ x: -INNER, y: {local_drop:.4}, z: 0.0 }};"));
+
+    let site = Site { context, world: None, law: FitLaw::Auto };
+    let dir = root.join("target/plateau-make-tests/element-cavity-fit");
+    std::fs::remove_dir_all(&dir).ok();
+    let mut writer = StandIn {
+        answers: vec![
+            format!("```rust\n{too_small_door}```"),
+            format!("```rust\n{fitted_door}```"),
+            format!("```rust\n{fitted_door}```"),
+        ]
+        .into(),
+        asked: Vec::new(),
+    };
+    let made = make_element_at(&mut writer, builder(), "a round green hobbit door", &site, &dir, QUICK, &mut |_| {}).unwrap();
+    let came: Vec<_> = made.rounds.iter().map(|r| (r.asked, r.came.as_str())).collect();
+    assert_eq!(came, [("write", "breaks: cavity fit"), ("laws", "keeps every law"), ("look", "keeps every law")]);
+    assert!(made.kept.is_some() && made.looked);
+    // Round 1 got the measured opening contour and bare site pictures.
+    assert!(writer.asked[0].0.contains("const OPENING: [(f32, f32); 48]") && writer.asked[0].0.contains("site-ahead.png"), "{}", writer.asked[0].0);
+    assert_eq!(writer.asked[0].1.as_deref(), Some(dir.join("site").as_path()));
+    // Round 2 got the exact `cavity fit` gap feedback.
+    assert!(writer.asked[1].0.contains("**cavity fit**") && writer.asked[1].0.contains("a gap of") && writer.asked[1].0.contains("o'clock"), "{}", writer.asked[1].0);
+    // Round 3 (`look`) got both shut (`fitted-ahead.png`) and open (`pressed-ahead.png`) renders.
+    assert!(writer.asked[2].0.contains("fitted-ahead.png") && writer.asked[2].0.contains("pressed-ahead.png"), "{}", writer.asked[2].0);
+    assert_eq!(writer.asked[2].1.as_deref(), Some(dir.join("pictures").as_path()));
+    for f in ["element.rs", "element.wasm", "element.site", "site/site-ahead.png", "pictures/fitted-ahead.png", "pictures/pressed-ahead.png"] {
+        assert!(dir.join(f).exists(), "missing expected output {f}");
+    }
+}
+
+#[test]
+fn make_element_at_open_ground_catches_floating_and_keeps_grounded_element() {
+    let person = SIZES[1].1;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let garden_bytes = std::fs::read(root.join("areas/modules/garden.wasm")).unwrap();
+    let mut garden = plateau_engine::Wasm::new(&garden_bytes, SEED, plateau_engine::Limits::default()).unwrap();
+    let from = [46.0f32, 1.6, 48.0];
+    let hit = body::look(&mut garden, from.map(|c| c as f64), [0.0, -0.6, -0.8], person, person * 45.0).unwrap().unwrap();
+    let normal = surface_normal(&mut garden, hit, person).unwrap();
+    let context = SiteContext::measure(&mut garden, &SiteProbe { target: hit.map(|c| c as f32), normal, from: Some(from), size: person }).unwrap();
+    assert!(context.cavity.is_none());
+
+    let floating = r#"use plateau_sdk::*;
+struct FloatingBench;
+impl Element for FloatingBench {
+    fn new(_: u64) -> Self { FloatingBench }
+    fn name(&self) -> &str { "Floating Bench" }
+    fn scene(&self) -> Scene {
+        let mut m = MeshBuilder::new();
+        m.cuboid(point(0.0, 1.1, 0.0), point(0.8, 0.2, 0.4), Material::Wood);
+        let mut sc = SceneBuilder::new();
+        let mesh = sc.add_mesh(m.build());
+        sc.place(mesh, point(0.0, 0.0, 0.0), Quat::IDENTITY, point(1.0, 1.0, 1.0), true);
+        sc.build()
+    }
+}
+element!(FloatingBench);
+"#;
+    let grounded = floating.replace("point(0.0, 1.1, 0.0), point(0.8, 0.2, 0.4)", "point(0.0, 0.25, 0.0), point(0.8, 0.40, 0.4)");
+
+    let site = Site { context, world: None, law: FitLaw::Auto };
+    let dir = root.join("target/plateau-make-tests/element-ground-fit");
+    std::fs::remove_dir_all(&dir).ok();
+    let mut writer = StandIn {
+        answers: vec![format!("```rust\n{floating}```"), format!("```rust\n{grounded}```"), format!("```rust\n{grounded}```")].into(),
+        asked: Vec::new(),
+    };
+    let made = make_element_at(&mut writer, builder(), "a wooden garden bench", &site, &dir, QUICK, &mut |_| {}).unwrap();
+    let came: Vec<_> = made.rounds.iter().map(|r| (r.asked, r.came.as_str())).collect();
+    assert_eq!(came, [("write", "breaks: ground fit"), ("laws", "keeps every law"), ("look", "keeps every law")]);
+    assert!(writer.asked[1].0.contains("**ground fit**") && writer.asked[1].0.contains("floats"), "{}", writer.asked[1].0);
+    assert!(dir.join("site/site-plan.png").exists() && dir.join("pictures/fitted-plan.png").exists());
 }
 
 #[test]
