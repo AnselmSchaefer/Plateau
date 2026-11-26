@@ -19,7 +19,7 @@ use crate::{Instance, Material, MeshData, Result, SIZES, Scene, Vertex};
 const PERSON_HEIGHT: f32 = SIZES[1].1;
 
 /// An element-local half-space plane keeping points with `dot(normal, p) >= offset`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClipPlane {
     pub normal: [f32; 3],
     pub offset: f32,

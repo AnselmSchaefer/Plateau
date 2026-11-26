@@ -16,11 +16,16 @@
 //! whether or not it was seen to; an element settles on water at rest, unloaded. What only the
 //! player sees and stands on (the topple under way, bobbing, a rider's weight pressing a boat down)
 //! is `animate`d between actions and moves no saved transform, so a log replays without it.
+//!
+//! **The graph** (`graph`, phase F): what each element was cut from, rests on and is owned by,
+//! written by the actions that make it so (`relations`), reported in their `Summary`, undone with
+//! them, and saved.
 
 pub mod action;
 pub mod history;
 pub mod log;
 mod objects;
+pub mod relations;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +39,7 @@ use crate::body::Body;
 use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, quat_normalize};
 use crate::cut::ObjectPhysics;
 use crate::edit::{Edit, EditLog, Op, SavedTile, WorldSave};
+use crate::graph::{Graph, GraphDelta, Node};
 use crate::modules::{ModuleCheck, SavedModule, relative_to_root};
 use crate::physics::{BuoyancyState, compute_buoyancy, player_mass_kg};
 use crate::rules::RuleBook;
@@ -44,6 +50,7 @@ use crate::{Compiled, ElementBounds, Limits, PlayerState, Result, Scene, Wasm, c
 pub use action::{Action, Actor, Outcome, SculptTarget, Summary};
 pub use history::{History, WorldAction};
 pub use log::{ActionLog, LOG_VERSION, Logged, replay};
+pub use relations::Footing;
 
 /// Which chunks a change makes stale.
 #[derive(Clone, Debug, PartialEq)]
@@ -167,6 +174,8 @@ pub struct World {
     pub edit_authors: Vec<Option<String>>,
     pub water: Arc<WaterLog>,
     pub rules: RuleBook,
+    /// What each element was cut from, rests on, and is owned by.
+    pub graph: Graph,
     pub tiles: Vec<SavedTile>,
     /// The loaded save's module hashes: kept for a module that cannot be read when saving again.
     pub modules: Vec<SavedModule>,
@@ -197,6 +206,8 @@ pub struct World {
     composed_revision: u64,
     changes: Changes,
     log: Option<ActionLog>,
+    /// The graph's changes during the action being applied.
+    journal: GraphDelta,
 }
 
 impl World {
@@ -234,6 +245,7 @@ impl World {
         let edits = Arc::new(EditLog::from_edits(save.edits.clone())?);
         let water = Arc::new(WaterLog::from_bodies(save.water.clone())?);
         let next_id = save.elements.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let graph = Graph::from_relations(save.relations.iter().cloned())?;
         let mut world = World {
             atlas,
             region: Composed::new(live, Arc::new(ComposedLog::empty())),
@@ -245,6 +257,7 @@ impl World {
             edit_authors: save.edit_authors.clone(),
             water,
             rules: save.rules.clone(),
+            graph,
             tiles,
             modules: save.modules.clone(),
             root: root.to_path_buf(),
@@ -265,12 +278,19 @@ impl World {
             composed_revision: 0,
             changes: Changes::default(),
             log: None,
+            journal: GraphDelta::default(),
         };
+        // Pieces cut from elements no longer in the world keep their ids, so none is used again.
+        world.next_id = world.next_id.max(world.graph.relations().filter_map(|r| r.to.element()).max().map_or(0, |m| m + 1));
         for pl in save.elements {
             world.spawn_layer_for(pl)?;
         }
         world.commit(Invalidation::All);
         world.refresh_all_buoyancy();
+        if save.relations.is_empty() {
+            world.derive_graph();
+        }
+        world.journal = GraphDelta::default();
         world.changes.said.clear();
         world.dirty = false;
         Ok((world, area_scenes))
@@ -284,6 +304,7 @@ impl World {
         save.rules = self.rules.clone();
         save.water = self.water.bodies().to_vec();
         save.edit_authors = self.edit_authors.clone();
+        save.relations = self.graph.relations().collect();
         save
     }
 
@@ -317,6 +338,7 @@ impl World {
         self.edit_authors = saved.edit_authors;
         self.water = Arc::new(WaterLog::from_bodies(saved.water)?);
         self.rules = saved.rules;
+        self.graph = Graph::from_relations(saved.relations.iter().cloned())?;
         self.runtime.clear(&mut self.scene);
         self.changes.layers.push(LayerChange::DespawnAllPlaced);
         self.placed.clear();
@@ -327,8 +349,13 @@ impl World {
             self.spawn_layer_for(pl)?;
             self.next_id = self.next_id.max(id + 1);
         }
+        self.next_id = self.next_id.max(self.graph.relations().filter_map(|r| r.to.element()).max().map_or(0, |m| m + 1));
         self.commit(Invalidation::All);
         self.refresh_all_buoyancy();
+        if saved.relations.is_empty() {
+            self.derive_graph();
+        }
+        self.journal = GraphDelta::default();
         self.dirty = false;
         Ok((edit_count, self.placed.len()))
     }
@@ -737,7 +764,16 @@ impl World {
         }
         let old_tf = pl.transform();
         let world_rev = self.world_rev();
-        let buoy = compute_buoyancy(&phys, old_tf, &mut self.region, extra_load_kg).ok()?;
+        let mut buoy = compute_buoyancy(&phys, old_tf, &mut self.region, extra_load_kg).ok()?;
+        // Water knows only the terrain: what rests on another element (a bridge over a channel, a
+        // pier) is held up by it, and does not sink or float down through it. (Lifted off it by
+        // water rising, it floats.)
+        if let BuoyancyState::Floating { target_y, .. } | BuoyancyState::Sinking { target_y, .. } = buoy
+            && target_y < old_tf.pos[1]
+            && self.contacts_at(id, old_tf).iter().any(|n| matches!(n, Node::Element(_)))
+        {
+            buoy = BuoyancyState::Dry { floor_y: old_tf.pos[1] };
+        }
         match buoy {
             BuoyancyState::Floating { target_y, .. } | BuoyancyState::Sinking { target_y, .. } => {
                 if buoy.is_floating() {
@@ -801,6 +837,11 @@ impl World {
             }
             let Some(phys) = self.runtime.physics_of(id) else { continue };
             if phys.rooted {
+                continue;
+            }
+            // Resting on another element (a log on a bridge over water), a rider's weight does not
+            // press it down through what holds it.
+            if !self.floating.contains_key(&id) && self.graph.supports_of(id).iter().any(|n| matches!(n, Node::Element(_))) {
                 continue;
             }
             let rest = pl.transform();

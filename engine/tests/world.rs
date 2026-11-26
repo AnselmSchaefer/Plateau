@@ -229,13 +229,14 @@ fn a_chopped_trunk_is_carried_and_laid_as_a_bridge_and_the_session_replays() {
     let chop_at = [pos[0], pos[1] + 0.9, pos[2]];
     let cut = |tool| Action::Cut { id: tree, hit: chop_at, dir: [1.0, 0.0, 0.0], tool, material: Some(Material::Wood) };
     assert!(matches!(act(&mut world, &mut body, cut(Tool::Shovel)), Outcome::Denied(_)));
-    let trunk = match act(&mut world, &mut body, cut(Tool::Saw)) {
-        Outcome::Done(s) => s.added[0],
+    let (stump, trunk) = match act(&mut world, &mut body, cut(Tool::Saw)) {
+        Outcome::Done(s) => (s.added[0], s.added[1]),
         other => panic!("not chopped: {other:?}"),
     };
     assert_eq!(world.placed.len(), 2);
+    assert!(world.find(tree).is_none(), "the tree is two pieces now");
     assert_eq!(world.falling.len(), 1, "the top is toppling");
-    let stump = world.find(tree).unwrap().clone();
+    let stump = world.find(stump).unwrap().clone();
     assert_eq!(stump.clips.len(), 1);
 
     // Picked up (the fall ends first), carried, and laid flat across the lawn to the west.

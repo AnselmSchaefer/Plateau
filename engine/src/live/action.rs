@@ -14,6 +14,7 @@ use crate::body::Body;
 use crate::compose::PlacedElement;
 use crate::cut::world_edit_to_local;
 use crate::edit::{Edit, Op};
+use crate::graph::{GraphDelta, Relation};
 use crate::physics::Tool;
 use crate::rules::Action as Rule;
 use crate::water::WaterLog;
@@ -98,6 +99,9 @@ pub struct Summary {
     pub promoted: Vec<u32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub water: bool,
+    /// What it did to the world graph.
+    #[serde(default, skip_serializing_if = "GraphDelta::is_empty")]
+    pub graph: GraphDelta,
     /// What the player is told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub said: Option<String>,
@@ -140,7 +144,9 @@ impl World {
         let size = actor.body.size;
         let yaw = actor.body.yaw;
         let id = actor.id.to_string();
-        let outcome = match &action {
+        self.journal = GraphDelta::default();
+        let pushed = self.history.pushed;
+        let mut outcome = match &action {
             Action::Sculpt { edit, hit, tool, target } => self.sculpt(&mut actor, *edit, *hit, *tool, *target),
             Action::Place { module, pos, yaw, rot, scale, fitted } => self.place(&mut actor, module, *pos, *yaw, *rot, *scale, *fitted),
             Action::Remove { id } => self.remove(&actor, *id),
@@ -154,6 +160,16 @@ impl World {
             Action::Undo => self.undo(actor.body),
             Action::Redo => self.redo(&mut actor),
         };
+        // What it did to the graph goes with its undo, and is said in its outcome.
+        let delta = self.take_journal();
+        if self.history.pushed != pushed
+            && let Some(done) = self.history.undo.last_mut()
+        {
+            done.graph = delta.clone();
+        }
+        if let Outcome::Done(summary) = &mut outcome {
+            summary.graph = delta;
+        }
         if let Some(log) = &mut self.log {
             let after = self.region.log.revision();
             if let Err(e) = log.write(&id, feet, size, yaw, &action, &outcome, before, after) {
@@ -203,7 +219,7 @@ impl World {
         }
         {
             let _span = info_span!("rules").entered();
-            let check = Rule::SculptElement { at: edit.center, player_size: actor.body.size, author: pl.author.as_deref() };
+            let check = Rule::SculptElement { at: edit.center, player_size: actor.body.size, owner: self.owner_of(id) };
             if let Err(denial) = self.rules.check(actor.id, &check) {
                 return Outcome::Denied(denial.reason);
             }
@@ -322,6 +338,8 @@ impl World {
         };
         match self.spawn_placed(pl.clone(), Some(&mut *actor.body)) {
             Ok(name) => {
+                self.relate(Relation::owned_by(id, actor.id));
+                self.settle_relations(id);
                 let floating = self.floating.contains_key(&id);
                 self.history.push(WorldAction::PlaceElement(pl));
                 let said = if fitted {
@@ -344,9 +362,10 @@ impl World {
 
     fn remove(&mut self, actor: &Actor<'_>, id: u32) -> Outcome {
         let Some(pl) = self.find(id) else { return Outcome::Denied(format!("no element #{id} to remove")) };
-        if let Err(denial) = self.rules.check(actor.id, &Rule::RemoveElement { at: pl.pos, author: pl.author.as_deref() }) {
+        if let Err(denial) = self.rules.check(actor.id, &Rule::RemoveElement { at: pl.pos, owner: self.owner_of(id) }) {
             return Outcome::Denied(denial.reason);
         }
+        self.unrelate_leaving(id);
         match self.remove_placed(id) {
             Some(removed) => {
                 self.history.push(WorldAction::RemoveElement(removed));
@@ -375,12 +394,12 @@ impl World {
 
     fn undo(&mut self, body: &mut Body) -> Outcome {
         self.finish_all_falls(Some(&mut *body));
-        let Some(action) = self.history.undo.pop() else { return Outcome::Unchanged("nothing to undo".into()) };
-        let said = match action.clone() {
+        let Some(done) = self.history.undo.pop() else { return Outcome::Unchanged("nothing to undo".into()) };
+        let said = match done.action.clone() {
             WorldAction::SdfEdit { edit, promoted_ids } => {
                 let mut next = (*self.edits).clone();
                 if next.pop().is_none() {
-                    self.history.undo.push(action);
+                    self.history.undo.push(done);
                     return Outcome::Unchanged("nothing to undo".into());
                 }
                 self.edits = Arc::new(next);
@@ -429,7 +448,8 @@ impl World {
                 "undo move".into()
             }
         };
-        self.history.redo.push(action);
+        self.revert_graph(&done.graph, false);
+        self.history.redo.push(done);
         Outcome::Done(self.summary(said))
     }
 
@@ -437,8 +457,8 @@ impl World {
         let author = actor.id.to_string();
         let body = &mut *actor.body;
         self.finish_all_falls(Some(&mut *body));
-        let Some(action) = self.history.redo.pop() else { return Outcome::Unchanged("nothing to redo".into()) };
-        let said = match action.clone() {
+        let Some(done) = self.history.redo.pop() else { return Outcome::Unchanged("nothing to redo".into()) };
+        let said = match done.action.clone() {
             WorldAction::SdfEdit { edit, promoted_ids } => {
                 let repromote: Vec<_> = promoted_ids.iter().map(|&(id, idx)| (id, Some(idx))).collect();
                 let bounds = self.set_elements_promoted(&repromote);
@@ -496,7 +516,8 @@ impl World {
                 "redo move".into()
             }
         };
-        self.history.undo.push(action);
+        self.revert_graph(&done.graph, true);
+        self.history.undo.push(done);
         Outcome::Done(self.summary(said))
     }
 }

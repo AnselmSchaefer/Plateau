@@ -209,6 +209,54 @@ Objects know what they come from, rest on, belong to, and fill.
 on a bridge rests on it; ownership survives a chop by another player; every law passes on the
 showcase world; saves round-trip.
 
+*Slice 1 done 2026-11-26 (headless tests only; not yet played by hand):*
+
+- `engine/src/graph.rs`: nodes are the terrain, placed elements by id (an original that was cut
+  keeps its id, never given out again) and players; relations `derived_from` (with the piece's
+  side of the cut), `rests_on`, `owned_by`, at most one of a kind between two nodes, in a
+  `BTreeMap`. `GraphDelta` (added, removed) undoes and redoes.
+- Saved as `rel <kind> <from> <to> [data]` after the elements (`rel derived_from 3 1 clip …`,
+  `rel rests_on 3 terrain`, `rel owned_by 3 @local`); refused if they name an element not in the
+  save (but for a piece's original), name one twice, or come in a `plateau-world 1` save. A save
+  with no `rel` records (made before the graph) is given one when opened: owners from who placed
+  each element, `rests_on` from contacts.
+- Written by `World::apply` only, through a journal (`live/relations.rs`): every action's delta is
+  in its `Summary` (so the action log carries it and `replay` checks it), kept with its undo, and
+  reverted by it. `Place` writes `owned_by` and `rests_on`; `Remove` takes the element's relations
+  and what rested on it; **a cut now makes two new pieces** (the stump is no longer the original's
+  id), each `derived_from` the original and owned by its owner, not the cutter, the top piece
+  resting where its fall ends; `Drop` rests the element on what it touches there and frees what
+  rested on it. A carried element keeps its relations until set down.
+- `rests_on` from real contacts (`World::contacts_at`): up to 512 points of the element's solid
+  meshes, at a transform, asked of the terrain (areas and sculpting, no water: a floating thing
+  rests on nothing) and of each other element alone (scene solids, or the SDF entry of a landform
+  or promoted one); a contact is a point within 5 % of the smaller one's size with the surface
+  below it. `Footing` says what needs holding up: ground, rooted, afloat, carried, or loose.
+- The rule book asks the graph: `rules::Action::{CutOrCarry, RemoveElement, SculptElement}` take
+  `owner` (from `owned_by`) instead of the placer.
+- Laws (`laws::world_graph`): `rests_are_contacts`, `none_unsupported`, `cuts_are_derived`,
+  `graph_round_trips`.
+- Tests: `engine/tests/graph.rs` (5): a chop gives a stump and a trunk derived from the tree, the
+  cut's delta undone and redone exactly; a trunk laid on a bridge rests on the bridge (not the lawn),
+  undone onto the lawn, the law failing when it is moved behind `apply`'s back, and loose (law
+  failing, as it should until G) when the bridge is removed; Bob chops Alice's tree and the pieces
+  stay hers, so under `own` he cannot carry them and she can; the showcase (bridge, tree, a tiny's
+  home, a hill, a chop, the trunk laid on the bridge) keeps every law at each step, saves and opens
+  with the same graph and text, its log replays to the same graph, and its save stripped of `rel`
+  records derives the same owners and rests; bad `rel` records are refused.
+
+Played by hand the same day: a short log set down on a bridge over a flooded channel sank through
+the deck to the water, because buoyancy asks only the terrain and water (a phase E fault, not the
+graph's). Now, when buoyancy would move something down while it rests on another element, the
+support wins, and a rider's weight doesn't press it down either (`settle_buoyancy_for`, `animate`);
+`a_log_laid_on_a_bridge_over_water_stays_on_the_bridge`, from the session's own channel and bridge.
+Logs played before this fix replay only up to such a drop.
+
+Short of the done-when: nothing. Not yet in the graph: `attached_to`, `fills`, `carved_into`,
+`flooded_by`, element parts, and `SiteContext::describe_for_prompt`'s neighbourhood. Relations go
+stale when the world changes under them without the element moving (terrain carved from under a
+log, water rising round it): G's support check is what should mend them; until then the laws say so.
+
 ### G. Support and falling (one to one and a half weeks)
 
 When a tree's trunk is removed, the tree falls.

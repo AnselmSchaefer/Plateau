@@ -22,6 +22,7 @@ use wasmtime::bail;
 
 use crate::compose::PlacedElement;
 use crate::cut::ClipPlane;
+use crate::graph::{Kind, Relation};
 use crate::modules::{SavedModule, parse_module_line, write_module_records};
 use crate::rules::RuleBook;
 use crate::water::{WaterBody, WaterLog};
@@ -576,6 +577,8 @@ pub struct WorldSave {
     /// Optional per-edit author list aligned with `edits` (`None` or shorter vector = unattributed).
     pub edit_authors: Vec<Option<String>>,
     pub elements: Vec<PlacedElement>,
+    /// The world graph (`rel` records, `graph`), in its order; empty in saves made before it.
+    pub relations: Vec<Relation>,
 }
 
 impl WorldSave {
@@ -591,6 +594,7 @@ impl WorldSave {
             edits,
             edit_authors: Vec::new(),
             elements: Vec::new(),
+            relations: Vec::new(),
         }
     }
 
@@ -606,6 +610,7 @@ impl WorldSave {
             edits,
             edit_authors: Vec::new(),
             elements,
+            relations: Vec::new(),
         }
     }
 
@@ -652,6 +657,10 @@ impl WorldSave {
                 write_sdf_record(&mut s, &format!("el-sdf {}", el.id), le, None);
             }
         }
+        for r in &self.relations {
+            s.push_str(&r.to_record());
+            s.push('\n');
+        }
         s
     }
 
@@ -668,6 +677,7 @@ impl WorldSave {
         let mut edit_authors: Vec<Option<String>> = Vec::new();
         let mut any_edit_author = false;
         let mut elements: Vec<PlacedElement> = Vec::new();
+        let mut relations: Vec<Relation> = Vec::new();
         for (line_no, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -731,6 +741,20 @@ impl WorldSave {
                     .find(|e| e.id == id)
                     .ok_or_else(|| wasmtime::format_err!("line {}: el-sdf references unknown element {id}", line_no + 1))?;
                 target.local_edits.push(edit);
+            } else if line.starts_with("rel ") {
+                if version == Some(1) {
+                    bail!("line {}: `rel` records need `plateau-world 2`", line_no + 1);
+                }
+                let rel = Relation::parse_record(line, line_no + 1)?;
+                // Its ends are elements already recorded, but for the original a piece was cut from,
+                // which may be gone.
+                let ends = [Some(&rel.from), (rel.kind != Kind::DerivedFrom).then_some(&rel.to)];
+                for id in ends.into_iter().flatten().filter_map(|n| n.clone().element()) {
+                    if !elements.iter().any(|e| e.id == id) {
+                        bail!("line {}: relation names element {id}, not in the save", line_no + 1);
+                    }
+                }
+                relations.push(rel);
             } else {
                 bail!("line {}: unknown record `{line}`", line_no + 1);
             }
@@ -741,7 +765,8 @@ impl WorldSave {
             edit_authors.clear();
         }
         modules.sort();
-        Ok(WorldSave { version, area, seed, tiles, modules, rules, water, edits, edit_authors, elements })
+        crate::graph::Graph::from_relations(relations.iter().cloned())?;
+        Ok(WorldSave { version, area, seed, tiles, modules, rules, water, edits, edit_authors, elements, relations })
     }
 
     /// Writes the save file atomically (write temp file in same directory, then rename).

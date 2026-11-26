@@ -145,17 +145,17 @@ fn rulebook_enforces_roles_scale_caps_guards_plots_and_object_ownership() {
     // CutCarryPolicy::OwnOnly: visitor "eve" can cut/carry/remove her own object, NOT alice's!
     assert!(
         rules
-            .check("eve", &Action::CutOrCarry { at: [20.0, 0.0, 20.0], author: Some("eve") })
+            .check("eve", &Action::CutOrCarry { at: [20.0, 0.0, 20.0], owner: Some("eve") })
             .is_ok()
     );
     assert!(
         rules
-            .check("eve", &Action::CutOrCarry { at: [20.0, 0.0, 20.0], author: Some("alice") })
+            .check("eve", &Action::CutOrCarry { at: [20.0, 0.0, 20.0], owner: Some("alice") })
             .is_err()
     );
     assert!(
         rules
-            .check("eve", &Action::RemoveElement { at: [20.0, 0.0, 20.0], author: Some("alice") })
+            .check("eve", &Action::RemoveElement { at: [20.0, 0.0, 20.0], owner: Some("alice") })
             .is_err()
     );
 

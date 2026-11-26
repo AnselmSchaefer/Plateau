@@ -21,15 +21,17 @@ Made from the code by `engine/tests/docs.rs`, never by hand: each crate's module
 | `chunk` | Chunks of an area's surface (POC_PLAN.md, step 2, "Meshing"): surface nets over a cube of `CELLS` cells a side, asked of the area at the size the chunk's voxel is detail for. |  |
 | `compose` | Composable standalone `.wasm` elements (POC_PLAN.md, step 8b; AGENTS.md). | `chunk`, `cut`, `edit`, `math`, `mesh_sdf`, `modules`, `scene`, `wasm`, `water` |
 | `cut` | Deterministic procedural `Scene` cutting, watertight cross-section capping, and scale-aware object physics / carry limits (Step 8c; AGENTS.md §1.3 & §2). | `compose`, `edit`, `physics` |
-| `edit` | Scale-stamped SDF sculpting & digging overlay (POC_PLAN.md, step 8; AGENTS.md). | `chunk`, `compose`, `cut`, `modules`, `rules`, `water` |
+| `edit` | Scale-stamped SDF sculpting & digging overlay (POC_PLAN.md, step 8; AGENTS.md). | `chunk`, `compose`, `cut`, `graph`, `modules`, `rules`, `water` |
 | `fit` | Whether an element fits the site it is for (Phase C): the laws a site-made element is held to, and where a carried one (a round door of any size) goes to fit an opening. | `body`, `compose`, `laws`, `mesh_sdf`, `scene`, `site` |
-| `laws` | The laws an area must keep (CONCEPT.md, "Laws"; POC_PLAN.md, step 3), searched for rather than proved. | `atlas`, `chunk`, `reach`, `rings`, `sketch`, `wasm` |
+| `graph` | The world graph (`WORLD_PLAN.md`, phase F): what each placed object comes from, rests on, and belongs to, as typed relations between nodes. | `cut` |
+| `laws` | The laws an area, and a live world's graph, must keep (CONCEPT.md, "Laws"; POC_PLAN.md, step 3; WORLD_PLAN.md, phase F), searched for rather than proved. | `atlas`, `chunk`, `edit`, `graph`, `live`, `reach`, `rings`, `sketch`, `wasm` |
 | `lib` | Plateau's engine (POC_PLAN.md). | `atlas`, `compose`, `cut`, `edit`, `fit`, `mesh_sdf`, `modules`, `physics`, `rules`, `site`, `wasm`, `water`, `world` |
-| `live` | The live world (`WORLD_PLAN.md`, phase E): everything a world is while someone plays it, and every change to it. | `atlas`, `body`, `chunk`, `compose`, `cut`, `edit`, `math`, `modules`, `physics`, `rules`, `scene`, `water` |
-| `live::action` | What a player asks of the world, and what came of it (`WORLD_PLAN.md`, phase E). | `body`, `compose`, `cut`, `edit`, `physics`, `rules`, `water` |
-| `live::history` | Undo and redo (`WORLD_PLAN.md`, phase E): what each change did, kept so it can be undone, across sculpting, promotion, placing, chopping and moving. | `compose`, `edit` |
+| `live` | The live world (`WORLD_PLAN.md`, phase E): everything a world is while someone plays it, and every change to it. | `atlas`, `body`, `chunk`, `compose`, `cut`, `edit`, `graph`, `math`, `modules`, `physics`, `rules`, `scene`, `water` |
+| `live::action` | What a player asks of the world, and what came of it (`WORLD_PLAN.md`, phase E). | `body`, `compose`, `cut`, `edit`, `graph`, `physics`, `rules`, `water` |
+| `live::history` | Undo and redo (`WORLD_PLAN.md`, phase E): what each change did, kept so it can be undone, across sculpting, promotion, placing, chopping and moving. | `compose`, `edit`, `graph` |
 | `live::log` | The action log (`WORLD_PLAN.md`, phase E): one JSON line an action, so a session can be read (by people, by the inspector of phase K) and replayed (`replay`) onto the save it began from. | `body` |
-| `live::objects` | Changes to placed objects (`WORLD_PLAN.md`, phase E): chopping, carrying, setting down, and piloting what floats. | `body`, `compose`, `cut`, `math`, `physics`, `rules` |
+| `live::objects` | Changes to placed objects (`WORLD_PLAN.md`, phase E): chopping, carrying, setting down, and piloting what floats. | `body`, `compose`, `cut`, `graph`, `math`, `physics`, `rules` |
+| `live::relations` | How the live world keeps its graph (`WORLD_PLAN.md`, phase F): what an element rests on, found from real contacts; whether it needs holding up at all; and every relation written through the journal, so the action that wrote it reports it and its undo reverts it. | `compose`, `graph`, `water` |
 | `math` | The engine's own transcendental functions (`WORLD_PLAN.md`, phase D). |  |
 | `mesh_sdf` | Exact, deterministic, BVH-accelerated Signed Distance Field built from a procedural `Scene`'s solid triangle meshes (`MeshSdf`). |  |
 | `modules` | Which modules a saved world was made of (`WORLD_PLAN.md`, phase D). | `edit` |

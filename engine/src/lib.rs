@@ -19,6 +19,7 @@ pub mod compose;
 pub mod cut;
 pub mod edit;
 pub mod fit;
+pub mod graph;
 pub mod laws;
 pub mod live;
 pub mod math;

@@ -1,8 +1,8 @@
-//! The laws an area must keep (CONCEPT.md, "Laws"; POC_PLAN.md, step 3), searched for rather than
-//! proved. Each search is seeded, so a failure plays again exactly, and says what broke in words,
-//! for whoever made the area (Claude, from step 5): where, at what size, by how much, and what the
-//! law asks. Each needs no right answer to compare with: it relates the area to itself, at two
-//! sizes, along a ray, or from the start.
+//! The laws an area, and a live world's graph, must keep (CONCEPT.md, "Laws"; POC_PLAN.md, step 3;
+//! WORLD_PLAN.md, phase F), searched for rather than proved. Each search is seeded, so a failure
+//! plays again exactly, and says what broke in words, for whoever made the area (Claude, from step
+//! 5): where, at what size, by how much, and what the law asks. Each needs no right answer to
+//! compare with: it relates the area to itself, at two sizes, along a ray, or from the start.
 //!
 //! | Law | Holds |
 //! |---|---|
@@ -16,6 +16,15 @@
 //! | `sketch_materials` | Blue is water, grey is stone rock/cliff, brown is land (not water), within a tolerance |
 //! | `sketch_places` | Every orange mark is reached by the tiny alone, and every purple mark by giants alone |
 //! | `borders_match` | Ground height, water level, and surface material are continuous along a shared edge with a neighbouring area |
+//!
+//! And those a live world's graph keeps (`WORLD_PLAN.md`, phase F; `world_graph` asks them all):
+//!
+//! | Law | Holds |
+//! |---|---|
+//! | `rests_are_contacts` | Every `rests_on` is a real contact, within a tolerance of the smaller object's size, between things in the world |
+//! | `none_unsupported` | Every element is ground, rooted, afloat, carried, or rests on something |
+//! | `cuts_are_derived` | Every piece made by a cut is `derived_from` what it was cut from, along the cut it carries |
+//! | `graph_round_trips` | The graph written to a save and read back is the same graph |
 
 use crate::atlas::{BorderSample, Side, sample_edge};
 use crate::chunk::{CELLS, Key};
@@ -1211,4 +1220,87 @@ fn check_border_samples(
     }
 
     Ok(())
+}
+
+/// Every `rests_on` joins an element in the world to the terrain or another element in the world,
+/// and is a real contact where both now are (`live::World::contacts_at`). Carried elements, and
+/// what rests on them, are left until they are set down.
+pub fn rests_are_contacts(world: &mut crate::live::World) -> Verdict {
+    use crate::graph::{Kind, Node};
+    let held = world.held.map(|h| h.id);
+    let rests: Vec<_> = world.graph.relations().filter(|r| r.kind == Kind::RestsOn).collect();
+    for r in rests {
+        let Some(a) = r.from.clone().element() else { return Err(format!("`{}`: only elements rest on things", r.to_record())) };
+        if world.find(a).is_none() {
+            return Err(format!("`{}`: element #{a} is not in the world", r.to_record()));
+        }
+        if let Node::Element(b) = r.to
+            && world.find(b).is_none()
+        {
+            return Err(format!("`{}`: element #{b} is not in the world", r.to_record()));
+        }
+        if held == Some(a) || held == r.to.clone().element() {
+            continue;
+        }
+        let tf = world.find(a).unwrap().transform();
+        if !world.contacts_at(a, tf).contains(&r.to) {
+            return Err(format!("{r}, but {} does not touch it from above where it is ({}): it moved, or what held it up did", world.element_name(a), at(tf.pos, 1.7)));
+        }
+    }
+    Ok(())
+}
+
+/// No element is unsupported: each is ground (an SDF landform), rooted, afloat, carried, or rests
+/// on something.
+pub fn none_unsupported(world: &crate::live::World) -> Verdict {
+    use crate::live::Footing;
+    for pl in &world.placed {
+        if world.footing(pl.id) == Some(Footing::Loose) && world.graph.supports_of(pl.id).is_empty() {
+            return Err(format!("{} (#{}) at {} is loose and rests on nothing", world.element_name(pl.id), pl.id, at(pl.pos, 1.7)));
+        }
+    }
+    Ok(())
+}
+
+/// Every piece made by a cut (an element carrying clips) is `derived_from` the element it was cut
+/// from, along its last clip, and every `derived_from` joins a piece in the world to an element
+/// that was.
+pub fn cuts_are_derived(world: &crate::live::World) -> Verdict {
+    for pl in &world.placed {
+        let Some(&last) = pl.clips.last() else { continue };
+        match world.graph.derived_from(pl.id) {
+            Some((_, cut)) if cut == last => {}
+            Some((orig, cut)) => return Err(format!("#{} was cut from #{orig} along {cut:?}, but carries {last:?} last", pl.id)),
+            None => return Err(format!("#{} ({}) was cut, but is derived from nothing", pl.id, world.element_name(pl.id))),
+        }
+    }
+    for r in world.graph.relations().filter(|r| r.kind == crate::graph::Kind::DerivedFrom) {
+        if r.from.clone().element().is_none_or(|p| world.find(p).is_none()) {
+            return Err(format!("`{}`: the piece is not in the world", r.to_record()));
+        }
+    }
+    Ok(())
+}
+
+/// The graph written to the world's save and read back is the same graph, and writes the same text.
+pub fn graph_round_trips(world: &crate::live::World) -> Result<Verdict> {
+    let text = world.to_save().to_text();
+    let again = crate::edit::WorldSave::from_text(&text)?;
+    let graph = crate::graph::Graph::from_relations(again.relations.iter().cloned())?;
+    if graph != world.graph {
+        return Ok(Err(format!("the save's graph has {} relations, the world's {}", graph.len(), world.graph.len())));
+    }
+    if again.to_text() != text {
+        return Ok(Err("the save read back does not write the same text".into()));
+    }
+    Ok(Ok(()))
+}
+
+/// Every law of the world graph, the first broken said.
+pub fn world_graph(world: &mut crate::live::World) -> Result<Verdict> {
+    let verdict = rests_are_contacts(world).and_then(|_| none_unsupported(world)).and_then(|_| cuts_are_derived(world));
+    if verdict.is_err() {
+        return Ok(verdict);
+    }
+    graph_round_trips(world)
 }

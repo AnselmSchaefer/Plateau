@@ -37,14 +37,23 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
                             ├─ tool (physics::Tool)        ─▶ Denied           │  Invalidation ─▶ chunks
                             ├─ the change (edit, place, cut, carry, steer)     ├─ LayerChange ─▶ scene meshes
                             ├─ what follows (promotion, water, buoyancy)       └─ words ─▶ HUD
+                            ├─ the graph (derived_from, rests_on, owned_by)
                             ├─ commit: a new ComposedLog snapshot
-                            ├─ history (undo/redo)
+                            ├─ history (undo/redo, with the graph's delta)
                             └─ action log line (--log) ─▶ Outcome
 ```
 
 - Everything a save keeps changes only through `World::apply`; `play` asks and shows. What is only
   seen (a topple under way, bobbing, a rider pressing a boat down) is `World::animate`d between
   actions and moves nothing saved, so a log replays (`live::replay`) onto the save it began from.
+- **The world graph** (`graph::Graph`, kept by `live::relations`): typed relations between
+  elements, the terrain and players, in an ordered map. A cut makes two new pieces, each
+  `derived_from` the original along its side of the cut and `owned_by` the original's owner (not
+  the cutter); `Place`, `Drop` and a cut piece's landing write `rests_on` from real contacts
+  (`World::contacts_at`: the element's solid points touching something from above, within 5 % of
+  the smaller one's size). Each action's `GraphDelta` is in its `Summary` and kept with its undo.
+  The rule book asks the graph who owns what. Its laws (`laws::world_graph`) are kept by every
+  test world.
 - `--log actions.jsonl` writes every action and what came of it; `--trace trace.json` writes the
   engine's spans for the Perfetto UI.
 
@@ -79,7 +88,11 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Site, cavity, opening | A place measured at the player's size; an opening's rim, outline, depth, floor | `engine::site` |
 | Fit | Whether an element meets its site (rim fit, ground fit), and where it goes to | `engine::fit` |
 | Law | A property every area must keep, searched for, never assumed (sizes agree, gates are real, …) | `engine::laws` |
-| World save | `plateau-world 2`: tiles, module hashes, rules, water, edits, elements | `edit::WorldSave`, `modules` |
+| World save | `plateau-world 2`: tiles, module hashes, rules, water, edits, elements, relations (`rel`) | `edit::WorldSave`, `modules` |
+| World graph, relation | What each element was cut from (`derived_from`), rests on (`rests_on`), and is owned by (`owned_by`) | `engine::graph` |
+| Footing | How an element is held up: ground (an SDF landform), rooted, afloat, carried, or loose (resting on something) | `live::relations::Footing` |
+| Contact | An element's solid touching something from above, within 5 % of the smaller one's size: what `rests_on` is made of | `World::contacts_at` |
+| Piece, original | The two elements a cut makes, and the element they were cut from (gone, its id kept) | `live::objects`, `graph` |
 | Action, outcome | A change asked of the live world, and what came of it | `live::action` |
 | Action log | `plateau-log 1`: one JSON line an action | `live::log` |
 | Changes | What the window must show after actions: SDF snapshots, layers, words | `live::Changes` |

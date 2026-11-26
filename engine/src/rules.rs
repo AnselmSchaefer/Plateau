@@ -2,7 +2,8 @@
 //!
 //! Enforced strictly by the engine / authoritative server (never trusted to `.wasm` modules).
 //! Permissions operate across four dimensions:
-//! - **Principals**: area `owners`, `builders`, `visitors`, plus per-object creator (`author`).
+//! - **Principals**: area `owners`, `builders`, `visitors`, plus each object's owner (the world
+//!   graph's `owned_by`, `graph`).
 //! - **Spatial scopes**: 64 m tile policies (`AreaPolicy`), optional claimed sub-volumes (`Plot`,
 //!   e.g. a tiny home plot inside a shared forest), and protected `border_guard` / `spawn_guard`
 //!   buffers for non-owners.
@@ -300,9 +301,10 @@ pub enum Action<'a> {
     Interact { at: [f32; 3] },
     Sculpt { lo: [f32; 3], hi: [f32; 3], player_size: f32, is_water: bool },
     PlaceElement { at: [f32; 3], player_size: f32 },
-    RemoveElement { at: [f32; 3], author: Option<&'a str> },
-    CutOrCarry { at: [f32; 3], author: Option<&'a str> },
-    SculptElement { at: [f32; 3], player_size: f32, author: Option<&'a str> },
+    /// `owner`: who owns the element (the world graph's `owned_by`).
+    RemoveElement { at: [f32; 3], owner: Option<&'a str> },
+    CutOrCarry { at: [f32; 3], owner: Option<&'a str> },
+    SculptElement { at: [f32; 3], player_size: f32, owner: Option<&'a str> },
     ModifyWater { lo: [f32; 3], hi: [f32; 3], player_size: f32 },
 }
 
@@ -633,26 +635,26 @@ fn check_policy(tile: [i32; 2], player: &str, pol: &RolePolicy, action: &Action<
                 };
             }
         }
-        Action::RemoveElement { author, .. } | Action::CutOrCarry { author, .. } => match pol.cut_carry {
+        Action::RemoveElement { owner, .. } | Action::CutOrCarry { owner, .. } => match pol.cut_carry {
             CutCarryPolicy::Any => {}
             CutCarryPolicy::OwnOnly => {
-                if author != Some(player) {
-                    return deny(format!("in {scope} you can only modify objects you placed"));
+                if owner != Some(player) {
+                    return deny(format!("in {scope} you can only modify objects you own"));
                 }
             }
             CutCarryPolicy::None => {
                 return deny(format!("chopping, carrying, or removing objects in {scope} is not allowed"));
             }
         },
-        Action::SculptElement { player_size, author, .. } => {
+        Action::SculptElement { player_size, owner, .. } => {
             if !size_allowed(pol.sculpt_max, player_size) {
                 return match pol.sculpt_max {
                     None => deny(format!("sculpting objects in {scope} is not allowed")),
                     Some(max) => deny(format!("sculpting objects in {scope} is limited to {} scale or smaller", max.name())),
                 };
             }
-            if pol.cut_carry == CutCarryPolicy::OwnOnly && author != Some(player) {
-                return deny(format!("in {scope} you can only sculpt objects you placed"));
+            if pol.cut_carry == CutCarryPolicy::OwnOnly && owner != Some(player) {
+                return deny(format!("in {scope} you can only sculpt objects you own"));
             }
             if pol.cut_carry == CutCarryPolicy::None {
                 return deny(format!("modifying objects in {scope} is not allowed"));

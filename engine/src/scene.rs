@@ -520,6 +520,31 @@ impl SceneWorld {
         hit
     }
 
+    /// Unsigned distance from `p` to the nearest solid mesh triangle of `owner` alone, if nearer
+    /// than `best`.
+    pub fn distance_to_solids_of(&self, owner: u32, p: [f32; 3], best: f32) -> Option<f32> {
+        let mut d_best = best;
+        let mut hit = None;
+        let statics = self.solid_static.get(&owner).into_iter().flatten();
+        let mut dynamics: Vec<&LiveInstance> = self.dynamic.iter().filter(|((o, _), l)| *o == owner && l.visible && l.instance.solid).map(|(_, l)| l).collect();
+        dynamics.sort_by_key(|l| l.instance.id);
+        for live in statics.chain(dynamics) {
+            if aabb_distance(p, live.world_lo, live.world_hi) >= d_best {
+                continue;
+            }
+            let Some(b) = self.bounds.get(&live.owner).and_then(|v| v.get(live.instance.mesh as usize)) else { continue };
+            let local = world_to_local(p, &live.instance);
+            if let Some((d_local, _)) = b.nearest_local(local, d_best / live.min_scale.max(1e-5)) {
+                let d_world = d_local * live.min_scale;
+                if d_world < d_best {
+                    d_best = d_world;
+                    hit = Some(d_world);
+                }
+            }
+        }
+        hit
+    }
+
     /// Raycasts against visible dynamic instances (`id > 0`) across all owners, returning
     /// `(owner, local_id, hit_t)`.
     pub fn raycast_dynamic_owned(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, u32, f32)> {

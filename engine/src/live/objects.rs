@@ -6,6 +6,7 @@ use super::{FallingElement, World, WorldAction};
 use crate::Material;
 use crate::body;
 use crate::compose::{PlacementTransform, quat_rotate};
+use crate::graph::Relation;
 use crate::cut::{CarryDecision, ObjectPhysics, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass, toppled_transform};
 use crate::math;
 use crate::physics::{BuoyancyState, Tool, compute_buoyancy, player_mass_kg, step_floating_move};
@@ -25,11 +26,13 @@ impl World {
         Summary { edits: self.edits.len(), elements: self.placed.len(), said: Some(said.into()), ..Summary::default() }
     }
 
-    /// Chops the element `id` where `hit` is, with `tool`, across its longest axis: the lower piece
-    /// stays, the upper is a new element, toppling away along `dir` if it stood upright.
+    /// Chops the element `id` where `hit` is, with `tool`, across its longest axis, into two new
+    /// elements: the lower piece stays where it stood, the upper topples away along `dir` if it
+    /// stood upright. Each is `derived_from` the original and owned by its owner (not the cutter),
+    /// and rests on what it touches where it comes to rest.
     pub(super) fn cut(&mut self, actor: &mut Actor<'_>, id: u32, hit: [f32; 3], dir: [f32; 3], tool: Tool, material: Option<Material>) -> Outcome {
         let Some(original) = self.find(id).cloned() else { return Outcome::Denied("aim at a placed object within reach to chop (K)".into()) };
-        if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: original.pos, author: original.author.as_deref() }) {
+        if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: original.pos, owner: self.owner_of(id) }) {
             return Outcome::Denied(denial.reason);
         }
         let name = self.element_name(id);
@@ -44,7 +47,9 @@ impl World {
         if clip_scene(&scene, &[plane.flipped()]).instances.is_empty() || upper_scene.instances.is_empty() {
             return Outcome::Denied("cut plane missed solid geometry — aim nearer the middle".into());
         }
+        let lower_id = self.alloc_id();
         let mut lower = original.clone();
+        lower.id = lower_id;
         lower.clips.push(plane.flipped());
         let upper_id = self.alloc_id();
         let mut upper = original.clone();
@@ -71,7 +76,9 @@ impl World {
             let gap = (0.14 * upper.scale).max(0.01);
             PlacementTransform::with_rot([0, 1, 2].map(|a| orig_tf.pos[a] + wn[a] * gap), orig_tf.rot, orig_tf.scale)
         };
+        let mut upper_floats = false;
         if let Ok(buoy) = compute_buoyancy(&upper_phys, rest, &mut self.region, 0.0) {
+            upper_floats = buoy.is_floating();
             match buoy {
                 BuoyancyState::Floating { target_y, .. } | BuoyancyState::Sinking { target_y, .. } => rest.pos[1] = target_y,
                 BuoyancyState::Dry { floor_y } => {
@@ -95,6 +102,8 @@ impl World {
                 duration: TOPPLE_SECONDS,
             });
         }
+        let owner = self.owner_of(id).map(str::to_string);
+        self.unrelate_leaving(id);
         self.remove_placed(id);
         let spawned = self
             .spawn_placed(lower.clone(), Some(&mut *actor.body))
@@ -103,13 +112,24 @@ impl World {
             self.falling.retain(|f| f.id != upper_id);
             return Outcome::Denied(format!("chop failed: {e}"));
         }
+        for (piece, clip) in [(lower_id, plane.flipped()), (upper_id, plane)] {
+            self.relate(Relation::derived_from(piece, id, clip));
+            if let Some(owner) = &owner {
+                self.relate(Relation::owned_by(piece, owner));
+            }
+        }
+        self.settle_relations(lower_id);
+        // The upper piece rests where its fall ends, not where it is still shown.
+        let upper_rests = if upper_floats || upper_phys.rooted { Vec::new() } else { self.contacts_at(upper_id, rest) };
+        self.rest_on(upper_id, &upper_rests);
         if upright && upper.is_promoted() {
             // A carved trunk falls as its crisp meshes; its SDF, tunnel and all, is back where it lands.
             self.show_solid_at(upper_id, orig_tf);
         }
         self.history.push(WorldAction::CutElement { original, lower, upper: upper_settled });
         let mut summary = self.said(format!("chopped {name} — press G to carry"));
-        summary.added = vec![upper_id];
+        summary.added = vec![lower_id, upper_id];
+        summary.removed = vec![id];
         Outcome::Done(summary)
     }
 
@@ -119,7 +139,7 @@ impl World {
             return Outcome::Denied("already carrying something".into());
         }
         let Some(pl) = self.find(id).cloned() else { return Outcome::Denied("aim at a placed object within reach to grab (G)".into()) };
-        if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: pl.pos, author: pl.author.as_deref() }) {
+        if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: pl.pos, owner: self.owner_of(id) }) {
             return Outcome::Denied(denial.reason);
         }
         let Some(phys) = self.physics_of(id) else { return Outcome::Denied("rooted in terrain — sculpt with B".into()) };
@@ -133,7 +153,8 @@ impl World {
         }
     }
 
-    /// Sets the carried element down at `pos`, turned by `rot`, as solid geometry.
+    /// Sets the carried element down at `pos`, turned by `rot`, as solid geometry: it rests on what
+    /// it now touches, and what rested on it rests on it no longer.
     pub(super) fn drop_held(&mut self, actor: &mut Actor<'_>, pos: [f32; 3], rot: [f32; 4]) -> Outcome {
         let Some(held) = self.held else { return Outcome::Denied("carrying nothing".into()) };
         if !pos.iter().chain(&rot).all(|c| c.is_finite()) {
@@ -144,6 +165,8 @@ impl World {
         }
         let scale = self.find(held.id).map_or(held.from.scale, |pl| pl.scale);
         self.release_held(PlacementTransform::with_rot(pos, rot, scale), true, Some(&mut *actor.body));
+        self.unrelate_resting_on(held.id);
+        self.settle_relations(held.id);
         let name = self.element_name(held.id);
         Outcome::Done(self.said(format!("placed {name} down")))
     }
