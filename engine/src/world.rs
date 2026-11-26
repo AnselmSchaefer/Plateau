@@ -2,14 +2,15 @@
 //! made again from the save as the player has them, for measuring sites in it (`site`), judging what
 //! is made for them (`fit`), and picturing both (`picture`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use wasmtime::{bail, format_err};
+use wasmtime::bail;
 
 use crate::atlas::{Atlas, CompiledAtlas, TileSpec};
 use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, SdfElementEntry};
 use crate::edit::{EditLog, SavedTile, WorldSave};
+use crate::modules::ModuleCheck;
 use crate::scene::{Combined, SceneWorld};
 use crate::water::WaterLog;
 use crate::{Answer, Compiled, Description, Limits, Region, Result, Wasm};
@@ -22,17 +23,21 @@ pub struct OpenWorld {
     /// The areas' and placed elements' procedural scenes, as someone of `size` meets them.
     pub scene: Arc<SceneWorld>,
     pub size: f32,
-}
-
-/// Where `path`, as a save has it, is: as it is, or under `root`.
-fn found(path: &str, root: &Path) -> Result<PathBuf> {
-    [PathBuf::from(path), root.join(path)].into_iter().find(|p| p.exists()).ok_or_else(|| format_err!("{path}: not found (nor under {})", root.display()))
+    /// Modules loaded although their bytes are not those the save recorded
+    /// (`ModuleCheck::AcceptChanged`).
+    pub changed_modules: Vec<String>,
 }
 
 impl OpenWorld {
     /// Opens `save` as someone `size` tall meets it. Its modules are looked for as they are named and
-    /// under `root`; `area` is its area's module if the save names none.
+    /// under `root`; `area` is its area's module if the save names none. A module whose bytes are
+    /// not those the save recorded is refused (`open_checked` to let it through).
     pub fn open(save: WorldSave, root: &Path, area: Option<&Path>, size: f32, limits: Limits) -> Result<OpenWorld> {
+        OpenWorld::open_checked(save, root, area, size, limits, ModuleCheck::Strict)
+    }
+
+    /// As `open`, with `check` saying what to do with a module that changed since the save.
+    pub fn open_checked(save: WorldSave, root: &Path, area: Option<&Path>, size: f32, limits: Limits, check: ModuleCheck) -> Result<OpenWorld> {
         let mut tiles = save.tiles.clone();
         if let Some(area) = area {
             tiles.retain(|t| t.at != [0, 0]);
@@ -41,18 +46,20 @@ impl OpenWorld {
         if tiles.is_empty() {
             bail!("the save does not say which module its area is: name it");
         }
-        let specs = tiles
-            .iter()
-            .map(|t| {
-                let path = found(&t.module, root)?;
-                let bytes = std::fs::read(&path).map_err(|e| format_err!("{}: {e}", path.display()))?;
-                Ok(TileSpec { at: t.at, seed: t.seed, compiled: Arc::new(Compiled::new(&bytes, limits)?) })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut changed_modules = Vec::new();
+        let mut specs = Vec::with_capacity(tiles.len());
+        for t in &tiles {
+            let read = save.read_module(&t.module, root, check)?;
+            if read.changed && !changed_modules.contains(&t.module) {
+                changed_modules.push(t.module.clone());
+            }
+            specs.push(TileSpec { at: t.at, seed: t.seed, compiled: Arc::new(Compiled::new(&read.bytes, limits)?) });
+        }
         let atlas = CompiledAtlas::new(specs)?;
         let mut scene = SceneWorld::default();
         atlas.instantiate()?.load_scenes_into(&mut scene)?;
         let mut catalog = ElementCatalog::new(root, limits);
+        catalog.expect_hashes(&save.modules, check);
         let mut runtime = ElementRuntime::new();
         let mut sdf = Vec::new();
         for pl in &save.elements {
@@ -69,7 +76,12 @@ impl OpenWorld {
         let edits = Arc::new(EditLog::from_edits(save.edits.clone())?);
         let water = Arc::new(WaterLog::from_bodies(save.water.clone())?);
         let log = Arc::new(ComposedLog::new_with_water(edits, sdf, water, 1));
-        Ok(OpenWorld { save, atlas, log, scene: Arc::new(scene), size })
+        for m in catalog.changed_modules() {
+            if !changed_modules.contains(m) {
+                changed_modules.push(m.clone());
+            }
+        }
+        Ok(OpenWorld { save, atlas, log, scene: Arc::new(scene), size, changed_modules })
     }
 
     /// An area's module as it is, untouched, opened as a world.

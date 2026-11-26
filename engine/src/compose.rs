@@ -26,6 +26,7 @@ use wasmtime::{bail, format_err};
 use crate::cut::{ClipPlane, ObjectPhysics, clip_scene};
 use crate::edit::{Edit, EditLog, Op};
 use crate::mesh_sdf::MeshSdf;
+use crate::modules::{ModuleCheck, SavedModule, check_bytes};
 use crate::scene::{Applied, SceneWorld};
 use crate::wasm::MAX_IMPULSE;
 use crate::water::WaterLog;
@@ -249,7 +250,7 @@ impl PlacedElement {
         self.scale = tf.scale;
         let q = quat_normalize(tf.rot);
         if quat_is_yaw_only(q) {
-            self.yaw = 2.0 * q[1].atan2(q[3]);
+            self.yaw = 2.0 * crate::math::atan2(q[1], q[3]);
             self.rot = None;
         } else {
             self.rot = Some(q);
@@ -359,11 +360,49 @@ pub struct ElementCatalog {
     limits: Limits,
     entries: HashMap<String, Arc<CompiledElement>>,
     promoted_sdfs: HashMap<PromotedKey, Option<Arc<MeshSdf>>>,
+    /// The hashes a loaded save recorded for its modules, checked as each is loaded.
+    expected: HashMap<String, String>,
+    check: ModuleCheck,
+    /// Modules loaded although their bytes differ from the save's (`ModuleCheck::AcceptChanged`).
+    changed: Vec<String>,
 }
 
 impl ElementCatalog {
     pub fn new(root: impl Into<PathBuf>, limits: Limits) -> ElementCatalog {
-        ElementCatalog { root: root.into(), limits, entries: HashMap::new(), promoted_sdfs: HashMap::new() }
+        ElementCatalog {
+            root: root.into(),
+            limits,
+            entries: HashMap::new(),
+            promoted_sdfs: HashMap::new(),
+            expected: HashMap::new(),
+            check: ModuleCheck::Strict,
+            changed: Vec::new(),
+        }
+    }
+
+    /// Checks every module loaded from now on against the hashes `modules` records (a save's),
+    /// refusing or accepting a changed one as `check` says. Modules already loaded whose bytes
+    /// were not checked are loaded again on next use.
+    pub fn expect_hashes(&mut self, modules: &[SavedModule], check: ModuleCheck) {
+        self.expected = modules.iter().map(|m| (m.path.clone(), m.sha256.clone())).collect();
+        self.check = check;
+        self.changed.clear();
+        let expected = &self.expected;
+        self.entries.retain(|name, _| !expected.contains_key(name));
+        self.promoted_sdfs.clear();
+    }
+
+    /// Modules loaded although they differ from the save they were expected for.
+    pub fn changed_modules(&self) -> &[String] {
+        &self.changed
+    }
+
+    /// Checks `bytes` of `module` against the expected hash, noting it if it changed.
+    fn verify(&mut self, module: &str, bytes: &[u8]) -> Result<()> {
+        if check_bytes(self.expected.get(module).map(String::as_str), module, bytes, self.check)? && !self.changed.iter().any(|m| m == module) {
+            self.changed.push(module.to_string());
+        }
+        Ok(())
     }
 
     /// Builds (or retrieves from cache) the exact local `MeshSdf` for a lazily promoted `Scene`
@@ -400,6 +439,7 @@ impl ElementCatalog {
         let path = Path::new(module);
         let full = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
         let bytes = std::fs::read(&full).map_err(|e| format_err!("{}: {e}", full.display()))?;
+        self.verify(module, &bytes)?;
         let compiled = CompiledElement::load(module.to_string(), &bytes, self.limits)?;
         self.entries.insert(module.to_string(), compiled.clone());
         Ok(compiled)
@@ -412,8 +452,12 @@ impl ElementCatalog {
     /// Discovers `.wasm` files under `elements/modules/*.wasm` and `made/elements/*/element.wasm`.
     pub fn discover(&mut self) -> Vec<Arc<CompiledElement>> {
         let mut found = Vec::new();
+        let root = self.root.clone();
         let mut try_add = |rel: String, full: &Path| {
+            // A module the loaded save expects other bytes of is left for `get_or_load` to refuse
+            // (or accept) by name, rather than offered as it is now.
             if let Ok(bytes) = std::fs::read(full)
+                && self.verify(&rel, &bytes).is_ok()
                 && let Ok(el) = CompiledElement::load(rel.clone(), &bytes, self.limits)
             {
                 self.entries.insert(rel, el.clone());
@@ -421,7 +465,7 @@ impl ElementCatalog {
             }
         };
 
-        let modules_dir = self.root.join("elements/modules");
+        let modules_dir = root.join("elements/modules");
         if let Ok(read) = std::fs::read_dir(&modules_dir) {
             let mut paths: Vec<PathBuf> = read.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|ext| ext == "wasm")).collect();
             paths.sort();
@@ -432,7 +476,7 @@ impl ElementCatalog {
             }
         }
 
-        let made_dir = self.root.join("made/elements");
+        let made_dir = root.join("made/elements");
         if let Ok(read) = std::fs::read_dir(&made_dir) {
             let mut dirs: Vec<PathBuf> = read.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
             dirs.sort();
@@ -1002,8 +1046,6 @@ pub fn transform_scene(scene: &Scene, tf: PlacementTransform) -> Scene {
 
 // Deterministic math & quaternion helpers (matching `plateau-sdk` and `edit.rs`).
 
-const PI: f32 = std::f32::consts::PI;
-const TAU: f32 = std::f32::consts::TAU;
 const SIZES_PERSON: f32 = 1.7;
 
 /// Deterministic unit quaternion for rotation by `yaw` radians around +Y.
@@ -1076,22 +1118,15 @@ fn abs_f32(a: f32) -> f32 {
     if a < 0.0 { -a } else { a }
 }
 
+/// The engine's deterministic sine (`math::sin`), under the name `site` and `cut` know it by.
 #[inline]
 pub(crate) fn sin_f32(x: f32) -> f32 {
-    let turns = x * (1.0 / TAU);
-    let mut r = (turns - (turns + 0.5).floor()) * TAU;
-    if r > PI / 2.0 {
-        r = PI - r;
-    } else if r < -PI / 2.0 {
-        r = -PI - r;
-    }
-    let r2 = r * r;
-    r * (1.0 + r2 * (-1.0 / 6.0 + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362_880.0 + r2 * (-1.0 / 39_916_800.0))))))
+    crate::math::sin(x)
 }
 
 #[inline]
 pub(crate) fn cos_f32(x: f32) -> f32 {
-    sin_f32(x + PI / 2.0)
+    crate::math::cos(x)
 }
 
 #[inline]

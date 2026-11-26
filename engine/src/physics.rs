@@ -16,7 +16,7 @@
 use crate::chunk;
 use crate::compose::{PlacementTransform, quat_mul, quat_rotate};
 use crate::cut::ObjectPhysics;
-use crate::{Material, Region, Result, SIZES};
+use crate::{Material, Region, Result, SIZES, math};
 
 const PERSON_HEIGHT: f32 = SIZES[1].1;
 /// Water density in kg/m³.
@@ -353,7 +353,7 @@ pub fn step_floating_move(
     let dt = clamp_f32(dt, 0.0, 0.1);
     let dyaw = turn_rate * dt;
     let next_rot = if abs_f32(dyaw) > 1e-6 {
-        let q_yaw = [0.0, (dyaw * 0.5).sin(), 0.0, (dyaw * 0.5).cos()];
+        let q_yaw = [0.0, math::sin(dyaw * 0.5), 0.0, math::cos(dyaw * 0.5)];
         quat_mul(q_yaw, cur_tf.rot)
     } else {
         cur_tf.rot
@@ -413,7 +413,7 @@ pub fn step_floating_move(
     candidate_pos[2] = final_xz[1];
     candidate_pos[1] = match buoy {
         BuoyancyState::Floating { target_y, bob_amplitude, .. } => {
-            let bob = (elapsed_time * 2.2).sin() * bob_amplitude;
+            let bob = math::sin(elapsed_time * 2.2) * bob_amplitude;
             target_y + bob
         }
         BuoyancyState::Sinking { target_y, .. } => target_y,

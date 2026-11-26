@@ -49,7 +49,7 @@ const FINER_AT_MOST: u32 = 3;
 /// The finest level a viewer `size` tall needs: the power of two at or below a twentieth of it
 /// (a giant's half a metre, a person's 6 cm, the tiny's half a millimetre).
 pub fn finest(size: f32) -> i32 {
-    ((size / VOXELS_A_HEIGHT).log2().floor() as i32).clamp(FINEST, COARSEST)
+    (crate::math::log2(size / VOXELS_A_HEIGHT).floor() as i32).clamp(FINEST, COARSEST)
 }
 
 /// How deep in a surface the eye may be, as a fraction of a viewer's height, and still be in the

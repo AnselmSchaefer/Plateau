@@ -23,7 +23,7 @@
 //! a touch: it looks for the surface itself, with rays stepped as far as each distance allows,
 //! which stop only where a surface really is.
 
-use crate::{Answer, LARGEST, Material, Region, Result, SMALLEST, chunk};
+use crate::{Answer, LARGEST, Material, Region, Result, SMALLEST, chunk, math};
 
 /// A body's proportions, as fractions of its height: its radius, its eye standing and seated
 /// (above the seat), the highest step it climbs without jumping, how high it jumps, its pace
@@ -63,7 +63,7 @@ pub fn give(m: Material) -> f32 {
 /// How far a body `size` tall sinks into a material, in metres: nothing for the tiny, a little for
 /// a person, `give` of its height for a giant, the pressure under a foot growing with size.
 pub fn sinks(m: Material, size: f32) -> f32 {
-    give(m) * size * ((size / 0.17).log10() * 0.5).clamp(0.0, 1.0)
+    give(m) * size * (math::log10(size / 0.17) * 0.5).clamp(0.0, 1.0)
 }
 
 /// What the player asks of the body this moment: to go forward and to the right (each -1 to 1),
@@ -193,7 +193,7 @@ impl Body {
 
     /// Forward across the ground, as x and z.
     pub fn forward(&self) -> [f32; 2] {
-        [-self.yaw.sin(), -self.yaw.cos()]
+        [-math::sin(self.yaw), -math::cos(self.yaw)]
     }
 
     /// Starts growing or shrinking to `size`, over `CHANGE_SECONDS`.
@@ -501,7 +501,7 @@ impl Body {
         change.done = (change.done + dt / CHANGE_SECONDS).min(1.0);
         let t = change.done * change.done * (3.0 - 2.0 * change.done);
         let before = self.size;
-        self.size = change.from * (change.to / change.from).powf(t);
+        self.size = if change.done >= 1.0 { change.to } else { change.from * math::pow(change.to / change.from, t) };
         if self.size > before && !self.room(area)? {
             self.size = before;
             self.change = None;

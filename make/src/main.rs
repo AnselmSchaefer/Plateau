@@ -166,7 +166,7 @@ fn main() {
                 let made = one_element(&repo, &name, &words, site.as_ref(), &args)?;
                 println!("{}", log(&words, &made));
                 match &site {
-                    Some(site) if made.kept.is_some() => place(&args, &name, site),
+                    Some(site) if made.kept.is_some() => place(&repo, &args, &name, site),
                     _ => Ok(()),
                 }
             })
@@ -340,7 +340,7 @@ fn site_of(repo: &Path, args: &[String]) -> Result<Option<Site>, String> {
 }
 
 /// With `--place`, the element `NAME` put into `--save`'s world where it was made to go.
-fn place(args: &[String], name: &str, site: &Site) -> Result<(), String> {
+fn place(repo: &Path, args: &[String], name: &str, site: &Site) -> Result<(), String> {
     if !args.iter().any(|a| a == "--place") {
         return Ok(());
     }
@@ -363,7 +363,7 @@ fn place(args: &[String], name: &str, site: &Site) -> Result<(), String> {
         local_edits: Vec::new(),
         author: None,
     });
-    save.save(&path).map_err(|e| format!("{}: {e:#}", path.display()))?;
+    save.save_sealed(&path, repo).map_err(|e| format!("{}: {e:#}", path.display()))?;
     println!("placed as element {id} in {}", path.display());
     Ok(())
 }
@@ -386,7 +386,8 @@ fn one_element(repo: &Path, name: &str, words: &str, site: Option<&Site>, args: 
         Some(site) => {
             // The world it was measured in, to judge it in again.
             if let Some(world) = &site.world {
-                world.save.save(&dir.join("element.plateau")).map_err(|e| format!("{e:#}"))?;
+                let mut save = world.save.clone();
+                save.save_sealed(&dir.join("element.plateau"), repo).map_err(|e| format!("{e:#}"))?;
             }
             make_element_at(&mut *writer, &builder, words, site, &dir, Settings::default(), &mut say)?
         }

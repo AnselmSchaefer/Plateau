@@ -168,7 +168,7 @@ impl PlaceMark {
             let [px, pz] = sketch.pixel_centre(i, j);
             let dx = ((x - px).abs() - hx).max(0.0);
             let dz = ((z - pz).abs() - hz).max(0.0);
-            let d = dx.hypot(dz);
+            let d = (dx * dx + dz * dz).sqrt();
             if d < best {
                 best = d;
             }

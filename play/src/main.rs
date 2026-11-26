@@ -38,6 +38,7 @@ use plateau_engine::cut::{CarryDecision, check_carry, check_cut_with_tool, choos
 use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, WorldSave, surface_normal};
 use plateau_engine::fit::fit_transform;
 use plateau_engine::laws::length;
+use plateau_engine::modules::{self, ModuleCheck};
 use plateau_engine::physics::{BuoyancyState, compute_buoyancy, player_mass_kg, step_floating_move};
 use plateau_engine::rules::{Action, LOCAL_PLAYER, RuleBook};
 use plateau_engine::scene::{Applied, BASE_OWNER, Combined, SceneWorld, is_area_owner};
@@ -67,6 +68,8 @@ fn main() {
     let mut player_id = LOCAL_PLAYER.to_string();
     let mut extra_elements: Vec<PathBuf> = Vec::new();
     let mut extra_tiles: Vec<([i32; 2], PathBuf)> = Vec::new();
+    let mut module_given = false;
+    let mut module_check = ModuleCheck::Strict;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
@@ -74,6 +77,7 @@ fn main() {
             "--tour" => tour = Some(PathBuf::from(args.next().expect("--tour takes a folder"))),
             "--behind" => behind = true,
             "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
+            "--accept-changed-modules" => module_check = ModuleCheck::AcceptChanged,
             "--element" => extra_elements.push(PathBuf::from(args.next().expect("--element takes a .wasm path"))),
             "--north" => extra_tiles.push((Side::North.step(), PathBuf::from(args.next().expect("--north takes a .wasm path")))),
             "--east" => extra_tiles.push((Side::East.step(), PathBuf::from(args.next().expect("--east takes a .wasm path")))),
@@ -87,21 +91,58 @@ fn main() {
                 let gz: i32 = gz_s.parse().expect("bad tile gz");
                 extra_tiles.push(([gx, gz], PathBuf::from(path)));
             }
-            _ => module = PathBuf::from(arg),
+            _ => {
+                module = PathBuf::from(arg);
+                module_given = true;
+            }
         }
     }
-    let (initial_edits, initial_edit_authors, initial_water, initial_rules, initial_elements) = match &save_arg {
-        Some(path) if path.exists() => {
-            let loaded = WorldSave::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            if loaded.seed != seed {
-                eprintln!("note: save {} uses seed {} (overriding --seed {seed})", path.display(), loaded.seed);
-                seed = loaded.seed;
+    let loaded = match &save_arg {
+        Some(path) if path.exists() => Some((path.clone(), WorldSave::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))),
+        _ => None,
+    };
+    let mut changed_modules: Vec<String> = Vec::new();
+    if let Some((path, loaded)) = &loaded {
+        if loaded.seed != seed {
+            eprintln!("note: save {} uses seed {} (overriding --seed {seed})", path.display(), loaded.seed);
+            seed = loaded.seed;
+        }
+        // The areas the save was played on, unless others are named.
+        if !module_given && extra_tiles.is_empty() && loaded.tiles.iter().any(|t| t.at == [0, 0]) {
+            for t in &loaded.tiles {
+                let found = modules::locate(&t.module, &here).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+                if t.at == [0, 0] {
+                    module = found;
+                } else {
+                    extra_tiles.push((t.at, found));
+                }
             }
+        }
+        // Every module played is checked against the hash the save recorded for it, if any.
+        let tiles = std::iter::once(&module).chain(extra_tiles.iter().map(|(_, p)| p));
+        let mut names: Vec<String> = tiles.map(|p| modules::relative_to_root(&p.to_string_lossy(), &here)).collect();
+        names.extend(loaded.elements.iter().map(|e| e.module.clone()));
+        names.sort();
+        names.dedup();
+        for name in names.into_iter().filter(|n| loaded.recorded_hash(n).is_some()) {
+            match loaded.read_module(&name, &here, module_check) {
+                Ok(read) if read.changed => changed_modules.push(name),
+                Ok(_) => {}
+                Err(e) => panic!("{}: {e:#}", path.display()),
+            }
+        }
+        if !changed_modules.is_empty() {
+            eprintln!("warning: changed since {} was saved, loaded anyway: {}", path.display(), changed_modules.join(", "));
+        }
+    }
+    let initial_modules = loaded.as_ref().map(|(_, l)| l.modules.clone()).unwrap_or_default();
+    let (initial_edits, initial_edit_authors, initial_water, initial_rules, initial_elements) = match loaded {
+        Some((path, loaded)) => {
             let log = Arc::new(EditLog::from_edits(loaded.edits).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
             let water = Arc::new(WaterLog::from_bodies(loaded.water).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
             (log, loaded.edit_authors, water, loaded.rules, loaded.elements)
         }
-        _ => (Arc::new(EditLog::new()), Vec::new(), Arc::new(WaterLog::new()), RuleBook::new(), Vec::new()),
+        None => (Arc::new(EditLog::new()), Vec::new(), Arc::new(WaterLog::new()), RuleBook::new(), Vec::new()),
     };
     let compile_tile = |path: &PathBuf, at: [i32; 2], seed: u64| -> TileSpec {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e} (areas/build.sh builds the areas)", path.display()));
@@ -124,7 +165,21 @@ fn main() {
         .unwrap_or("area");
     let save_path = save_arg.unwrap_or_else(|| here.join("target/saves").join(format!("{stem}-seed{seed}.plateau")));
 
-    let mut place_mode = PlaceMode::new(here.clone(), extra_elements, initial_elements);
+    let mut place_mode = PlaceMode::new(here.clone(), extra_elements, initial_elements, initial_modules.clone(), module_check);
+    let mut sculpt_state = Sculpt::new(
+        initial_edits.clone(),
+        initial_edit_authors,
+        initial_water.clone(),
+        initial_rules,
+        player_id,
+        saved_tiles,
+        save_path,
+        String::new(),
+        seed,
+    );
+    sculpt_state.modules = initial_modules;
+    sculpt_state.root = here.clone();
+    sculpt_state.module_check = module_check;
     let initial_composed = place_mode.build_composed(initial_edits.clone(), initial_water.clone());
     let mut atlas_live = compiled_atlas.instantiate().expect("the area atlas made");
     let tile_names: Vec<([i32; 2], String)> = atlas_live
@@ -184,17 +239,7 @@ fn main() {
             initial_element_scenes,
             initial_composed: Some(initial_composed),
         })
-        .insert_resource(Sculpt::new(
-            initial_edits,
-            initial_edit_authors,
-            initial_water,
-            initial_rules,
-            player_id,
-            saved_tiles,
-            save_path,
-            described.name.clone(),
-            seed,
-        ))
+        .insert_resource(Sculpt { area_name: described.name.clone(), ..sculpt_state })
         .insert_resource(place_mode)
         .insert_resource(CarryState::default())
         .insert_resource(LiveScene { world, elapsed: 0.0, interact_pressed: false, holding_use: false })
@@ -203,7 +248,8 @@ fn main() {
             pitch: -0.15,
             eye: None,
             focus: None,
-            said: None,
+            said: (!changed_modules.is_empty())
+                .then(|| (format!("changed since saved, loaded anyway: {}", changed_modules.join(", ")), Instant::now() + Duration::from_secs(10))),
             intent: Intent::default(),
             owed: 0.0,
             third: tour.is_none() || behind,
@@ -879,6 +925,10 @@ impl EditCtx<'_, '_> {
         self.carry.floating.clear();
         self.carry.piloting = None;
         let saved = self.sculpt.load_world()?;
+        self.sculpt.modules = saved.modules.clone();
+        self.place.expected_modules = saved.modules.clone();
+        let check = self.place.module_check;
+        self.place.catalog.expect_hashes(&saved.modules, check);
         let edit_count = saved.edits.len();
         let water = WaterLog::from_bodies(saved.water)?;
         self.sculpt.replace_world_state(saved.edits, saved.edit_authors, water, saved.rules)?;
@@ -1201,7 +1251,11 @@ fn look_and_ask(
                         let min_step = ctx.sculpt.radius(psize) * 0.45;
                         d2 >= min_step * min_step
                     });
-                if spacing_ok {
+                // A stamp the same as the last one made (on the terrain, or on a placed element in
+                // its own frame) changes nothing but the log: clicks are not spaced, so drop it.
+                let duplicate = ctx.sculpt.edits.edits().last() == Some(&edit)
+                    || ctx.place.placed.iter().any(|pl| pl.local_edits.last().is_some_and(|last| *last == world_edit_to_local(&edit, pl.transform())));
+                if spacing_ok && !duplicate {
                     // Enforce material-aware tool rules when carving (`Op::Carve`): e.g. a Saw
                     // carves Wood/foliage but refuses Stone; a Shovel digs earth/mud/sand only.
                     let tool_carve_err = if op == Op::Carve {

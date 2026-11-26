@@ -33,6 +33,7 @@ Keep a clean split between the two geometric representations so carving and port
 
 - Architecture overview diagram: `docs/architecture.html` and `docs/architecture.png`
 - Concept & roadmap: `CONCEPT.md`, `POC_PLAN.md`
+- Current plan (phases D–K: `World::apply` + action log, world graph, support & falling, materials & tools, parametric elements, brick cache, inspector): `WORLD_PLAN.md`
 - Claude authoring guide: `make/GUIDE.md`
 
 ```bash

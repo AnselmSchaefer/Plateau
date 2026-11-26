@@ -9,12 +9,13 @@
 //! - **`Z` / `Y`**: undo / redo with live chunk re-invalidation
 //! - **`F5`** (or **`Ctrl+S`**) / **`F9`**: save / reload edits from disk (`.plateau` file)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bevy::prelude::*;
 use plateau_engine::compose::PlacedElement;
 use plateau_engine::edit::{Edit, EditLog, Op, SavedTile, Shape, WorldSave};
+use plateau_engine::modules::{ModuleCheck, SavedModule};
 use plateau_engine::physics::Tool;
 use plateau_engine::picture::colour;
 use plateau_engine::rules::RuleBook;
@@ -95,6 +96,12 @@ pub struct Sculpt {
     pub player_id: String,
     /// Multi-area tile manifest persisted in `WorldSave`.
     pub tiles: Vec<SavedTile>,
+    /// The loaded save's module hashes: kept for modules that cannot be read when saving again.
+    pub modules: Vec<SavedModule>,
+    /// The folder modules are named relative to in saves (the repository, as `PlaceMode`'s catalog).
+    pub root: PathBuf,
+    /// What to do with a module that changed since the save being loaded.
+    pub module_check: ModuleCheck,
     pub save_path: PathBuf,
     pub area_name: String,
     pub seed: u64,
@@ -132,6 +139,9 @@ impl Sculpt {
             rules,
             player_id,
             tiles,
+            modules: Vec::new(),
+            root: PathBuf::from("."),
+            module_check: ModuleCheck::Strict,
             save_path,
             area_name,
             seed,
@@ -208,7 +218,8 @@ impl Sculpt {
         world.rules = self.rules.clone();
         world.water = self.water.bodies().to_vec();
         world.edit_authors = self.edit_authors.clone();
-        world.save(path)?;
+        world.modules = self.modules.clone();
+        world.save_sealed(path, &self.root)?;
         Ok(())
     }
 
@@ -218,9 +229,26 @@ impl Sculpt {
         Ok(())
     }
 
+    /// Loads the save at `save_path`, refusing it (as `module_check` says) if a module it names has
+    /// changed since, before anything of the world shown is replaced.
     pub fn load_world(&self) -> Result<WorldSave> {
-        WorldSave::load(&self.save_path)
+        let saved = WorldSave::load(&self.save_path)?;
+        check_modules(&saved, &self.root, self.module_check)?;
+        Ok(saved)
     }
+}
+
+/// Reads every module `saved` names (its tiles' and its elements'), against the hashes it recorded:
+/// an error names the first that is missing or, under `ModuleCheck::Strict`, changed. Returns those
+/// that changed and were let through.
+pub fn check_modules(saved: &WorldSave, root: &Path, check: ModuleCheck) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    for name in saved.named_modules() {
+        if saved.read_module(&name, root, check)?.changed {
+            changed.push(name);
+        }
+    }
+    Ok(changed)
 }
 
 /// Marker component for the translucent 3D sculpt brush preview ghost.

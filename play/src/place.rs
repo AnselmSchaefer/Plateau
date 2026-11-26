@@ -19,6 +19,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::compose::{CompiledElement, ComposedLog, ElementCatalog, PlacedElement, PlacementTransform, SdfElementEntry};
 use plateau_engine::edit::Edit;
+use plateau_engine::modules::{ModuleCheck, SavedModule};
 use plateau_engine::site::SiteContext;
 use plateau_engine::{ElementBounds, Limits, Region, SIZES};
 
@@ -81,11 +82,21 @@ pub struct PlaceMode {
     pub fitted: Option<FittedSnap>,
     pub last_site: Option<SiteContext>,
     pub revision: u64,
+    /// The loaded save's module hashes, checked as elements load (kept across `rescan`).
+    pub expected_modules: Vec<SavedModule>,
+    pub module_check: ModuleCheck,
 }
 
 impl PlaceMode {
-    pub fn new(root: PathBuf, extra_paths: Vec<PathBuf>, initial_placed: Vec<PlacedElement>) -> PlaceMode {
+    pub fn new(
+        root: PathBuf,
+        extra_paths: Vec<PathBuf>,
+        initial_placed: Vec<PlacedElement>,
+        expected_modules: Vec<SavedModule>,
+        module_check: ModuleCheck,
+    ) -> PlaceMode {
         let mut catalog = ElementCatalog::new(root, Limits::default());
+        catalog.expect_hashes(&expected_modules, module_check);
         let mut palette = catalog.discover();
         for p in &extra_paths {
             let key = p.to_string_lossy().into_owned();
@@ -112,12 +123,15 @@ impl PlaceMode {
             fitted: None,
             last_site: None,
             revision: 1,
+            expected_modules,
+            module_check,
         }
     }
 
     pub fn rescan(&mut self) -> usize {
         let prev_mod = self.current().map(|e| e.module.clone());
         let mut catalog = ElementCatalog::new(self.catalog.root().to_path_buf(), Limits::default());
+        catalog.expect_hashes(&self.expected_modules, self.module_check);
         let mut palette = catalog.discover();
         for p in &self.extra_paths {
             let key = p.to_string_lossy().into_owned();

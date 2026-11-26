@@ -14,6 +14,8 @@ wasmtime = { version = "51.0.0", default-features = false, features = ["cranelif
 wasmparser = { version = "0.263.0", default-features = false, features = ["std", "validate", "features"] }
 # Reading sketched maps (step 6) and writing pictures.
 png = "0.18.1"
+# A save names each module it was made of by its bytes' hash (WORLD_PLAN.md, phase D).
+sha2 = "0.10.9"
 
 [dev-dependencies]
 # The areas of `areas/` played natively: what their modules must answer as.

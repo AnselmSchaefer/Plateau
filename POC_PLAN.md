@@ -780,6 +780,49 @@ worlds (Steps 8a–8c), seamless multi-area walking (`pond-sketched` + `forest-b
 106 passing offline tests, and a concrete next-stage roadmap for networking, creatures, the
 gallery/signing, and the browser.
 
+### After the PoC: phases A–C (2026-11-25)
+
+Built the same day as step 10, each a showcase of its own; recorded here after the fact (2026-11-26).
+What they left unjoined is the subject of [`WORLD_PLAN.md`](WORLD_PLAN.md), phases D–K.
+
+- **Phase A: who may change what, water that follows a carve, one manifest.**
+  `engine/src/rules.rs`: a `RuleBook` of area policies (owners, builders, visitors), claimed
+  `Plot`s, border and spawn guards, caps by size on sculpting, placing and water, and who may cut or
+  carry placed objects (`none`, `own`, `any`). `engine/src/water.rs`: engine-owned `WaterBody`s
+  laid over everything else; a carve that opens onto water below its level floods it and any dry
+  hollow joined to it, at the water's own level; distinct ponds keep distinct levels; dams cut it.
+  `WorldSave` gains `tile`, `policy`, `plot`, `water`, `water-basin` and `author` records, reading
+  the saves of steps 8a–9. Tests: `engine/tests/phase_a.rs` (8).
+- **Phase B: tools by material, and floating.** `engine/src/physics.rs`: each material's density
+  and hardness; `Tool` (`All`, `Saw`, `Pickaxe`, `Shovel`, `Hands`) allowed or refused by the
+  material aimed at, for cutting (`K`) and carving (`B`); Archimedes buoyancy for any discrete
+  object (a hollow hull displaces more than its planks), boats piloted across ponds and into
+  channels dug in phase A, stopping at the shore; a giant swamps a person's boat. New elements
+  `boat` and `pillar`; a triangle BVH over `SceneWorld`'s solids; buoyancy cached for still
+  objects. Tests: `engine/tests/phase_b.rs` (4).
+- **Phase C: measuring a place, and elements made to fit it.** `engine/src/site.rs`: a
+  `SiteContext` of what is about a point at the measuring player's size (ground heights, materials,
+  water, headroom) and the opening aimed at (`Cavity`: rim, facing, outline at 48 spokes, depth,
+  wall, floor, whether the measurer gets in), saved as `.site` files bit for bit.
+  `engine/src/fit.rs`: `cavity_fit` (a frame meets the wall all round, a leaf keeps the opening shut
+  until `F`, whoever walked in still does) and `ground_fit`; `fit_transform` turns and scales an
+  element made for no place into an opening. `plateau make-element --at/--site` gives Claude the
+  measured site; `play` measures the site aimed at with `I` (writing `.site` and `.plateau` files) and snaps a fitted element with `O`. The `hobbit-door`
+  element and, made by Claude, `made/elements/oak-hollow-door` (2 rounds, no fixes, 605 s). An
+  optional Antigravity (`agy`) writer beside `claude -p`. `engine/src/world.rs`: a save opened
+  without a window. Tests: `engine/tests/phase_c.rs` (8).
+
+Found (in the review of 2026-11-26):
+
+- Every change to the world was made in `play/src/main.rs`, and rules and tools were checked there
+  only; the engine had no single place a change went through (`WORLD_PLAN.md`, phase E).
+- Tools were checked at the point aimed at, not over what a brush removes; materials are a
+  surface's, not what lies under it (phase H).
+- Chopping topples a piece by script onto the terrain alone; carving through a trunk leaves its
+  crown in the air (phase G).
+- Saves named modules by absolute path and no hash, so a rebuilt area replayed old edits on a new
+  hill; `play` ignored the areas a save named (phase D).
+
 ## Measures
 
 | Measure | Target | PoC Result |

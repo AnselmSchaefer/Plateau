@@ -22,6 +22,7 @@ use wasmtime::bail;
 
 use crate::compose::PlacedElement;
 use crate::cut::ClipPlane;
+use crate::modules::{SavedModule, parse_module_line, write_module_records};
 use crate::rules::RuleBook;
 use crate::water::{WaterBody, WaterLog};
 use crate::{Answer, Command, Description, ElementBounds, Material, PlayerState, Region, Result, Scene, chunk};
@@ -540,8 +541,10 @@ pub fn surface_normal(area: &mut dyn Region, at: [f64; 3], size: f32) -> Result<
     if len > 1e-12 { Ok([g[0] / len, g[1] / len, g[2] / len]) } else { Ok([0.0, 1.0, 0.0]) }
 }
 
-/// Current save file format version.
-pub const SAVE_VERSION: u32 = 1;
+/// Current save file format version: 2 names each module with its bytes' hash (`modules`).
+pub const SAVE_VERSION: u32 = 2;
+/// Save versions still read: 1 (Steps 8a–9, phases A–C) has no `module` records.
+pub const READ_VERSIONS: [u32; 2] = [1, 2];
 
 /// One base area tile in a multi-area world manifest (`tile <gx> <gz> <module> seed <u64>`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -553,14 +556,18 @@ pub struct SavedTile {
 
 /// Composable world save & manifest: base area(s) + seed + ownership `RuleBook` + engine-managed
 /// hydrostatic `WaterBody` list + chronological SDF edit log + placed standalone `.wasm` elements.
-/// Backward-compatible with earlier Step 8a/8b/8c `plateau-world 1` files.
+/// Reads `plateau-world 1` files (Steps 8a–9, phases A–C) and writes `plateau-world 2`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSave {
+    /// The version the save was read as (written saves are always `SAVE_VERSION`).
     pub version: u32,
     pub area: String,
     pub seed: u64,
     /// Optional explicit multi-area tile manifest (`tile` records). Empty for legacy single-area saves.
     pub tiles: Vec<SavedTile>,
+    /// The modules its tiles and elements were made of, with their bytes' hashes (`module`
+    /// records, sorted by path; filled by `seal`, empty in version 1 saves).
+    pub modules: Vec<SavedModule>,
     /// Multi-scale ownership & permission rule book (`policy` and `plot` records).
     pub rules: RuleBook,
     /// Engine-managed hydrostatic water bodies (`water` and `water-basin` records).
@@ -578,6 +585,7 @@ impl WorldSave {
             area: area.into(),
             seed,
             tiles: Vec::new(),
+            modules: Vec::new(),
             rules: RuleBook::new(),
             water: Vec::new(),
             edits,
@@ -592,6 +600,7 @@ impl WorldSave {
             area: area.into(),
             seed,
             tiles: Vec::new(),
+            modules: Vec::new(),
             rules: RuleBook::new(),
             water: Vec::new(),
             edits,
@@ -603,12 +612,13 @@ impl WorldSave {
     /// Serializes to a human-readable, deterministic, bit-exact text representation.
     pub fn to_text(&self) -> String {
         let mut s = String::new();
-        s.push_str(&format!("plateau-world {}\n", self.version));
+        s.push_str(&format!("plateau-world {SAVE_VERSION}\n"));
         s.push_str(&format!("area {}\n", self.area.replace(['\n', '\r'], " ")));
         s.push_str(&format!("seed {}\n", self.seed));
         for t in &self.tiles {
             s.push_str(&format!("tile {} {} {} seed {}\n", t.at[0], t.at[1], t.module, t.seed));
         }
+        write_module_records(&self.modules, &mut s);
         self.rules.write_records(&mut s);
         if !self.water.is_empty()
             && let Ok(wl) = WaterLog::from_bodies(self.water.clone())
@@ -651,6 +661,7 @@ impl WorldSave {
         let mut area = String::new();
         let mut seed = None;
         let mut tiles = Vec::new();
+        let mut modules: Vec<SavedModule> = Vec::new();
         let mut rules = RuleBook::new();
         let mut water: Vec<WaterBody> = Vec::new();
         let mut edits = Vec::new();
@@ -664,8 +675,8 @@ impl WorldSave {
             }
             if let Some(rest) = line.strip_prefix("plateau-world ") {
                 let v: u32 = rest.trim().parse().map_err(|e| wasmtime::format_err!("line {}: invalid version: {e}", line_no + 1))?;
-                if v != SAVE_VERSION {
-                    bail!("line {}: unsupported save version {v} (expected {SAVE_VERSION})", line_no + 1);
+                if !READ_VERSIONS.contains(&v) {
+                    bail!("line {}: unsupported save version {v} (this build reads {READ_VERSIONS:?})", line_no + 1);
                 }
                 version = Some(v);
             } else if let Some(rest) = line.strip_prefix("area ") {
@@ -674,6 +685,15 @@ impl WorldSave {
                 seed = Some(rest.trim().parse::<u64>().map_err(|e| wasmtime::format_err!("line {}: invalid seed: {e}", line_no + 1))?);
             } else if line.starts_with("tile ") {
                 tiles.push(parse_tile_line(line, line_no + 1)?);
+            } else if line.starts_with("module ") {
+                if version == Some(1) {
+                    bail!("line {}: `module` records need `plateau-world 2`", line_no + 1);
+                }
+                let m = parse_module_line(line, line_no + 1)?;
+                if modules.iter().any(|o| o.path == m.path) {
+                    bail!("line {}: module {} recorded twice", line_no + 1, m.path);
+                }
+                modules.push(m);
             } else if line.starts_with("policy ") {
                 rules.set_area(RuleBook::parse_policy_line(line, line_no + 1)?);
             } else if line.starts_with("plot ") {
@@ -720,7 +740,8 @@ impl WorldSave {
         if !any_edit_author {
             edit_authors.clear();
         }
-        Ok(WorldSave { version, area, seed, tiles, rules, water, edits, edit_authors, elements })
+        modules.sort();
+        Ok(WorldSave { version, area, seed, tiles, modules, rules, water, edits, edit_authors, elements })
     }
 
     /// Writes the save file atomically (write temp file in same directory, then rename).

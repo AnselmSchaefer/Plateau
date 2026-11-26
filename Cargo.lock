@@ -4790,6 +4790,7 @@ dependencies = [
  "areas-played",
  "plateau-sdk",
  "png",
+ "sha2",
  "wasmparser 0.263.0",
  "wasmtime",
  "wat",
