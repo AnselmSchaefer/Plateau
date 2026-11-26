@@ -111,14 +111,14 @@ impl Tool {
                 if p.fibrous {
                     Ok(())
                 } else {
-                    Err(format!("Saw cannot cut {} — switch to Pickaxe (C)", mat.name()))
+                    Err(format!("Saw cannot cut {} — switch to Pickaxe", mat.name()))
                 }
             }
             Tool::Pickaxe => {
                 if mat == Material::Stone || p.earthy {
                     Ok(())
                 } else {
-                    Err(format!("Pickaxe cannot cleanly cut {} — switch to Saw (C)", mat.name()))
+                    Err(format!("Pickaxe cannot cleanly cut {} — switch to Saw", mat.name()))
                 }
             }
             Tool::Shovel => {
@@ -126,10 +126,10 @@ impl Tool {
                     Ok(())
                 } else {
                     let hint = if mat == Material::Stone { "Pickaxe" } else { "Saw" };
-                    Err(format!("Shovel cannot cut {} — switch to {hint} (C)", mat.name()))
+                    Err(format!("Shovel cannot cut {} — switch to {hint}", mat.name()))
                 }
             }
-            Tool::Hands => Err("Bare hands cannot cut — switch to Saw or Pickaxe (C)".into()),
+            Tool::Hands => Err("Bare hands cannot cut — switch to Saw or Pickaxe".into()),
         }
     }
 
@@ -146,14 +146,14 @@ impl Tool {
                     Ok(())
                 } else {
                     let hint = if mat == Material::Stone { "Pickaxe" } else { "Shovel" };
-                    Err(format!("Saw cannot carve {} — switch to {hint} (C)", mat.name()))
+                    Err(format!("Saw cannot carve {} — switch to {hint}", mat.name()))
                 }
             }
             Tool::Pickaxe => {
                 if mat == Material::Stone || p.earthy {
                     Ok(())
                 } else {
-                    Err(format!("Pickaxe cannot carve {} — switch to Saw (C)", mat.name()))
+                    Err(format!("Pickaxe cannot carve {} — switch to Saw", mat.name()))
                 }
             }
             Tool::Shovel => {
@@ -161,10 +161,10 @@ impl Tool {
                     Ok(())
                 } else {
                     let hint = if mat == Material::Stone { "Pickaxe" } else { "Saw" };
-                    Err(format!("Shovel cannot dig {} — switch to {hint} (C)", mat.name()))
+                    Err(format!("Shovel cannot dig {} — switch to {hint}", mat.name()))
                 }
             }
-            Tool::Hands => Err("Bare hands cannot carve — switch tool with C".into()),
+            Tool::Hands => Err("Bare hands cannot carve — switch tool".into()),
         }
     }
 }

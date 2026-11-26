@@ -310,7 +310,7 @@ fn setup(
     commands.spawn((
         Text::new(
             "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  K chop  /  G grab & carry (H flat, R/T turn, Wheel tilt)  /  B sculpt  /  P place (O fit cavity)  /  I measure site\n\
-             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  C tool/sit  /  V view  /  M flags  /  F12 shot",
+             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  N tool  /  C sit  /  V view  /  M flags  /  F12 shot",
         ),
         text(14.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
@@ -940,8 +940,8 @@ fn look_and_ask(
     let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
     let dt = time.delta_secs().min(0.1);
 
-    // Cycle active material-aware tool (`C`: Workshop -> Saw -> Pickaxe -> Shovel -> Hands).
-    if !ctrl && keys.just_pressed(KeyCode::KeyC) {
+    // Cycle active material-aware tool (`N`: Workshop -> Saw -> Pickaxe -> Shovel -> Hands). `C` is sitting.
+    if !ctrl && keys.just_pressed(KeyCode::KeyN) {
         ctx.sculpt.tool = ctx.sculpt.tool.next();
         player.say(format!("tool: {}", ctx.sculpt.tool.name()));
     }
@@ -1359,7 +1359,7 @@ fn hud(
         String::new()
     };
     let mut s = format!(
-        "{}  /  {doing}  /  tool: {} (C){tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}  /  tool: {} (N){tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
         sculpt.tool.short_name(),
         c.shown,
