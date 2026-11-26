@@ -22,7 +22,7 @@ use wasmtime::bail;
 
 use crate::compose::PlacedElement;
 use crate::cut::ClipPlane;
-use crate::graph::{Kind, Relation};
+use crate::graph::{Kind, Node as GraphNode, Relation};
 use crate::modules::{SavedModule, parse_module_line, write_module_records};
 use crate::rules::RuleBook;
 use crate::water::{WaterBody, WaterLog};
@@ -746,12 +746,18 @@ impl WorldSave {
                     bail!("line {}: `rel` records need `plateau-world 2`", line_no + 1);
                 }
                 let rel = Relation::parse_record(line, line_no + 1)?;
-                // Its ends are elements already recorded, but for the original a piece was cut from,
-                // which may be gone.
-                let ends = [Some(&rel.from), (rel.kind != Kind::DerivedFrom).then_some(&rel.to)];
-                for id in ends.into_iter().flatten().filter_map(|n| n.clone().element()) {
-                    if !elements.iter().any(|e| e.id == id) {
-                        bail!("line {}: relation names element {id}, not in the save", line_no + 1);
+                // Its ends are recorded already: elements (but for the original a piece was cut from,
+                // or an element an edit once carved, which may be gone), edits, water bodies.
+                let history = matches!(rel.kind, Kind::DerivedFrom | Kind::CarvedInto);
+                for (end, is_to) in [(&rel.from, false), (&rel.to, true)] {
+                    let there = match *end {
+                        GraphNode::Element(id) => (is_to && history) || elements.iter().any(|e| e.id == id),
+                        GraphNode::Edit(i) => (i as usize) < edits.len(),
+                        GraphNode::Water(id) => water.iter().any(|b| b.id == id),
+                        GraphNode::Terrain | GraphNode::Player(_) => true,
+                    };
+                    if !there {
+                        bail!("line {}: relation names {end}, not in the save", line_no + 1);
                     }
                 }
                 relations.push(rel);

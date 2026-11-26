@@ -21,8 +21,9 @@
 //!
 //! | Law | Holds |
 //! |---|---|
+//! | `relations_are_whole` | Every relation joins things that are there (or, for history, were): elements, edits, water bodies; whatever fills an opening is attached to what it is in |
 //! | `rests_are_contacts` | Every `rests_on` is a real contact, within a tolerance of the smaller object's size, between things in the world |
-//! | `none_unsupported` | Every element is ground, rooted, afloat, carried, or rests on something |
+//! | `none_unsupported` | Every element is ground, rooted, afloat, carried, or rests on or is attached to something |
 //! | `cuts_are_derived` | Every piece made by a cut is `derived_from` what it was cut from, along the cut it carries |
 //! | `graph_round_trips` | The graph written to a save and read back is the same graph |
 
@@ -1222,22 +1223,41 @@ fn check_border_samples(
     Ok(())
 }
 
-/// Every `rests_on` joins an element in the world to the terrain or another element in the world,
-/// and is a real contact where both now are (`live::World::contacts_at`). Carried elements, and
-/// what rests on them, are left until they are set down.
-pub fn rests_are_contacts(world: &mut crate::live::World) -> Verdict {
+/// Every relation joins what is there: elements in the world (but the original a piece was cut from,
+/// or an element an edit once carved, which are history), edits in the edit log, water bodies the
+/// world has; and whatever fills an opening is attached to what the opening is in.
+pub fn relations_are_whole(world: &crate::live::World) -> Verdict {
     use crate::graph::{Kind, Node};
+    for r in world.graph.relations() {
+        let history = matches!(r.kind, Kind::DerivedFrom | Kind::CarvedInto);
+        for (end, is_to) in [(&r.from, false), (&r.to, true)] {
+            let there = match *end {
+                Node::Element(id) => (is_to && history) || world.find(id).is_some(),
+                Node::Edit(i) => (i as usize) < world.edits.len(),
+                Node::Water(id) => world.water.bodies().iter().any(|b| b.id == id),
+                Node::Terrain | Node::Player(_) => true,
+            };
+            if !there {
+                return Err(format!("`{}`: {end} is not in the world", r.to_record()));
+            }
+        }
+        if r.kind == Kind::Fills && !world.graph.contains(&crate::graph::Relation::attached_to(r.from.clone().element().unwrap_or(0), r.to.clone())) {
+            return Err(format!("{r}, but is not attached to it"));
+        }
+    }
+    Ok(())
+}
+
+/// Every `rests_on` is a real contact where both ends now are (`live::World::contacts_at`).
+/// Carried elements, and what rests on them, are left until they are set down.
+pub fn rests_are_contacts(world: &mut crate::live::World) -> Verdict {
+    use crate::graph::Kind;
     let held = world.held.map(|h| h.id);
     let rests: Vec<_> = world.graph.relations().filter(|r| r.kind == Kind::RestsOn).collect();
     for r in rests {
         let Some(a) = r.from.clone().element() else { return Err(format!("`{}`: only elements rest on things", r.to_record())) };
         if world.find(a).is_none() {
             return Err(format!("`{}`: element #{a} is not in the world", r.to_record()));
-        }
-        if let Node::Element(b) = r.to
-            && world.find(b).is_none()
-        {
-            return Err(format!("`{}`: element #{b} is not in the world", r.to_record()));
         }
         if held == Some(a) || held == r.to.clone().element() {
             continue;
@@ -1251,11 +1271,11 @@ pub fn rests_are_contacts(world: &mut crate::live::World) -> Verdict {
 }
 
 /// No element is unsupported: each is ground (an SDF landform), rooted, afloat, carried, or rests
-/// on something.
+/// on or is attached to something.
 pub fn none_unsupported(world: &crate::live::World) -> Verdict {
     use crate::live::Footing;
     for pl in &world.placed {
-        if world.footing(pl.id) == Some(Footing::Loose) && world.graph.supports_of(pl.id).is_empty() {
+        if world.footing(pl.id) == Some(Footing::Loose) && !world.is_held_up(pl.id) {
             return Err(format!("{} (#{}) at {} is loose and rests on nothing", world.element_name(pl.id), pl.id, at(pl.pos, 1.7)));
         }
     }
@@ -1298,7 +1318,7 @@ pub fn graph_round_trips(world: &crate::live::World) -> Result<Verdict> {
 
 /// Every law of the world graph, the first broken said.
 pub fn world_graph(world: &mut crate::live::World) -> Result<Verdict> {
-    let verdict = rests_are_contacts(world).and_then(|_| none_unsupported(world)).and_then(|_| cuts_are_derived(world));
+    let verdict = relations_are_whole(world).and_then(|_| rests_are_contacts(world)).and_then(|_| none_unsupported(world)).and_then(|_| cuts_are_derived(world));
     if verdict.is_err() {
         return Ok(verdict);
     }

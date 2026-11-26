@@ -18,6 +18,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::compose::{CompiledElement, ElementCatalog, PlacementTransform};
+use plateau_engine::graph::Opening;
 use plateau_engine::live::World;
 use plateau_engine::site::SiteContext;
 use plateau_engine::{ElementBounds, Limits, Region, SIZES};
@@ -33,6 +34,8 @@ pub struct FittedSnap {
     pub module: String,
     pub transform: PlacementTransform,
     pub summary: String,
+    /// Where the opening it fits was measured (it fills it once placed).
+    pub opening: Opening,
 }
 
 #[derive(Resource)]

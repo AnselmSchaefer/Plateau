@@ -1,8 +1,8 @@
 //! The world graph (`WORLD_PLAN.md`, phase F): what each placed object comes from, rests on, and
 //! belongs to, as typed relations between nodes.
 //!
-//! Nodes are the terrain (the base areas with their sculpting), placed elements by id, and players
-//! by id. A relation is `kind from → to`, at most one of each kind between two nodes, kept in an
+//! Nodes are the terrain (the base areas with their sculpting), placed elements by id, players by
+//! id, the terrain's edits by their place in the edit log, and water bodies by id. A relation is `kind from → to`, at most one of each kind between two nodes, kept in an
 //! ordered map, so every machine walks the graph alike and a save writes it the same each time:
 //!
 //! | Kind | From → to | Written by | Data |
@@ -10,11 +10,15 @@
 //! | `derived_from` | a piece → the element it was cut from | `Cut` | the piece's own side of the cut |
 //! | `rests_on` | an element → what holds it up (terrain or an element) | `Place`, `Drop`, `Cut` (where a piece comes to rest), from real contacts | — |
 //! | `owned_by` | an element → a player | `Place`; a cut piece inherits its original's owner, not the cutter | — |
+//! | `attached_to` | an element → what it is fixed to (terrain or an element): held up by it | `Place` fitted to an opening | — |
+//! | `fills` | an element → what the opening it fills is in | `Place` fitted to an opening | where the opening was measured |
+//! | `carved_into` | a terrain edit → what it carved (the terrain, elements it cut) | `Sculpt` (a carve) | — |
+//! | `flooded_by` | a water body → the carve that let it in | `Sculpt` (a carve that floods) | — |
 //!
 //! The graph changes only by `World::apply`: each change is a `GraphDelta` (relations added and
 //! removed), reported in the action's `Summary` and kept with its undo, which reverts it. Saved as
 //! `rel <kind> <from> <to> [data]` lines in `plateau-world 2`, where `3` is element 3, `terrain`
-//! the terrain, and `@name` a player.
+//! the terrain, `@name` a player, `edit:4` the terrain's fifth edit, and `water:2` water body 2.
 
 use std::collections::BTreeMap;
 
@@ -33,6 +37,10 @@ pub enum Node {
     Element(u32),
     /// A player, by id.
     Player(String),
+    /// One of the terrain's edits, by its place in the edit log (from 0).
+    Edit(u32),
+    /// A water body, by id.
+    Water(u32),
 }
 
 impl Node {
@@ -49,6 +57,8 @@ impl Node {
             Node::Terrain => "terrain".into(),
             Node::Element(id) => id.to_string(),
             Node::Player(p) => format!("@{p}"),
+            Node::Edit(i) => format!("edit:{i}"),
+            Node::Water(i) => format!("water:{i}"),
         }
     }
 
@@ -57,6 +67,10 @@ impl Node {
             Some(Node::Terrain)
         } else if let Some(p) = s.strip_prefix('@') {
             valid_player(p).then(|| Node::Player(p.to_string()))
+        } else if let Some(i) = s.strip_prefix("edit:") {
+            i.parse().ok().map(Node::Edit)
+        } else if let Some(i) = s.strip_prefix("water:") {
+            i.parse().ok().map(Node::Water)
         } else {
             s.parse().ok().map(Node::Element)
         }
@@ -69,6 +83,8 @@ impl std::fmt::Display for Node {
             Node::Terrain => f.write_str("the terrain"),
             Node::Element(id) => write!(f, "#{id}"),
             Node::Player(p) => write!(f, "{p}"),
+            Node::Edit(i) => write!(f, "edit {i}"),
+            Node::Water(i) => write!(f, "water body {i}"),
         }
     }
 }
@@ -84,17 +100,30 @@ pub enum Kind {
     DerivedFrom,
     RestsOn,
     OwnedBy,
+    AttachedTo,
+    Fills,
+    CarvedInto,
+    FloodedBy,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::DerivedFrom, Kind::RestsOn, Kind::OwnedBy];
+    pub const ALL: [Kind; 7] = [Kind::DerivedFrom, Kind::RestsOn, Kind::OwnedBy, Kind::AttachedTo, Kind::Fills, Kind::CarvedInto, Kind::FloodedBy];
 
     pub fn name(self) -> &'static str {
         match self {
             Kind::DerivedFrom => "derived_from",
             Kind::RestsOn => "rests_on",
             Kind::OwnedBy => "owned_by",
+            Kind::AttachedTo => "attached_to",
+            Kind::Fills => "fills",
+            Kind::CarvedInto => "carved_into",
+            Kind::FloodedBy => "flooded_by",
         }
+    }
+
+    /// Whether an element is held up by being the `from` of this kind.
+    pub fn holds_up(self) -> bool {
+        matches!(self, Kind::RestsOn | Kind::AttachedTo)
     }
 
     pub fn from_name(s: &str) -> Option<Kind> {
@@ -105,8 +134,12 @@ impl Kind {
     fn joins(self, from: &Node, to: &Node) -> bool {
         match self {
             Kind::DerivedFrom => matches!((from, to), (Node::Element(a), Node::Element(b)) if a != b),
-            Kind::RestsOn => matches!((from, to), (Node::Element(a), Node::Terrain) | (Node::Element(a), Node::Element(_)) if Node::Element(*a) != *to),
+            Kind::RestsOn | Kind::AttachedTo | Kind::Fills => {
+                matches!((from, to), (Node::Element(a), Node::Terrain) | (Node::Element(a), Node::Element(_)) if Node::Element(*a) != *to)
+            }
             Kind::OwnedBy => matches!((from, to), (Node::Element(_), Node::Player(_))),
+            Kind::CarvedInto => matches!((from, to), (Node::Edit(_), Node::Terrain | Node::Element(_))),
+            Kind::FloodedBy => matches!((from, to), (Node::Water(_), Node::Edit(_))),
         }
     }
 }
@@ -118,6 +151,26 @@ pub enum Data {
     None,
     /// The plane a piece was cut along, facing away from the piece (the clip it carries).
     Cut(ClipPlane),
+    /// Where an opening was measured: enough to measure it again (`site::SiteProbe`, unseen).
+    Opening(Opening),
+}
+
+/// An opening as it was pointed at when an element was fitted to it: a point of its wall, the way
+/// out of that wall, and the height of whoever measured it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Opening {
+    pub target: [f32; 3],
+    pub normal: [f32; 3],
+    pub size: f32,
+}
+
+impl Opening {
+    pub fn validate(&self) -> Result<()> {
+        if !self.target.iter().chain(&self.normal).all(|c| c.is_finite()) || !(self.size.is_finite() && self.size > 0.0) {
+            bail!("an opening must be finite, with a size above nought, got {self:?}");
+        }
+        Ok(())
+    }
 }
 
 /// One relation: `kind from → to`, with its data.
@@ -151,6 +204,22 @@ impl Relation {
         Relation::new(Kind::OwnedBy, Node::Element(id), Node::Player(player.to_string()))
     }
 
+    pub fn attached_to(a: u32, host: Node) -> Relation {
+        Relation::new(Kind::AttachedTo, Node::Element(a), host)
+    }
+
+    pub fn fills(a: u32, host: Node, opening: Opening) -> Relation {
+        Relation { kind: Kind::Fills, from: Node::Element(a), to: host, data: Data::Opening(opening) }
+    }
+
+    pub fn carved_into(edit: u32, what: Node) -> Relation {
+        Relation::new(Kind::CarvedInto, Node::Edit(edit), what)
+    }
+
+    pub fn flooded_by(water: u32, edit: u32) -> Relation {
+        Relation::new(Kind::FloodedBy, Node::Water(water), Node::Edit(edit))
+    }
+
     fn key(&self) -> (Kind, Node, Node) {
         (self.kind, self.from.clone(), self.to.clone())
     }
@@ -161,7 +230,9 @@ impl Relation {
         }
         match (self.kind, self.data) {
             (Kind::DerivedFrom, Data::Cut(c)) => c.validate(),
-            (Kind::DerivedFrom, Data::None) => bail!("a `derived_from` relation needs its cut"),
+            (Kind::DerivedFrom, _) => bail!("a `derived_from` relation needs its cut"),
+            (Kind::Fills, Data::Opening(o)) => o.validate(),
+            (Kind::Fills, _) => bail!("a `fills` relation needs its opening"),
             (_, Data::None) => Ok(()),
             (k, _) => bail!("a `{}` relation carries no data", k.name()),
         }
@@ -170,8 +241,13 @@ impl Relation {
     /// The save's record: `rel <kind> <from> <to> [data]`.
     pub fn to_record(&self) -> String {
         let mut s = format!("rel {} {} {}", self.kind.name(), self.from.to_token(), self.to.to_token());
-        if let Data::Cut(c) = self.data {
-            s.push_str(&format!(" clip {} {} {} {}", c.normal[0], c.normal[1], c.normal[2], c.offset));
+        match self.data {
+            Data::None => {}
+            Data::Cut(c) => s.push_str(&format!(" clip {} {} {} {}", c.normal[0], c.normal[1], c.normal[2], c.offset)),
+            Data::Opening(o) => {
+                let [t, n] = [o.target, o.normal];
+                s.push_str(&format!(" opening {} {} {} normal {} {} {} size {}", t[0], t[1], t[2], n[0], n[1], n[2], o.size));
+            }
         }
         s
     }
@@ -184,11 +260,12 @@ impl Relation {
         let kind = Kind::from_name(tok[1]).ok_or_else(|| format_err!("line {line_no}: unknown relation `{}`", tok[1]))?;
         let node = |s: &str| Node::from_token(s).ok_or_else(|| format_err!("line {line_no}: `{s}` is not a node (an element id, `terrain`, or `@player`)"));
         let (from, to) = (node(tok[2])?, node(tok[3])?);
+        let f = |s: &str| s.parse::<f32>().map_err(|e| format_err!("line {line_no}: bad number `{s}`: {e}"));
         let data = match &tok[4..] {
             [] => Data::None,
-            ["clip", nx, ny, nz, off] => {
-                let f = |s: &str| s.parse::<f32>().map_err(|e| format_err!("line {line_no}: bad clip number `{s}`: {e}"));
-                Data::Cut(ClipPlane { normal: [f(nx)?, f(ny)?, f(nz)?], offset: f(off)? })
+            ["clip", nx, ny, nz, off] => Data::Cut(ClipPlane { normal: [f(nx)?, f(ny)?, f(nz)?], offset: f(off)? }),
+            ["opening", tx, ty, tz, "normal", nx, ny, nz, "size", size] => {
+                Data::Opening(Opening { target: [f(tx)?, f(ty)?, f(tz)?], normal: [f(nx)?, f(ny)?, f(nz)?], size: f(size)? })
             }
             rest => bail!("line {line_no}: unknown relation data `{}`", rest.join(" ")),
         };
@@ -204,6 +281,10 @@ impl std::fmt::Display for Relation {
             Kind::DerivedFrom => "was cut from",
             Kind::RestsOn => "rests on",
             Kind::OwnedBy => "is owned by",
+            Kind::AttachedTo => "is attached to",
+            Kind::Fills => "fills an opening in",
+            Kind::CarvedInto => "carved into",
+            Kind::FloodedBy => "came in through",
         };
         write!(f, "{} {verb} {}", self.from, self.to)
     }
@@ -364,11 +445,51 @@ impl Graph {
         self.to_node(Kind::DerivedFrom, &to).filter_map(|r| r.from.element()).collect()
     }
 
-    /// The relations an element leaving the world takes with it: all its own, and every `rests_on`
-    /// onto it. (Pieces cut from it keep their `derived_from`: it is their history.)
+    /// The relations an element leaving the world takes with it: all its own, and everything held up
+    /// by it or filling it (`rests_on`, `attached_to`, `fills` onto it). What is history stays: pieces
+    /// cut from it keep their `derived_from`, edits that carved it their `carved_into`.
     pub fn leaving(&self, id: u32) -> Vec<Relation> {
         let node = Node::Element(id);
-        self.relations().filter(|r| r.from == node || (r.kind == Kind::RestsOn && r.to == node)).collect()
+        self.relations().filter(|r| r.from == node || (r.to == node && Graph::rests_on_host(r.kind))).collect()
+    }
+
+    /// Kinds that need their `to` where it is: they go when it moves or leaves.
+    pub fn rests_on_host(kind: Kind) -> bool {
+        matches!(kind, Kind::RestsOn | Kind::AttachedTo | Kind::Fills)
+    }
+
+    /// What the element `id` is attached to, in order.
+    pub fn attached_of(&self, id: u32) -> Vec<Node> {
+        let from = Node::Element(id);
+        self.from_node(Kind::AttachedTo, &from).map(|r| r.to).collect()
+    }
+
+    /// What is attached to, or fills an opening in, `node`, in order.
+    pub fn fixed_to(&self, node: &Node) -> Vec<Relation> {
+        self.relations().filter(|r| r.to == *node && matches!(r.kind, Kind::AttachedTo | Kind::Fills)).collect()
+    }
+
+    /// What the terrain edit `edit` carved into.
+    pub fn carved_by(&self, edit: u32) -> Vec<Node> {
+        let from = Node::Edit(edit);
+        self.from_node(Kind::CarvedInto, &from).map(|r| r.to).collect()
+    }
+
+    /// The edits that carved into `node`, in order.
+    pub fn carves_into(&self, node: &Node) -> Vec<u32> {
+        self.to_node(Kind::CarvedInto, node).filter_map(|r| match r.from {
+            Node::Edit(i) => Some(i),
+            _ => None,
+        }).collect()
+    }
+
+    /// The carves that let water body `water` in.
+    pub fn flooded_through(&self, water: u32) -> Vec<u32> {
+        let from = Node::Water(water);
+        self.from_node(Kind::FloodedBy, &from).filter_map(|r| match r.to {
+            Node::Edit(i) => Some(i),
+            _ => None,
+        }).collect()
     }
 
     /// The save's `rel` records, one a line.
@@ -387,7 +508,16 @@ mod tests {
     #[test]
     fn records_read_back_and_deltas_undo() {
         let plane = ClipPlane { normal: [0.0, 1.0, 0.0], offset: 0.9 };
-        let rels = [Relation::derived_from(3, 1, plane), Relation::rests_on(3, Node::Terrain), Relation::owned_by(3, "alice")];
+        let opening = Opening { target: [1.0, 0.5, 2.0], normal: [0.0, 0.0, 1.0], size: 0.017 };
+        let rels = [
+            Relation::derived_from(3, 1, plane),
+            Relation::rests_on(3, Node::Terrain),
+            Relation::owned_by(3, "alice"),
+            Relation::attached_to(4, Node::Element(3)),
+            Relation::fills(4, Node::Element(3), opening),
+            Relation::carved_into(0, Node::Element(3)),
+            Relation::flooded_by(1, 0),
+        ];
         for r in &rels {
             assert_eq!(&Relation::parse_record(&r.to_record(), 1).unwrap(), r);
         }
@@ -399,11 +529,17 @@ mod tests {
         assert_eq!(g.owner_of(3), Some("alice"));
         assert_eq!(g.supports_of(3), vec![Node::Terrain]);
         assert_eq!(g.derived_from(3), Some((1, plane)));
+        assert_eq!(g.attached_of(4), vec![Node::Element(3)]);
+        assert_eq!(g.carves_into(&Node::Element(3)), vec![0]);
+        assert_eq!(g.flooded_through(1), vec![0]);
+        assert_eq!(g.leaving(3).len(), 5, "its own three, and the door fixed to it");
         let mut undone = GraphDelta::default();
         g.undo(&d, &mut undone);
         assert!(g.is_empty());
         g.redo(&d, &mut GraphDelta::default());
-        assert_eq!(g.len(), 3);
+        assert_eq!(g.len(), rels.len());
+        assert!(Relation::parse_record("rel fills 4 3", 1).is_err(), "a fill names its opening");
+        assert!(Relation::parse_record("rel flooded_by water:1 3", 1).is_err(), "water comes in through an edit");
         assert!(Relation::parse_record("rel rests_on 3 3", 1).is_err(), "nothing rests on itself");
         assert!(Relation::parse_record("rel owned_by 3 terrain", 1).is_err());
         assert!(Relation::parse_record("rel derived_from 3 1", 1).is_err(), "a piece names its cut");

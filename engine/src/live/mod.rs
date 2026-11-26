@@ -24,6 +24,7 @@
 pub mod action;
 pub mod history;
 pub mod log;
+mod near;
 mod objects;
 pub mod relations;
 

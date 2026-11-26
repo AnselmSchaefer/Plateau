@@ -154,7 +154,8 @@ impl World {
     }
 
     /// Sets the carried element down at `pos`, turned by `rot`, as solid geometry: it rests on what
-    /// it now touches, and what rested on it rests on it no longer.
+    /// it now touches; what rested on it or was fixed to it is so no longer, nor does it fill or
+    /// hang from what it did.
     pub(super) fn drop_held(&mut self, actor: &mut Actor<'_>, pos: [f32; 3], rot: [f32; 4]) -> Outcome {
         let Some(held) = self.held else { return Outcome::Denied("carrying nothing".into()) };
         if !pos.iter().chain(&rot).all(|c| c.is_finite()) {
@@ -165,7 +166,7 @@ impl World {
         }
         let scale = self.find(held.id).map_or(held.from.scale, |pl| pl.scale);
         self.release_held(PlacementTransform::with_rot(pos, rot, scale), true, Some(&mut *actor.body));
-        self.unrelate_resting_on(held.id);
+        self.unrelate_moved(held.id);
         self.settle_relations(held.id);
         let name = self.element_name(held.id);
         Outcome::Done(self.said(format!("placed {name} down")))

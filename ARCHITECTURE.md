@@ -37,7 +37,7 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
                             ├─ tool (physics::Tool)        ─▶ Denied           │  Invalidation ─▶ chunks
                             ├─ the change (edit, place, cut, carry, steer)     ├─ LayerChange ─▶ scene meshes
                             ├─ what follows (promotion, water, buoyancy)       └─ words ─▶ HUD
-                            ├─ the graph (derived_from, rests_on, owned_by)
+                            ├─ the graph (derived_from, rests_on, owned_by, attached_to, fills, carved_into, flooded_by)
                             ├─ commit: a new ComposedLog snapshot
                             ├─ history (undo/redo, with the graph's delta)
                             └─ action log line (--log) ─▶ Outcome
@@ -51,9 +51,16 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
   `derived_from` the original along its side of the cut and `owned_by` the original's owner (not
   the cutter); `Place`, `Drop` and a cut piece's landing write `rests_on` from real contacts
   (`World::contacts_at`: the element's solid points touching something from above, within 5 % of
-  the smaller one's size). Each action's `GraphDelta` is in its `Summary` and kept with its undo.
-  The rule book asks the graph who owns what. Its laws (`laws::world_graph`) are kept by every
-  test world.
+  the smaller one's size). A fitted `Place` (given where its opening was measured) `fills` and is
+  `attached_to` what the opening is in (`World::host_at`: what is solid just behind its wall); a
+  terrain carve is `carved_into` the terrain and the elements it cuts; a water body is
+  `flooded_by` the carves it came in through. Each action's `GraphDelta` is in its `Summary` and
+  kept with its undo. The rule book asks the graph who owns what. Its laws (`laws::world_graph`)
+  are kept by every test world.
+- **A site's neighbourhood** (`World::neighbourhood`, `live::near`): what a measured site is in and
+  who owns it, what that was cut from, carves and water there, what already fills it, and the
+  elements near by, in words, saved in the `.site` file (`near` lines) and given to Claude in
+  `describe_for_prompt`. `play`'s `I` fills it; `make --place` places through `World::apply`.
 - `--log actions.jsonl` writes every action and what came of it; `--trace trace.json` writes the
   engine's spans for the Perfetto UI.
 
@@ -89,7 +96,9 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Fit | Whether an element meets its site (rim fit, ground fit), and where it goes to | `engine::fit` |
 | Law | A property every area must keep, searched for, never assumed (sizes agree, gates are real, …) | `engine::laws` |
 | World save | `plateau-world 2`: tiles, module hashes, rules, water, edits, elements, relations (`rel`) | `edit::WorldSave`, `modules` |
-| World graph, relation | What each element was cut from (`derived_from`), rests on (`rests_on`), and is owned by (`owned_by`) | `engine::graph` |
+| World graph, relation | What each element was cut from (`derived_from`), rests on (`rests_on`), is owned by (`owned_by`), is attached to (`attached_to`) and fills (`fills`); what each carve cut (`carved_into`) and let water into (`flooded_by`) | `engine::graph` |
+| Host | What an opening is in: the terrain or an element, solid just behind its wall | `World::host_at` |
+| Neighbourhood | A site's surroundings in the world, in words, for Claude | `live::near`, `SiteContext::near` |
 | Footing | How an element is held up: ground (an SDF landform), rooted, afloat, carried, or loose (resting on something) | `live::relations::Footing` |
 | Contact | An element's solid touching something from above, within 5 % of the smaller one's size: what `rests_on` is made of | `World::contacts_at` |
 | Piece, original | The two elements a cut makes, and the element they were cut from (gone, its id kept) | `live::objects`, `graph` |

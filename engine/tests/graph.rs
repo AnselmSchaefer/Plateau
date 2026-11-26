@@ -63,7 +63,7 @@ fn done(outcome: Outcome) -> Summary {
 }
 
 fn place(world: &mut World, who: &str, body: &mut Body, module: &str, pos: [f32; 3]) -> u32 {
-    done(act_as(world, who, body, Action::Place { module: module.into(), pos, yaw: 0.0, rot: None, scale: 1.0, fitted: false })).added[0]
+    done(act_as(world, who, body, Action::Place { module: module.into(), pos, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None })).added[0]
 }
 
 /// Chops the element `id` a metre up with a saw, the top toppling east: (stump, trunk).
@@ -333,9 +333,165 @@ fn a_save_naming_what_is_not_there_is_refused() {
     let mut save = garden_save();
     save.relations = vec![Relation::rests_on(4, Node::Terrain)];
     let e = WorldSave::from_text(&save.to_text()).expect_err("no element 4");
-    assert!(format!("{e:#}").contains("element 4"), "{e:#}");
+    assert!(format!("{e:#}").contains("#4"), "{e:#}");
     let twice = "plateau-world 2\nseed 1\nelement 1 m seed 1 pos 0 0 0 yaw 0 scale 1 size 1.7 after 0\nrel owned_by 1 @a\nrel owned_by 1 @a\n";
     assert!(WorldSave::from_text(twice).is_err());
     let old = "plateau-world 1\nseed 1\nrel owned_by 1 @a\n";
     assert!(WorldSave::from_text(old).is_err(), "a version 1 save has no graph");
+}
+
+// ---- Slice 2: what fills, is attached to, carved into, and flooded what; a site's neighbourhood ----
+
+/// Where the oak's trunk is, placed at (32, 0, 48) with seed 7 (as in `phase_c.rs`), half a metre
+/// up on its south side.
+const OAK: [f32; 3] = [32.0, 0.0, 48.0];
+const SOUTH: f32 = 48.294_56;
+
+/// The oak placed with the seed `phase_c.rs` measures it by, and a tiny's round home bored into its
+/// trunk with a saw (12 stamps of the tiny's brush, in the tree's own frame).
+fn oak_with_home(world: &mut World, body: &mut Body) -> u32 {
+    let oak = done(act_as(world, "local", body, Action::Place { module: TREE.into(), pos: OAK, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7) })).added[0];
+    let r = 0.75 * TINY;
+    for k in 0..12 {
+        let at = [32.0, 0.5, SOUTH - 0.45 * r * k as f32];
+        let stamp = Edit::carve(Shape::Sphere { radius: r }, at, 0.35 * r, None, TINY);
+        done(act_as(world, "local", body, Action::Sculpt { edit: stamp, hit: at, tool: Tool::Saw, target: SculptTarget::Element(oak) }));
+    }
+    oak
+}
+
+/// The tiny's home measured from just outside it, as `I` does (an opening, unless a door shuts it).
+fn home_site(world: &mut World) -> plateau_engine::site::SiteContext {
+    use plateau_engine::edit::surface_normal;
+    use plateau_engine::site::{SiteContext, SiteProbe};
+    let from = [32.0, 0.505, SOUTH + 0.06];
+    // Seen by a tiny, as `play` shows the world to whoever plays it: the carved trunk, not the
+    // uncarved mesh a person sees in its place.
+    world.sync_viewer_size(TINY);
+    let mut site = {
+        let mut c = world.combined();
+        let t = body::look(&mut c, from.map(|v| v as f64), [0.0, 0.0, -1.0], TINY, TINY * 45.0).unwrap().expect("the home's back wall");
+        let normal = surface_normal(&mut c, t, TINY).unwrap();
+        let probe = SiteProbe { target: t.map(|v| v as f32), normal, from: Some(from), size: TINY };
+        SiteContext::measure(&mut c, &probe).unwrap()
+    };
+    site.near = world.neighbourhood(&site);
+    site
+}
+
+#[test]
+fn a_door_fitted_to_a_home_in_a_tree_fills_it_and_hangs_from_the_tree() {
+    use plateau_engine::graph::Opening;
+    let mut world = open(garden_save());
+    let mut body = person(&mut world);
+    let oak = oak_with_home(&mut world, &mut body);
+    let site = home_site(&mut world);
+    assert!(site.cavity.is_some(), "the home is an opening");
+    assert!(site.near[0].starts_with(&format!("The site is in Oak Tree (#{oak}), carved into")), "{:?}", site.near);
+    assert!(site.near[0].contains("owned by local") && site.near[0].contains("12 times in its own frame"), "{:?}", site.near);
+
+    // The door goes where the site says, as `make --place` puts it.
+    let opening = Opening { target: site.target, normal: site.normal, size: site.size };
+    let tf = site.frame;
+    let door = done(act_as(&mut world, "local", &mut body, Action::Place {
+        module: "elements/modules/hobbit-door.wasm".into(),
+        pos: tf.pos,
+        yaw: 0.0,
+        rot: Some(tf.rot),
+        scale: tf.scale,
+        fitted: true,
+        opening: Some(opening),
+        seed: Some(7),
+    }))
+    .added[0];
+    assert_eq!(world.find(door).unwrap().seed, 7, "placed with the seed it was made with");
+    assert!(world.graph.contains(&Relation::fills(door, Node::Element(oak), opening)));
+    assert_eq!(world.graph.attached_of(door), vec![Node::Element(oak)]);
+    assert!(world.is_held_up(door), "it hangs from the tree");
+    graph_holds(&mut world);
+
+    // Pointed at again, it is the door that is seen; the site knows the opening is filled, and by what.
+    let again = home_site(&mut world);
+    assert!(again.cavity.is_none(), "the door shuts it");
+    let filled = format!("This opening is filled already, by Hobbit Door (#{door}), fitted into Oak Tree (#{oak}).");
+    assert!(again.near.contains(&filled), "{:?}", again.near);
+    assert!(again.near[0].starts_with(&format!("The site is on Hobbit Door (#{door})")) && again.near[0].contains(&format!("is attached to Oak Tree (#{oak})")), "{:?}", again.near);
+    let words = again.describe_for_prompt();
+    assert!(words.contains("### Round about, in the world") && words.contains("filled already"), "{words}");
+    let text = again.to_text();
+    assert_eq!(plateau_engine::site::SiteContext::from_text(&text).unwrap(), again, "a site file keeps its neighbourhood");
+
+    // Taken off and set down on the lawn, it fills nothing and hangs from nothing; undone, it is back.
+    done(act_as(&mut world, "local", &mut body, Action::Grab { id: door }));
+    let lawn = top_at(&mut world, LAWN[0] - 6.0, LAWN[2]);
+    done(act_as(&mut world, "local", &mut body, Action::Drop { pos: lawn, rot: [0.0, 0.0, 0.0, 1.0] }));
+    assert!(world.graph.attached_of(door).is_empty() && world.graph.fixed_to(&Node::Element(oak)).is_empty());
+    done(act_as(&mut world, "local", &mut body, Action::Undo));
+    assert_eq!(world.graph.attached_of(door), vec![Node::Element(oak)]);
+    graph_holds(&mut world);
+
+    // Saved: the fill keeps where its opening was measured.
+    let dir = scratch("door");
+    let path = dir.join("garden.plateau");
+    world.save(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains(&format!("rel fills {door} {oak} opening ")), "{saved}");
+    let mut reopened = open(WorldSave::load(&path).unwrap());
+    assert_eq!(reopened.graph, world.graph);
+    graph_holds(&mut reopened);
+}
+
+#[test]
+fn carves_say_what_they_cut_and_floods_what_they_let_in() {
+    let mut world = open(garden_save());
+    let mut body = person(&mut world);
+
+    // A terrain carve aimed at a tree cuts into the tree (promoting it), not the ground.
+    let tree = place(&mut world, "local", &mut body, TREE, LAWN);
+    let pos = world.find(tree).unwrap().pos;
+    let notch = Edit::carve(Shape::Sphere { radius: 0.1 }, [pos[0], pos[1] + 0.6, pos[2] + 0.12], 0.03, None, PERSON);
+    let s = done(act_as(&mut world, "local", &mut body, Action::Sculpt { edit: notch, hit: notch.center, tool: Tool::Saw, target: SculptTarget::Terrain { aimed: Some(tree) } }));
+    assert_eq!(s.promoted, vec![tree]);
+    assert_eq!(world.graph.carved_by(0), vec![Node::Element(tree)]);
+    // A cave into the ground cuts into the terrain.
+    let cave = Edit::carve(Shape::Sphere { radius: 0.4 }, [LAWN[0] + 4.0, -0.1, LAWN[2]], 0.1, None, PERSON);
+    done(act_as(&mut world, "local", &mut body, Action::Sculpt { edit: cave, hit: cave.center, tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } }));
+    assert_eq!(world.graph.carved_by(1), vec![Node::Terrain]);
+    graph_holds(&mut world);
+
+    // The channel played by hand: a mound, then a dig through it to the pond, which floods it.
+    let mound = Edit::add(Shape::Sphere { radius: 1.2750001 }, [27.022926, -0.29227033, 37.05045], 0.44625002, Material::Soil, PERSON);
+    done(act_as(&mut world, "local", &mut body, Action::Sculpt { edit: mound, hit: mound.center, tool: Tool::All, target: SculptTarget::Terrain { aimed: None } }));
+    assert!(world.graph.carved_by(2).is_empty(), "adding carves nothing");
+    let dig = Edit::carve(Shape::Sphere { radius: 1.2750001 }, [27.046272, 0.99110466, 37.08866], 0.44625002, None, PERSON);
+    let dug = done(act_as(&mut world, "local", &mut body, Action::Sculpt { edit: dig, hit: dig.center, tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } }));
+    assert!(dug.water);
+    let body_id = world.water.bodies()[0].id;
+    assert_eq!(world.graph.flooded_through(body_id), vec![3]);
+    assert!(world.graph.carved_by(3).contains(&Node::Terrain));
+    graph_holds(&mut world);
+
+    // Undone, the water and its relation go; redone, both come back as they were.
+    let before = world.graph.clone();
+    done(act_as(&mut world, "local", &mut body, Action::Undo));
+    assert!(world.water.is_empty() && world.graph.flooded_through(body_id).is_empty() && world.graph.carved_by(3).is_empty());
+    graph_holds(&mut world);
+    done(act_as(&mut world, "local", &mut body, Action::Redo));
+    assert_eq!(world.graph, before);
+    graph_holds(&mut world);
+
+    // A site at the channel's edge names the carves and the water let in.
+    use plateau_engine::site::{SiteContext, SiteProbe};
+    let probe = SiteProbe { target: [27.0, -0.3, 37.0], normal: [0.0, 1.0, 0.0], from: None, size: PERSON };
+    let site = SiteContext::measure(&mut world.combined(), &probe).unwrap();
+    let near = world.neighbourhood(&site);
+    assert!(near.iter().any(|l| l.contains("carve") && l.contains("terrain edit 3")), "{near:?}");
+    assert!(near.iter().any(|l| l.starts_with(&format!("Water came into the carves here (water body {body_id}"))), "{near:?}");
+
+    // Saved and opened, the same graph.
+    let path = scratch("carves").join("garden.plateau");
+    world.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(&format!("rel flooded_by water:{body_id} edit:3\n")) && text.contains(&format!("rel carved_into edit:0 {tree}\n")), "{text}");
+    assert_eq!(open(WorldSave::load(&path).unwrap()).graph, world.graph);
 }

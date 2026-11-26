@@ -56,7 +56,7 @@ fn sampled(world: &mut World, at: [f32; 3], size: f32) -> u64 {
 }
 
 fn place_tree(world: &mut World, body: &mut Body) -> u32 {
-    match act(world, body, Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false }) {
+    match act(world, body, Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None }) {
         Outcome::Done(s) => s.added[0],
         other => panic!("the tree was not placed: {other:?}"),
     }
@@ -138,7 +138,7 @@ fn the_rule_book_and_the_tool_refuse_through_apply() {
     let hill = Edit::add(Shape::Sphere { radius: 1.0 }, [LAWN[0] + 4.0, -0.4, LAWN[2]], 0.3, Material::Soil, PERSON);
     let edits = world.edits.len();
     assert!(matches!(act(&mut world, &mut body, Action::Sculpt { edit: hill, hit: LAWN, tool: Tool::All, target: SculptTarget::Terrain { aimed: None } }), Outcome::Denied(_)));
-    assert!(matches!(act(&mut world, &mut body, Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false }), Outcome::Denied(_)));
+    assert!(matches!(act(&mut world, &mut body, Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None }), Outcome::Denied(_)));
     assert!(matches!(act(&mut world, &mut body, Action::Remove { id: tree }), Outcome::Denied(_)));
     assert_eq!((world.edits.len(), world.placed.len()), (edits, 1));
     assert!(world.apply(Actor { id: "owner", body: &mut body }, Action::Remove { id: tree }).is_done());
@@ -295,6 +295,8 @@ fn a_boat_is_paddled_across_the_pond_and_the_paddling_replays() {
         rot: None,
         scale: 1.0,
         fitted: false,
+        opening: None,
+        seed: None,
     }) {
         Outcome::Done(s) => s.added[0],
         other => panic!("no boat: {other:?}"),

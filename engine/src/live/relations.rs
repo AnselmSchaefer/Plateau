@@ -1,14 +1,20 @@
 //! How the live world keeps its graph (`WORLD_PLAN.md`, phase F): what an element rests on, found
-//! from real contacts; whether it needs holding up at all; and every relation written through the
-//! journal, so the action that wrote it reports it and its undo reverts it.
+//! from real contacts; what an opening is in; what a carve cut and what water came in through it;
+//! whether an element needs holding up at all; and every relation written through the journal, so
+//! the action that wrote it reports it and its undo reverts it.
+//!
+//! Each question is asked of one thing alone: the terrain (the areas and their sculpting, without
+//! water or elements), one SDF element (a landform, or a promoted scene element with its own
+//! carving), or one scene element's solid meshes.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::World;
-use crate::compose::{Composed, ComposedLog, PlacementTransform, quat_rotate};
-use crate::graph::{GraphDelta, Kind, Node, Relation};
-use crate::water::WaterLog;
+use crate::compose::{Composed, ComposedLog, PlacementTransform, SdfElementEntry, quat_rotate};
+use crate::edit::{Edit, EditLog, Op};
+use crate::graph::{GraphDelta, Kind, Node, Opening, Relation};
+use crate::water::{WaterBasin, WaterLog};
 use crate::{Answer, Description, LARGEST, Region, Result, SMALLEST, Scene};
 
 /// The most points of an element asked about when finding what it rests on.
@@ -75,7 +81,33 @@ fn touches_from_above(d: &[f32], up: &[f32], tol: f32, depth: f32) -> bool {
     d.iter().zip(up).any(|(&d, &u)| d <= tol && d >= -depth && u - d >= 0.5 * tol)
 }
 
+/// Distances from `pts` to the SDF element `entry` alone, at `size`.
+fn entry_distances(entry: &SdfElementEntry, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
+    let log = ComposedLog::new_with_water(Arc::new(EditLog::default()), vec![entry.clone()], Arc::new(WaterLog::new()), 0);
+    let mut out = Vec::new();
+    Composed::new(Nothing, log).sample(pts, size, &mut out).ok()?;
+    Some(out.iter().map(|a| a.distance).collect())
+}
+
+fn overlaps(lo: [f32; 3], hi: [f32; 3], blo: [f32; 3], bhi: [f32; 3]) -> bool {
+    (0..3).all(|a| hi[a] >= blo[a] && lo[a] <= bhi[a])
+}
+
 impl World {
+    /// Distances from `pts` to the terrain alone (the areas with `edits`, no water, no elements), at
+    /// `size`.
+    fn terrain_distances(&mut self, edits: Arc<EditLog>, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
+        let log = ComposedLog::new_with_water(edits, Vec::new(), Arc::new(WaterLog::new()), 0);
+        let mut out = Vec::new();
+        Composed::new(&mut self.region.region, log).sample(pts, size, &mut out).ok()?;
+        Some(out.iter().map(|a| a.distance).collect())
+    }
+
+    /// The SDF elements (landforms and promoted ones) whose bounds come within `lo..hi`, but `except`.
+    fn sdf_entries_near(&self, lo: [f32; 3], hi: [f32; 3], except: Option<u32>) -> Vec<SdfElementEntry> {
+        self.region.log.sdf_elements.iter().filter(|e| Some(e.placed.id) != except && overlaps(e.world_lo, e.world_hi, lo, hi)).cloned().collect()
+    }
+
     /// Who owns the element `id` (its `owned_by`).
     pub fn owner_of(&self, id: u32) -> Option<&str> {
         self.graph.owner_of(id)
@@ -151,17 +183,12 @@ impl World {
         let mut found = BTreeSet::new();
 
         // The terrain: the areas and the sculpting, without water or placed elements.
-        let terrain_log = ComposedLog::new_with_water(self.edits.clone(), Vec::new(), Arc::new(WaterLog::new()), 0);
         let tol = (CONTACT_TOLERANCE * span).max(1e-4);
+        let edits = self.edits.clone();
+        if let (Some(d), Some(u)) = (self.terrain_distances(edits.clone(), &pts, size), self.terrain_distances(edits, &raise(tol), size))
+            && touches_from_above(&d, &u, tol, depth)
         {
-            let mut terrain = Composed::new(&mut self.region.region, terrain_log);
-            let (mut d, mut u) = (Vec::new(), Vec::new());
-            if terrain.sample(&pts, size, &mut d).is_ok() && terrain.sample(&raise(tol), size, &mut u).is_ok() {
-                let (d, u): (Vec<f32>, Vec<f32>) = (d.iter().map(|a| a.distance).collect(), u.iter().map(|a| a.distance).collect());
-                if touches_from_above(&d, &u, tol, depth) {
-                    found.insert(Node::Terrain);
-                }
-            }
+            found.insert(Node::Terrain);
         }
 
         // Every other element near enough: scene elements by their solid meshes, SDF ones (native
@@ -183,26 +210,13 @@ impl World {
                 found.insert(Node::Element(other));
             }
         }
-        let entries: Vec<_> = self
-            .region
-            .log
-            .sdf_elements
-            .iter()
-            .filter(|e| e.placed.id != id && (0..3).all(|a| e.world_hi[a] >= qlo[a] && e.world_lo[a] <= qhi[a]))
-            .cloned()
-            .collect();
-        for entry in entries {
-            let other = entry.placed.id;
+        for entry in self.sdf_entries_near(qlo, qhi, Some(id)) {
             let ext = (0..3).map(|a| entry.world_hi[a] - entry.world_lo[a]).fold(0.0f32, f32::max);
             let tol = (CONTACT_TOLERANCE * span.min(ext)).max(1e-4);
-            let log = ComposedLog::new_with_water(Arc::new(Default::default()), vec![entry], Arc::new(WaterLog::new()), 0);
-            let mut alone = Composed::new(Nothing, log);
-            let (mut d, mut u) = (Vec::new(), Vec::new());
-            if alone.sample(&pts, size, &mut d).is_ok() && alone.sample(&raise(tol), size, &mut u).is_ok() {
-                let (d, u): (Vec<f32>, Vec<f32>) = (d.iter().map(|a| a.distance).collect(), u.iter().map(|a| a.distance).collect());
-                if touches_from_above(&d, &u, tol, depth) {
-                    found.insert(Node::Element(other));
-                }
+            if let (Some(d), Some(u)) = (entry_distances(&entry, &pts, size), entry_distances(&entry, &raise(tol), size))
+                && touches_from_above(&d, &u, tol, depth)
+            {
+                found.insert(Node::Element(entry.placed.id));
             }
         }
         found.into_iter().collect()
@@ -229,11 +243,101 @@ impl World {
         }
     }
 
-    /// What rests on the element `id` rests on it no longer (it moved away from under them).
-    pub(super) fn unrelate_resting_on(&mut self, id: u32) {
-        for other in self.graph.resting_on(id) {
-            self.unrelate(&Relation::rests_on(other, Node::Element(id)));
+    /// The element `id` has moved: what rested on it, or was fixed to it, is so no longer, and it
+    /// no longer fills or is fixed to what it was.
+    pub(super) fn unrelate_moved(&mut self, id: u32) {
+        let node = Node::Element(id);
+        let gone: Vec<Relation> = self
+            .graph
+            .relations()
+            .filter(|r| (r.to == node && crate::graph::Graph::rests_on_host(r.kind)) || (r.from == node && matches!(r.kind, Kind::AttachedTo | Kind::Fills)))
+            .collect();
+        for r in gone {
+            self.unrelate(&r);
         }
+    }
+
+    /// What the opening pointed at by `o` is in: the thing solid just behind its wall (the terrain,
+    /// or an SDF element, most deeply), or else the scene element whose solid the wall is.
+    pub fn host_at(&mut self, o: Opening) -> Option<Node> {
+        let eps = (0.05 * o.size).max(1e-3);
+        let n = o.normal;
+        let p = [o.target[0] - n[0] * eps, o.target[1] - n[1] * eps, o.target[2] - n[2] * eps];
+        let size = o.size.clamp(SMALLEST, LARGEST);
+        let mut best: Option<(f32, Node)> = None;
+        let mut consider = |d: f32, node: Node| {
+            if d < 0.0 && best.as_ref().is_none_or(|(b, _)| d < *b) {
+                best = Some((d, node));
+            }
+        };
+        let edits = self.edits.clone();
+        if let Some(d) = self.terrain_distances(edits, &[p], size) {
+            consider(d[0], Node::Terrain);
+        }
+        for entry in self.sdf_entries_near(p, p, None) {
+            if let Some(d) = entry_distances(&entry, &[p], size) {
+                consider(d[0], Node::Element(entry.placed.id));
+            }
+        }
+        if let Some((_, node)) = best {
+            return Some(node);
+        }
+        // A scene element's meshes say how far, not which side: the nearest within the wall's reach.
+        let reach = 2.0 * eps;
+        let mut nearest: Option<(f32, u32)> = None;
+        for owner in self.scene.solid_placed_overlapping([p[0] - reach, p[1] - reach, p[2] - reach], [p[0] + reach, p[1] + reach, p[2] + reach]) {
+            if let Some(d) = self.scene.distance_to_solids_of(owner, p, reach)
+                && nearest.is_none_or(|(b, _)| d < b)
+            {
+                nearest = Some((d, owner));
+            }
+        }
+        nearest.map(|(_, id)| Node::Element(id))
+    }
+
+    /// What the terrain carve `edit`, about to be the edit log's `index`th, carves into: the terrain
+    /// if there was any within it, and every SDF element (landform or promoted) it reaches inside,
+    /// with `promoted` (those it promotes now, not yet in the SDF).
+    pub(super) fn carved_by_edit(&mut self, edit: &Edit, promoted: &[u32]) -> Vec<Node> {
+        if edit.op != Op::Carve {
+            return Vec::new();
+        }
+        let size = edit.stamp_size.clamp(SMALLEST, LARGEST);
+        let reach = edit.shape.radius();
+        let mut found = BTreeSet::new();
+        let edits = self.edits.clone();
+        if self.terrain_distances(edits, &[edit.center], size).is_some_and(|d| d[0] < reach) {
+            found.insert(Node::Terrain);
+        }
+        let (lo, hi) = edit.influence_bounds();
+        for entry in self.sdf_entries_near(lo, hi, None) {
+            if entry_distances(&entry, &[edit.center], size).is_some_and(|d| d[0] < reach) {
+                found.insert(Node::Element(entry.placed.id));
+            }
+        }
+        found.extend(promoted.iter().map(|&id| Node::Element(id)));
+        found.into_iter().collect()
+    }
+
+    /// The basins water has come into since `before`, as (water body, the terrain edit whose carve
+    /// it fills: the last carve of that shape there).
+    pub(super) fn newly_flooded(&self, before: &WaterLog) -> Vec<(u32, u32)> {
+        let had = |basin: &WaterBasin| before.bodies().iter().any(|b| b.basins.contains(basin));
+        let mut out = BTreeSet::new();
+        for body in self.water.bodies() {
+            for basin in body.basins.iter().filter(|b| !had(b)) {
+                if let Some(i) = self.edits.edits().iter().rposition(|e| e.op == Op::Carve && WaterBasin::from_edit(e) == *basin) {
+                    out.insert((body.id, i as u32));
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Whether the element `id` is held up by the graph: it rests on, or is attached to, something.
+    pub fn is_held_up(&self, id: u32) -> bool {
+        let node = Node::Element(id);
+        self.graph.relations().any(|r| r.from == node && r.kind.holds_up())
     }
 
     /// The graph of a save made before there was one: each element owned by whoever placed it,

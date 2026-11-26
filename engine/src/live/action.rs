@@ -14,7 +14,7 @@ use crate::body::Body;
 use crate::compose::PlacedElement;
 use crate::cut::world_edit_to_local;
 use crate::edit::{Edit, Op};
-use crate::graph::{GraphDelta, Relation};
+use crate::graph::{GraphDelta, Opening, Relation};
 use crate::physics::Tool;
 use crate::rules::Action as Rule;
 use crate::water::WaterLog;
@@ -43,8 +43,21 @@ pub enum Action {
     /// with `tool`.
     Sculpt { edit: Edit, hit: [f32; 3], tool: Tool, target: SculptTarget },
     /// An element of `module` placed at `pos`, turned by `yaw` (or `rot`), `scale` times its size;
-    /// `fitted` if it was fitted to an opening.
-    Place { module: String, pos: [f32; 3], yaw: f32, rot: Option<[f32; 4]>, scale: f32, fitted: bool },
+    /// `fitted` if it was fitted to an opening, and `opening`, where that opening was measured (it
+    /// then fills it, attached to what it is in); `seed`, the one it was made and judged with, if
+    /// it must be that one (else the world gives it one).
+    Place {
+        module: String,
+        pos: [f32; 3],
+        yaw: f32,
+        rot: Option<[f32; 4]>,
+        scale: f32,
+        fitted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opening: Option<Opening>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
+    },
     /// The placed element `id` taken away.
     Remove { id: u32 },
     /// The placed element `id` chopped where `hit` is, with `tool`, which found `material` there;
@@ -148,7 +161,9 @@ impl World {
         let pushed = self.history.pushed;
         let mut outcome = match &action {
             Action::Sculpt { edit, hit, tool, target } => self.sculpt(&mut actor, *edit, *hit, *tool, *target),
-            Action::Place { module, pos, yaw, rot, scale, fitted } => self.place(&mut actor, module, *pos, *yaw, *rot, *scale, *fitted),
+            Action::Place { module, pos, yaw, rot, scale, fitted, opening, seed } => {
+                self.place(&mut actor, module, *pos, *yaw, *rot, *scale, *fitted, *opening, *seed)
+            }
             Action::Remove { id } => self.remove(&actor, *id),
             Action::Cut { id, hit, dir, tool, material } => self.cut(&mut actor, *id, *hit, *dir, *tool, *material),
             Action::Grab { id } => self.grab(&mut actor, *id),
@@ -264,7 +279,8 @@ impl World {
                 return Outcome::Denied(denial.reason);
             }
         }
-        // A carve that opens onto water below its level floods.
+        // A carve that opens onto water below its level floods (it, and any dry carve it joins).
+        let water_before = self.water.clone();
         let water_bounds = if edit.op == Op::Carve && self.rules.check(actor.id, &Rule::ModifyWater { lo, hi, player_size: size }).is_ok() {
             let _span = info_span!("water").entered();
             let mut next = (*self.water).clone();
@@ -282,6 +298,7 @@ impl World {
         let edit_idx = self.edits.len();
         let (promoted_ids, promo_bounds, promo_names) =
             if edit.op == Op::Carve { self.promote_overlapping_scene_elements(&edit, aimed, edit_idx) } else { (Vec::new(), Vec::new(), Vec::new()) };
+        let carved = self.carved_by_edit(&edit, &promoted_ids.iter().map(|&(id, _)| id).collect::<Vec<_>>());
         let mut next = (*self.edits).clone();
         if let Err(e) = next.push(edit) {
             return Outcome::Denied(format!("sculpt error: {e}"));
@@ -290,6 +307,14 @@ impl World {
         self.edit_authors.push(Some(actor.id.to_string()));
         self.dirty = true;
         self.history.push(WorldAction::SdfEdit { edit, promoted_ids: promoted_ids.clone() });
+        for what in carved {
+            self.relate(Relation::carved_into(edit_idx as u32, what));
+        }
+        if water_bounds.is_some() {
+            for (body, idx) in self.newly_flooded(&water_before) {
+                self.relate(Relation::flooded_by(body, idx));
+            }
+        }
         self.commit(Invalidation::Some { edits: vec![edit], bounds: promo_bounds, water: water_bounds });
         if water_bounds.is_some() || !self.floating.is_empty() {
             self.refresh_all_buoyancy();
@@ -309,9 +334,21 @@ impl World {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn place(&mut self, actor: &mut Actor<'_>, module: &str, pos: [f32; 3], yaw: f32, rot: Option<[f32; 4]>, scale: f32, fitted: bool) -> Outcome {
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        &mut self,
+        actor: &mut Actor<'_>,
+        module: &str,
+        pos: [f32; 3],
+        yaw: f32,
+        rot: Option<[f32; 4]>,
+        scale: f32,
+        fitted: bool,
+        opening: Option<Opening>,
+        seed: Option<u64>,
+    ) -> Outcome {
         let size = actor.body.size;
-        if !(scale.is_finite() && scale > 0.0) || !pos.iter().all(|c| c.is_finite()) {
+        if !(scale.is_finite() && scale > 0.0) || !pos.iter().all(|c| c.is_finite()) || opening.is_some_and(|o| o.validate().is_err()) {
             return Outcome::Denied("cannot place there".into());
         }
         if let Err(denial) = self.rules.check(actor.id, &Rule::PlaceElement { at: pos, player_size: size }) {
@@ -320,11 +357,13 @@ impl World {
         if let Err(e) = self.catalog.get_or_load(module) {
             return Outcome::Denied(format!("place error: {e}"));
         }
+        // What the opening is in, asked before the element is there to be mistaken for it.
+        let host = opening.and_then(|o| self.host_at(o).map(|h| (o, h)));
         let id = self.alloc_id();
         let pl = PlacedElement {
             id,
             module: module.to_string(),
-            seed: self.seed.wrapping_mul(31).wrapping_add(id as u64),
+            seed: seed.unwrap_or_else(|| self.seed.wrapping_mul(31).wrapping_add(id as u64)),
             pos,
             yaw,
             rot,
@@ -339,6 +378,10 @@ impl World {
         match self.spawn_placed(pl.clone(), Some(&mut *actor.body)) {
             Ok(name) => {
                 self.relate(Relation::owned_by(id, actor.id));
+                if let Some((o, host)) = host {
+                    self.relate(Relation::fills(id, host.clone(), o));
+                    self.relate(Relation::attached_to(id, host));
+                }
                 self.settle_relations(id);
                 let floating = self.floating.contains_key(&id);
                 self.history.push(WorldAction::PlaceElement(pl));

@@ -252,10 +252,42 @@ support wins, and a rider's weight doesn't press it down either (`settle_buoyanc
 `a_log_laid_on_a_bridge_over_water_stays_on_the_bridge`, from the session's own channel and bridge.
 Logs played before this fix replay only up to such a drop.
 
-Short of the done-when: nothing. Not yet in the graph: `attached_to`, `fills`, `carved_into`,
-`flooded_by`, element parts, and `SiteContext::describe_for_prompt`'s neighbourhood. Relations go
-stale when the world changes under them without the element moving (terrain carved from under a
-log, water rising round it): G's support check is what should mend them; until then the laws say so.
+Short of the done-when: nothing. Relations go stale when the world changes under them without the
+element moving (terrain carved from under a log, water rising round it): G's support check is what
+should mend them; until then the laws say so.
+
+*Slice 2 done 2026-11-26 (headless tests only; not yet played by hand):*
+
+- New nodes: the terrain's edits (`edit:4`, by place in the edit log) and water bodies
+  (`water:2`). New relations: `attached_to` and `fills` (with the `Opening` it was measured at:
+  target, normal, size, enough to measure it again in I), `carved_into`, `flooded_by`.
+- `Action::Place` takes `opening` and `seed` (both optional, so older logs still read). A fitted
+  place `fills` and is `attached_to` its host (`World::host_at`: the terrain or SDF element solid
+  just behind the opening's wall, else the scene element whose mesh it is), asked before the
+  element is there. Being attached holds an element up (`none_unsupported`). `play`'s fitted snap
+  carries its opening; **`make --place` now places through `World::apply`** (owned by `local`, the
+  seed it was judged with, its fill and rests; `--accept-changed-modules` passes through).
+- A terrain carve is `carved_into` the terrain if there was any within it and every SDF element it
+  reaches inside, with those it promotes; a carve that floods writes `flooded_by` for every basin
+  newly filled (a dry carve it joins too). Undo reverts them with the water.
+- Leaving or moving: an element takes with it what rested on, was attached to or filled it; set
+  down elsewhere, it no longer fills or hangs from what it did. History stays (`derived_from`,
+  `carved_into` to elements gone).
+- **A site's neighbourhood** (`live/near.rs`, `World::neighbourhood`): what the site is in
+  (with its owner, its lineage of cuts, how it was carved, what holds it up), whether an opening
+  there is filled already and by what, the carves round about (how many, at what size, into what),
+  water let in through them, and up to eight elements near by, in the site's local metres.
+  `SiteContext::near`, saved as `near` lines in `.site` files and given to Claude in
+  `describe_for_prompt` ("Round about, in the world"); filled by `play`'s `I`.
+- Laws: `relations_are_whole` (every end there, or history; whatever fills is attached).
+- Tests: `engine/tests/graph.rs` (8, two new): a hobbit door placed into a tiny's home bored in an
+  oak fills it and hangs from the oak, the site naming the oak, its owner and carving, and once the
+  door is in, the door and what it fills; the site file keeps its neighbourhood; taken off and
+  undone; saved and reopened. A terrain carve aimed at a tree is carved into the tree, a cave into
+  the terrain; the hand-played channel floods and is `flooded_by` its dig, undone and redone
+  exactly; a site at its edge names the carves and the water; saved and reopened.
+
+Not yet: element parts (`part_of`); re-measuring an opening when an edit changes it (I).
 
 ### G. Support and falling (one to one and a half weeks)
 

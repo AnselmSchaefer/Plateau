@@ -131,6 +131,10 @@ pub struct SiteContext {
     /// Clear height above the target, if there is anything over it within six heights.
     pub overhead: Option<f32>,
     pub cavity: Option<Cavity>,
+    /// What is round about in the world, in words (what the site is in and who owns it, carves,
+    /// water let in, elements near by), from the world graph: written by `live::World::neighbourhood`,
+    /// which knows the world; `measure` knows only the region, and leaves it empty.
+    pub near: Vec<String>,
 }
 
 /// A ray: from a point, along a direction of length one, at most so far.
@@ -485,7 +489,7 @@ impl SiteContext {
         let overhead = sight.cast(&[Ray { from: base, along: UP, far: 6.0 * h }], false)?[0].map(|hit| hit.t);
         let (ground, water) = ground(&mut sight, frame, cavity.is_some(), overhead)?;
         let materials = materials(&mut sight, &probe, cavity.as_ref())?;
-        Ok(SiteContext { area: String::new(), target: probe.target, normal, size: h, frame, ground, materials, water, overhead, cavity })
+        Ok(SiteContext { area: String::new(), target: probe.target, normal, size: h, frame, ground, materials, water, overhead, cavity, near: Vec::new() })
     }
 
     /// The opening's outline in the frame's local metres (x right, y up from the sill, at z = 0).
@@ -581,6 +585,12 @@ impl SiteContext {
             s += &format!("{}\n", cells.join(" "));
         }
         s += "```\n";
+        if !self.near.is_empty() {
+            s += "\n### Round about, in the world\n\nWhat the world knows of the site and what is near it (places in local metres, as above):\n\n";
+            for line in &self.near {
+                s += &format!("- {line}\n");
+            }
+        }
         if let Some(c) = &self.cavity {
             let span = c.span();
             let up = c.drop();
@@ -665,6 +675,9 @@ impl SiteContext {
             let list = |v: &[f32]| v.iter().map(f32::to_string).collect::<Vec<_>>().join(" ");
             s += &format!("contour {}\nmargin {}\n", list(&c.radii), list(&c.wall));
         }
+        for line in &self.near {
+            s += &format!("near {}\n", line.replace(['\n', '\r'], " "));
+        }
         s
     }
 
@@ -673,6 +686,7 @@ impl SiteContext {
         let (mut version, mut area, mut target, mut normal, mut size, mut frame) = (None, String::new(), None, None, None, None);
         let (mut ground, mut materials, mut water, mut overhead): (Option<Ground>, _, _, _) = (None, Vec::new(), None, None);
         let mut cavity: Option<Cavity> = None;
+        let mut near = Vec::new();
         for (k, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -690,6 +704,10 @@ impl SiteContext {
                 }
                 "area" => {
                     area = rest.trim().to_string();
+                    continue;
+                }
+                "near" => {
+                    near.push(rest.trim().to_string());
                     continue;
                 }
                 "target" => target = Some(f.three()?),
@@ -783,6 +801,7 @@ impl SiteContext {
             water,
             overhead,
             cavity,
+            near,
         };
         if !(SMALLEST..=LARGEST).contains(&site.size) {
             bail!("a site is measured by someone {SMALLEST} to {LARGEST} m tall, not {}", site.size);

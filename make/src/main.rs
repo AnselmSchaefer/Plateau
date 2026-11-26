@@ -27,7 +27,11 @@
 use std::path::{Path, PathBuf};
 
 use plateau_engine::atlas::Side;
-use plateau_engine::compose::PlacedElement;
+use plateau_engine::body::Body;
+use plateau_engine::graph::Opening;
+use plateau_engine::live::{Action, Actor, Outcome, World};
+use plateau_engine::modules::ModuleCheck;
+use plateau_engine::rules::LOCAL_PLAYER;
 use plateau_engine::edit::{WorldSave, surface_normal};
 use plateau_engine::sketch::Sketch;
 use plateau_engine::{Limits, OpenWorld, SiteContext, SiteProbe, Size, Wasm, laws};
@@ -194,7 +198,7 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "plateau make \"<words>\" [--sketch MAP.png] [--name NAME] [--beside SIDE:AREA ...]\n\
-         plateau make-element \"<words>\" [--name NAME] [SITE [--fit auto|cavity|ground|none] [--place]]\n\
+         plateau make-element \"<words>\" [--name NAME] [SITE [--fit auto|cavity|ground|none] [--place [--accept-changed-modules]]]\n\
          plateau test-set [NAME ...]\n\
          plateau check NAME [--sketch MAP.png] [--beside SIDE:AREA ...]\n\
          plateau check-pair AREA_A SIDE AREA_B\n\
@@ -339,31 +343,36 @@ fn site_of(repo: &Path, args: &[String]) -> Result<Option<Site>, String> {
     Ok(Some(Site { context, world: Some(world), law }))
 }
 
-/// With `--place`, the element `NAME` put into `--save`'s world where it was made to go.
+/// With `--place`, the element `NAME` put into `--save`'s world where it was made to go, through the
+/// world's own `apply` (so it is owned, fills its opening, and rests on what it touches), with the
+/// seed it was made and judged with.
 fn place(repo: &Path, args: &[String], name: &str, site: &Site) -> Result<(), String> {
     if !args.iter().any(|a| a == "--place") {
         return Ok(());
     }
     let path = flag(args, "--save").map(PathBuf::from).ok_or("--place needs the world to place it in: --save WORLD.plateau")?;
-    let mut save = WorldSave::load(&path).map_err(|e| format!("{}: {e:#}", path.display()))?;
-    let tf = site.context.frame;
-    let id = save.elements.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-    save.elements.push(PlacedElement {
-        id,
+    let save = WorldSave::load(&path).map_err(|e| format!("{}: {e:#}", path.display()))?;
+    let c = &site.context;
+    let check = if args.iter().any(|a| a == "--accept-changed-modules") { ModuleCheck::AcceptChanged } else { ModuleCheck::Strict };
+    let (mut world, _) = World::open(save, None, repo, Limits::default(), check, c.size).map_err(|e| format!("{}: {e:#}", path.display()))?;
+    let tf = c.frame;
+    let mut body = Body::of_size(c.size);
+    body.feet = tf.pos.map(|v| v as f64);
+    let place = Action::Place {
         module: format!("made/elements/{name}/element.wasm"),
-        seed: SEED,
         pos: tf.pos,
         yaw: 0.0,
         rot: Some(tf.rot),
         scale: tf.scale,
-        stamp_size: site.context.size,
-        after_edits: save.edits.len(),
-        promoted: None,
-        clips: Vec::new(),
-        local_edits: Vec::new(),
-        author: None,
-    });
-    save.save_sealed(&path, repo).map_err(|e| format!("{}: {e:#}", path.display()))?;
+        fitted: true,
+        opening: c.cavity.as_ref().map(|_| Opening { target: c.target, normal: c.normal, size: c.size }),
+        seed: Some(SEED),
+    };
+    let id = match world.apply(Actor { id: LOCAL_PLAYER, body: &mut body }, place) {
+        Outcome::Done(s) => s.added[0],
+        other => return Err(format!("not placed: {other:?}")),
+    };
+    world.save(&path).map_err(|e| format!("{}: {e:#}", path.display()))?;
     println!("placed as element {id} in {}", path.display());
     Ok(())
 }
