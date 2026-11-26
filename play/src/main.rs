@@ -3,7 +3,7 @@
 //! live multi-scale SDF sculpting (`B`), composable standalone `.wasm` element placement (`P`),
 //! and physical chopping (`K`) & carrying (`G`).
 //!
-//! `cargo run --release -p plateau-play [-- area.wasm] [--north|--east|--south|--west area.wasm] [--tile gx,gz:area.wasm ...] [--seed N] [--save file.plateau [--accept-changed-modules]] [--log actions.jsonl] [--element elem.wasm ...] [--tour folder [--behind]]`;
+//! `cargo run --release -p plateau-play [-- area.wasm] [--north|--east|--south|--west area.wasm] [--tile gx,gz:area.wasm ...] [--seed N] [--save file.plateau [--accept-changed-modules]] [--log actions.jsonl] [--trace trace.json] [--element elem.wasm ...] [--tour folder [--behind]]`;
 //! the walled garden (`areas/modules/garden.wasm`) unless another module is given, or the areas the
 //! save names. The world itself (`plateau_engine::live::World`) is the engine's: this crate asks it
 //! for changes (`World::apply`) and shows what changed.
@@ -16,6 +16,7 @@ mod place;
 mod scene;
 mod sculpt;
 mod surface;
+mod trace;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use bevy::asset::embedded_asset;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
+use bevy::log::LogPlugin;
 use bevy::light::{CascadeShadowConfigBuilder, GlobalAmbientLight};
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
@@ -35,15 +37,13 @@ use chunks::Chunks;
 use place::{ElementGhost, FittedSnap, PlaceMode, PreviewAssets};
 use plateau_engine::atlas::{CompiledAtlas, Side};
 use plateau_engine::body::{self, Body, Intent};
-use plateau_engine::compose::PlacementTransform;
-use plateau_engine::cut::{CarryDecision, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass, toppled_transform};
+use plateau_engine::cut::{check_carry, format_mass};
 use plateau_engine::edit::{Op, SavedTile, WorldSave, surface_normal};
 use plateau_engine::fit::fit_transform;
 use plateau_engine::laws::length;
-use plateau_engine::live::{self, ActionLog, Actor, FallingElement, LayerChange, Outcome, SculptTarget, World, WorldAction};
+use plateau_engine::live::{self, ActionLog, Actor, LayerChange, Outcome, SculptTarget, World};
 use plateau_engine::modules::{self, ModuleCheck};
-use plateau_engine::physics::{BuoyancyState, compute_buoyancy};
-use plateau_engine::rules::{Action, LOCAL_PLAYER};
+use plateau_engine::rules::LOCAL_PLAYER;
 use plateau_engine::scene::{Applied, BASE_OWNER, SceneWorld};
 use plateau_engine::site::{SiteContext, SiteProbe};
 use plateau_engine::{Limits, PlayerState, Region, SIZES, START, Scene, WIDTH, rings};
@@ -82,6 +82,9 @@ fn main() {
             "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
             "--accept-changed-modules" => module_check = ModuleCheck::AcceptChanged,
             "--log" => log_arg = Some(PathBuf::from(args.next().expect("--log takes a file path"))),
+            "--trace" => {
+                let _ = trace::TRACE_TO.set(PathBuf::from(args.next().expect("--trace takes a file path")));
+            }
             "--element" => extra_elements.push(PathBuf::from(args.next().expect("--element takes a .wasm path"))),
             "--north" => extra_tiles.push((Side::North.step(), PathBuf::from(args.next().expect("--north takes a .wasm path")))),
             "--east" => extra_tiles.push((Side::East.step(), PathBuf::from(args.next().expect("--east takes a .wasm path")))),
@@ -157,7 +160,9 @@ fn main() {
     let present_mode = if tour.is_some() || std::env::var_os("PLATEAU_NO_VSYNC").is_some() { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync };
     let window = Window { title: format!("Plateau: {}", described.name), present_mode, resolution: (1600, 900).into(), ..default() };
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin { primary_window: Some(window), ..default() }));
+    app.add_plugins(
+        DefaultPlugins.set(WindowPlugin { primary_window: Some(window), ..default() }).set(LogPlugin { custom_layer: trace::layer, ..default() }),
+    );
     embedded_asset!(app, "play/src", "surface.wesl");
     app.add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(MaterialPlugin::<SurfaceMaterial>::default())
@@ -359,20 +364,28 @@ impl EditCtx<'_> {
         outcome
     }
 
-    /// Puts the carried object back where it was picked up.
-    fn cancel_carry(&mut self) -> Option<String> {
-        let item = self.carry.held.take()?;
-        self.world.0.release_held(item.original_tf, None, None);
-        Some(item.name)
+    /// Puts the carried object back where it was picked up (saying so if `say`).
+    fn cancel_carry(&mut self, player: &mut Player, say: bool) {
+        if self.carry.held.take().is_none() {
+            return;
+        }
+        let id = self.sculpt.player_id.clone();
+        let outcome = self.world.0.apply(Actor { id: &id, body: &mut player.body }, live::Action::Return);
+        if say && let Some(said) = outcome.said() {
+            player.say(said);
+        }
     }
 
-    /// Sets the carried object down at `aim_world`, as solid walkable geometry; undoable if
-    /// `record_undo`.
-    fn drop_carried_at(&mut self, aim_world: [f64; 3], player: &mut Player, record_undo: bool) -> Option<String> {
-        let item = self.carry.held.take()?;
+    /// Sets the carried object down at `aim_world` as it is held (turned, tilted, flat or upright),
+    /// as solid walkable geometry. Whether it was.
+    fn drop_carried_at(&mut self, aim_world: [f64; 3], player: &mut Player) -> bool {
+        let Some(item) = &self.carry.held else { return false };
         let tf = item.target_transform(aim_world);
-        self.world.0.release_held(tf, record_undo.then_some(item.original_tf), Some(&mut player.body));
-        Some(item.name)
+        let done = self.apply(player, live::Action::Drop { pos: tf.pos, rot: tf.rot }).is_done();
+        if done {
+            self.carry.held = None;
+        }
+        done
     }
 }
 
@@ -412,160 +425,27 @@ fn show_world_changes(
     }
 }
 
-/// The mouse turns the view; the keys say where to go, and change size, sit, sculpt, place, or interact.
-#[allow(clippy::too_many_arguments)]
-fn look_and_ask(
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    motion: Res<AccumulatedMouseMotion>,
-    scroll: Res<AccumulatedMouseScroll>,
-    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
-    tour: Option<Res<Tour>>,
-    mut player: ResMut<Player>,
-    mut ctx: EditCtx,
-) {
-    if tour.is_some() {
-        return;
-    }
-    ctx.world.0.tick_falling(time.delta_secs().min(0.1), &mut player.body);
-    ctx.world.0.sync_viewer_size(player.body.size);
+/// What the player asks this frame, and from where they look: for the modes' handlers.
+#[derive(Clone, Copy)]
+struct Asking<'a> {
+    keys: &'a ButtonInput<KeyCode>,
+    buttons: &'a ButtonInput<MouseButton>,
+    scroll: &'a AccumulatedMouseScroll,
+    time: &'a Time,
+    /// The mouse is held by the window.
+    grabbed: bool,
+    ctrl: bool,
+    /// Where rays from the crosshair start, and their way.
+    pivot: [f64; 3],
+    dir: [f32; 3],
+    psize: f32,
+    /// Sculpting, placing or carrying.
+    tool_active: bool,
+}
 
-    let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
-    if grabbed && player.body.change.is_none() {
-        player.body.yaw -= motion.delta.x * 0.0025;
-        player.pitch = (player.pitch - motion.delta.y * 0.0025).clamp(-1.55, 1.55);
-    }
-    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-    let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
-    let dt = time.delta_secs().min(0.1);
-
-    // Cycle active material-aware tool (`C`: Workshop -> Saw -> Pickaxe -> Shovel -> Hands).
-    if !ctrl && keys.just_pressed(KeyCode::KeyC) {
-        ctx.sculpt.tool = ctx.sculpt.tool.next();
-        player.say(format!("tool: {}", ctx.sculpt.tool.name()));
-    }
-
-    // Handle active boat/raft piloting & passive floating buoyancy.
-    let piloting = ctx.world.0.piloting.is_some();
-    let boat_fwd = if piloting && !ctrl { held(KeyCode::KeyW) - held(KeyCode::KeyS) } else { 0.0 };
-    let boat_turn = if piloting { held(KeyCode::KeyA) - held(KeyCode::KeyD) } else { 0.0 };
-    if piloting && keys.just_pressed(KeyCode::Space) {
-        ctx.world.0.piloting = None;
-        player.say("dismounted");
-    }
-    ctx.world.0.tick_buoyancy(dt, boat_fwd, boat_turn, &mut player.body);
-
-    let carry_speed = ctx.carry.speed_factor();
-    player.intent = if ctx.world.0.piloting.is_some() {
-        Intent::default()
-    } else {
-        Intent {
-            forward: if ctrl { 0.0 } else { (held(KeyCode::KeyW) - held(KeyCode::KeyS)) * carry_speed },
-            right: (held(KeyCode::KeyD) - held(KeyCode::KeyA)) * carry_speed,
-            run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
-            jump: keys.pressed(KeyCode::Space),
-        }
-    };
-
-    // If shrinking made the carried object exceed current size's carry capacity, set it down safely.
-    if let Some(item) = &ctx.carry.held
-        && !check_carry(&item.physics, false, player.body.size).is_allowed()
-    {
-        let fwd = Vec3::new(-player.body.yaw.sin(), 0.0, -player.body.yaw.cos());
-        let dist = (player.body.size * 1.5).max(item.physics.world_radius(item.scale) + player.body.size * 0.5) as f64;
-        let drop_pos = [
-            player.body.feet[0] + fwd.x as f64 * dist,
-            player.body.feet[1],
-            player.body.feet[2] + fwd.z as f64 * dist,
-        ];
-        if let Some(name) = ctx.drop_carried_at(drop_pos, &mut player, true) {
-            player.say(format!("{name} too heavy at this size — set down"));
-        }
-    }
-
-    if keys.just_pressed(KeyCode::KeyB) {
-        if ctx.carry.is_carrying() {
-            let _ = ctx.cancel_carry();
-        }
-        ctx.sculpt.active = !ctx.sculpt.active;
-        ctx.sculpt.hold_timer = 0.0;
-        ctx.sculpt.last_stamp = None;
-        if ctx.sculpt.active {
-            ctx.place.active = false;
-            ctx.place.aim = None;
-            ctx.place.fitted = None;
-            player.say(format!("sculpt mode: {} / {}", ctx.sculpt.preset.name(), ctx.sculpt.material().name()));
-        } else {
-            ctx.sculpt.aim = None;
-            player.say("sculpt mode off");
-        }
-    }
-
-    if keys.just_pressed(KeyCode::KeyP) {
-        if ctx.carry.is_carrying() {
-            let _ = ctx.cancel_carry();
-        }
-        ctx.place.active = !ctx.place.active;
-        ctx.place.fitted = None;
-        if ctx.place.active {
-            ctx.sculpt.active = false;
-            ctx.sculpt.aim = None;
-            if let Some(el) = ctx.place.current() {
-                let kind = if el.is_sdf() { "SDF" } else { "Scene" };
-                player.say(format!("place mode: {} [{kind}] (O fits an opening)", el.name));
-            } else {
-                player.say("place mode: no .wasm elements found (run ./elements/build.sh)");
-            }
-        } else {
-            ctx.place.aim = None;
-            player.say("place mode off");
-        }
-    }
-
-    if ctrl && keys.just_pressed(KeyCode::KeyR) {
-        let n = ctx.place.rescan(&mut ctx.world.0);
-        place::clear_preview_cache(&mut ctx.preview);
-        player.say(format!("rescanned elements: {n} available"));
-    }
-
-    let tool_active = ctx.sculpt.active || ctx.place.active || ctx.carry.is_carrying();
-    if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
-        if ctx.world.0.piloting.is_some() {
-            ctx.world.0.piloting = None;
-            player.say("released helm");
-        } else if let Some(boat_id) = ctx.world.0.scene.standing_on_placed(player.body.feet, player.body.size)
-            && ctx.world.0.floating.contains_key(&boat_id)
-        {
-            ctx.sculpt.active = false;
-            ctx.sculpt.aim = None;
-            ctx.place.active = false;
-            ctx.place.aim = None;
-            ctx.world.0.piloting = Some(boat_id);
-            let name = ctx.world.0.element_name(boat_id);
-            player.say(format!("paddling {name} — W/S row, A/D steer, F/Space dismount"));
-        } else {
-            let act = Action::Interact { at: player.body.feet.map(|c| c as f32) };
-            match ctx.world.0.rules.check(&ctx.sculpt.player_id, &act) {
-                Ok(()) => ctx.live.interact_pressed = true,
-                Err(denial) => player.say(denial.reason),
-            }
-        }
-    }
-    ctx.live.holding_use = keys.pressed(KeyCode::KeyF) || (!tool_active && buttons.pressed(MouseButton::Right));
-
-    // Helper closure for camera-pivot raycast collinear with the `+` crosshair.
-    let eye = player.eye.unwrap_or(player.body.eye());
-    let dir = player.looking().to_array();
-    let psize = player.body.size;
-    let pivot = if player.third {
-        let per = (psize / DRAWN_AS) as f64;
-        [eye[0], eye[1] + player.lift as f64 * per, eye[2]]
-    } else {
-        eye
-    };
-
-    // Inspect / capture a site or cavity at the crosshair (`I`: writes `.site` + companion `.plateau`).
+/// `I`: measures the site or opening at the crosshair, writing a `.site` file and the world beside it.
+fn measure_site(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
+    let Asking { keys, ctrl, pivot, dir, psize, .. } = *a;
     if !ctrl && keys.just_pressed(KeyCode::KeyI) {
         ctx.world.0.finish_all_falls(None);
         let reach = psize * 45.0;
@@ -633,7 +513,11 @@ fn look_and_ask(
         }
     }
 
-    // Sculpting controls (Step 8a: scale-stamped SDF edits).
+}
+
+/// `B` mode: brush shape, material and size; strokes on the terrain or on a placed element.
+fn sculpt_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
+    let Asking { keys, buttons, scroll, time, grabbed, ctrl, pivot, dir, psize, .. } = *a;
     if ctx.sculpt.active {
         if keys.just_pressed(KeyCode::Tab) {
             ctx.sculpt.preset = ctx.sculpt.preset.next();
@@ -722,7 +606,7 @@ fn look_and_ask(
                         None => SculptTarget::Terrain { aimed: aimed_unpromoted },
                     };
                     let tool = ctx.sculpt.tool;
-                    match ctx.apply(&mut player, live::Action::Sculpt { edit, hit: h32, tool, target }) {
+                    match ctx.apply(player, live::Action::Sculpt { edit, hit: h32, tool, target }) {
                         Outcome::Done(_) => {
                             ctx.sculpt.last_stamp = Some(edit.center);
                             ctx.sculpt.hold_timer = if click_op.is_some() { 0.25 } else { 0.14 };
@@ -735,7 +619,11 @@ fn look_and_ask(
         }
     }
 
-    // Place Element controls (Step 8b / Phase C: standalone composable .wasm elements + cavity auto-fit).
+}
+
+/// `P` mode: the palette, turning and scaling, fitting to an opening (`O`), placing and removing.
+fn place_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
+    let Asking { keys, buttons, scroll, grabbed, ctrl, pivot, dir, psize, .. } = *a;
     if ctx.place.active {
         if keys.just_pressed(KeyCode::Tab) {
             ctx.place.next_element();
@@ -838,7 +726,7 @@ fn look_and_ask(
             };
             if let Some((at, yaw, rot, scale, was_fitted)) = placement {
                 let place = live::Action::Place { module: elem.module.clone(), pos: at, yaw, rot, scale, fitted: was_fitted };
-                if ctx.apply(&mut player, place).is_done() && was_fitted {
+                if ctx.apply(player, place).is_done() && was_fitted {
                     ctx.place.fitted = None;
                 }
             }
@@ -856,15 +744,18 @@ fn look_and_ask(
             };
             match target_id {
                 Some(id) => {
-                    ctx.apply(&mut player, live::Action::Remove { id });
+                    ctx.apply(player, live::Action::Remove { id });
                 }
                 None => player.say("aim at a placed element to remove it"),
             }
         }
     }
 
-    // Chop / Cut discrete procedural Scene objects (Step 8c: K key — works on both unpromoted and
-    // tunnel-carved promoted Scene elements!).
+}
+
+/// `K`: chops the placed object aimed at.
+fn chop_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
+    let Asking { keys, pivot, dir, psize, .. } = *a;
     if keys.just_pressed(KeyCode::KeyK) && !ctx.carry.is_carrying() {
         ctx.sculpt.active = false;
         ctx.sculpt.aim = None;
@@ -888,133 +779,20 @@ fn look_and_ask(
             (None, Some((b, _, pb, mb))) => Some((b, pb, mb)),
             (None, None) => None,
         };
-        if let Some((id, hit_world, hit_mat)) = target_hit {
-            ctx.world.0.finish_all_falls(Some(&mut player.body));
-            if let Some(original) = ctx.world.0.find(id).cloned() {
-                if let Err(denial) = ctx.world.0.rules.check(
-                    &ctx.sculpt.player_id,
-                    &Action::CutOrCarry { at: original.pos, author: original.author.as_deref() },
-                ) {
-                    player.say(denial.reason);
-                } else {
-                let is_sdf = ctx.world.0.catalog.get(&original.module).is_some_and(|e| e.is_sdf());
-                let elem_name = ctx.world.0.catalog.get(&original.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
-                if let Some(phys) = ctx.world.0.physics_of(id) {
-                    match check_cut_with_tool(&phys, is_sdf, psize, ctx.sculpt.tool, hit_mat) {
-                        Err(reason) => player.say(reason),
-                        Ok(()) => {
-                            let orig_tf = original.transform();
-                            let hit_local = orig_tf.world_to_local_point(hit_world);
-                            if let Some(plane) = choose_cut_plane(&phys, hit_local) {
-                                let raw_local = ctx.world.0.runtime.local_scene_of(id).cloned();
-                                if let Some(cur_scene) = raw_local {
-                                    let lower_sc = clip_scene(&cur_scene, &[plane.flipped()]);
-                                    let upper_sc = clip_scene(&cur_scene, &[plane]);
-                                    let lower_ok = !lower_sc.instances.is_empty();
-                                    let upper_ok = !upper_sc.instances.is_empty();
-                                    if lower_ok && upper_ok {
-                                        let mut lower = original.clone();
-                                        lower.clips.push(plane.flipped());
-
-                                        let upper_id = ctx.world.0.alloc_id();
-                                        let mut upper = original.clone();
-                                        upper.id = upper_id;
-                                        upper.clips.push(plane);
-
-                                        let upper_phys = plateau_engine::cut::ObjectPhysics::compute(&upper_sc, upper.scale);
-                                        let was_upright = !CarriedItem::is_rot_horizontal(orig_tf.rot);
-
-                                        // Compute target resting transform for the detached upper half.
-                                        // Probe strictly against terrain SDF (`world.region`, NOT
-                                        // `Combined` while `original` is still standing!) so the
-                                        // detached half never lands on the uncut original's own roof,
-                                        // then settle via Archimedes buoyancy (wood floats, stone sinks!).
-                                        let mut target_upper_tf = if was_upright {
-                                            let flen = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt();
-                                            let (fx, fz) = if flen > 1e-3 {
-                                                (dir[0] / flen, dir[2] / flen)
-                                            } else {
-                                                (-player.body.yaw.sin(), -player.body.yaw.cos())
-                                            };
-                                            let probe_x = orig_tf.pos[0] as f64 + (fx * upper_phys.world_span * 0.45) as f64;
-                                            let probe_z = orig_tf.pos[2] as f64 + (fz * upper_phys.world_span * 0.45) as f64;
-                                            let start_y = orig_tf.pos[1] as f64 + upper_phys.world_span as f64 + 1.0;
-                                            let ground_y = body::look(&mut ctx.world.0.region, [probe_x, start_y, probe_z], [0.0, -1.0, 0.0], psize, upper_phys.world_span * 2.0 + 10.0)
-                                                .ok()
-                                                .flatten()
-                                                .map_or(orig_tf.pos[1], |h| h[1] as f32);
-                                            toppled_transform(orig_tf, &upper_phys, [fx, fz], ground_y)
-                                        } else {
-                                            // Cross-cutting an already lying log/stone: nudge apart cleanly along cut normal.
-                                            let wn = orig_tf.local_to_world_dir(plane.normal);
-                                            let gap = (0.14 * upper.scale).max(0.01);
-                                            let shifted = [
-                                                orig_tf.pos[0] + wn[0] * gap,
-                                                orig_tf.pos[1] + wn[1] * gap,
-                                                orig_tf.pos[2] + wn[2] * gap,
-                                            ];
-                                            PlacementTransform::with_rot(shifted, orig_tf.rot, orig_tf.scale)
-                                        };
-                                        if let Ok(buoy) = compute_buoyancy(&upper_phys, target_upper_tf, &mut ctx.world.0.region, 0.0) {
-                                            match buoy {
-                                                BuoyancyState::Floating { target_y, .. } | BuoyancyState::Sinking { target_y, .. } => {
-                                                    target_upper_tf.pos[1] = target_y;
-                                                }
-                                                BuoyancyState::Dry { floor_y } => {
-                                                    let (min_y, _) = upper_phys.rotated_y_extents(target_upper_tf.rot, target_upper_tf.scale);
-                                                    target_upper_tf.pos[1] = floor_y - min_y - 0.02 * target_upper_tf.scale;
-                                                }
-                                            }
-                                        }
-
-                                        let mut upper_settled = upper.clone();
-                                        upper_settled.set_transform(target_upper_tf);
-
-                                        if was_upright {
-                                            ctx.world.0.falling.push(FallingElement {
-                                                id: upper_id,
-                                                from_pos: orig_tf.pos,
-                                                from_rot: orig_tf.rot,
-                                                to_pos: target_upper_tf.pos,
-                                                to_rot: target_upper_tf.rot,
-                                                scale: orig_tf.scale,
-                                                elapsed: 0.0,
-                                                duration: 0.48,
-                                            });
-                                        }
-                                        ctx.world.0.remove_placed(original.id);
-                                        let spawn_lower = ctx.world.0.spawn_placed(lower.clone(), Some(&mut player.body));
-                                        let spawn_upper = ctx.world.0.spawn_placed(if was_upright { upper.clone() } else { upper_settled.clone() }, Some(&mut player.body));
-                                        if spawn_lower.is_ok() && spawn_upper.is_ok() {
-                                            if was_upright && upper.is_promoted() {
-                                                // Show solid procedural mesh during the 0.48s fall so
-                                                // promoted carved trunks animate smoothly, then restore
-                                                // exact SDF + tunnel on settle!
-                                                ctx.world.0.show_solid_at(upper_id, orig_tf);
-                                            }
-                                            ctx.world.0.history.push(WorldAction::CutElement { original, lower, upper: upper_settled });
-                                            player.say(format!("chopped {elem_name} — press G to carry"));
-                                        } else {
-                                            ctx.world.0.falling.retain(|f| f.id != upper_id);
-                                        }
-                                    } else {
-                                        player.say("cut plane missed solid geometry — aim nearer the middle");
-                                    }
-                                }
-                            } else {
-                                player.say("too small to cut cleanly");
-                            }
-                        }
-                    }
-                }
-                }
+        match target_hit {
+            Some((id, hit, material)) => {
+                let tool = ctx.sculpt.tool;
+                ctx.apply(player, live::Action::Cut { id, hit, dir, tool, material });
             }
-        } else {
-            player.say("aim at a placed object within reach to chop (K)");
+            None => player.say("aim at a placed object within reach to chop (K)"),
         }
     }
 
-    // Grab / Carry / Rotate / Tilt / Place discrete procedural Scene objects (Step 8c: G key).
+}
+
+/// `G`: picks up what is aimed at; while carrying, turns, tilts, lays flat, sets down or puts back.
+fn carry_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
+    let Asking { keys, buttons, scroll, grabbed, ctrl, pivot, dir, psize, .. } = *a;
     if ctx.carry.is_carrying() {
         let reach = (psize * 12.0).max(ctx.carry.held.as_ref().map_or(0.0, |h| h.physics.world_span * 2.5));
         let aim = {
@@ -1045,17 +823,10 @@ fn look_and_ask(
         }
         if keys.just_pressed(KeyCode::KeyG) || (grabbed && buttons.just_pressed(MouseButton::Left)) {
             if let Some(target_aim) = ctx.carry.held.as_ref().and_then(|h| h.aim) {
-                let at = [target_aim[0] as f32, target_aim[1] as f32, target_aim[2] as f32];
-                if let Err(denial) = ctx.world.0.rules.check(&ctx.sculpt.player_id, &Action::PlaceElement { at, player_size: psize }) {
-                    player.say(denial.reason);
-                } else if let Some(name) = ctx.drop_carried_at(target_aim, &mut player, true) {
-                    player.say(format!("placed {name} down"));
-                }
+                ctx.drop_carried_at(target_aim, player);
             }
         } else if (grabbed && buttons.just_pressed(MouseButton::Right)) || keys.just_pressed(KeyCode::KeyX) {
-            if let Some(name) = ctx.cancel_carry() {
-                player.say(format!("returned {name}"));
-            }
+            ctx.cancel_carry(player, true);
         }
     } else if keys.just_pressed(KeyCode::KeyG) {
         ctx.sculpt.active = false;
@@ -1074,68 +845,50 @@ fn look_and_ask(
             (None, Some((b, _))) => Some(b),
             (None, None) => None,
         };
-        if let Some(id) = target_id {
-            ctx.world.0.finish_all_falls(Some(&mut player.body));
-            if let Some(pl) = ctx.world.0.find(id).cloned() {
-                if let Err(denial) = ctx.world.0.rules.check(
-                    &ctx.sculpt.player_id,
-                    &Action::CutOrCarry { at: pl.pos, author: pl.author.as_deref() },
-                ) {
-                    player.say(denial.reason);
-                } else {
-                let is_sdf = ctx.world.0.catalog.get(&pl.module).is_some_and(|e| e.is_sdf());
-                let name = ctx.world.0.catalog.get(&pl.module).map_or_else(|| format!("#{id}"), |e| e.name.clone());
-                let phys = ctx.world.0.physics_of(id);
-                if let Some(phys) = phys {
-                    match check_carry(&phys, is_sdf, psize) {
-                        CarryDecision::Blocked(reason) => player.say(reason),
-                        CarryDecision::Allowed { speed_factor } => {
-                            let orig_tf = pl.transform();
-                            let flat = CarriedItem::is_rot_horizontal(orig_tf.rot);
-                            let merged = ctx.world.0.runtime.local_scene_of(id).and_then(|sc| scene::build_merged_mesh(sc, false, false));
-                            let mesh_handle = merged.map_or_else(|| ctx.carry_assets.fallback.clone(), |(m, _)| ctx.meshes.add(m));
-                            ctx.world.0.take_held(id);
-                            ctx.carry.held = Some(CarriedItem {
-                                name: name.clone(),
-                                scale: pl.scale,
-                                physics: phys,
-                                original_tf: orig_tf,
-                                speed_factor,
-                                yaw: player.body.yaw,
-                                pitch: 0.0,
-                                flat,
-                                aim: None,
-                                mesh: mesh_handle,
-                            });
-                            player.say(format!(
-                                "carrying {name} ({}) — H flat, R/T turn, Wheel tilt, LMB/G place",
-                                format_mass(phys.world_mass_kg)
-                            ));
-                        }
+        match target_id {
+            Some(id) => {
+                if ctx.apply(player, live::Action::Grab { id }).is_done() {
+                    // How it is shown in hand, and aimed: the world holds it.
+                    let world = &ctx.world.0;
+                    if let (Some(pl), Some(phys)) = (world.find(id), world.physics_of(id)) {
+                        let orig_tf = pl.transform();
+                        let merged = world.runtime.local_scene_of(id).and_then(|sc| scene::build_merged_mesh(sc, false, false));
+                        let mesh = merged.map_or_else(|| ctx.carry_assets.fallback.clone(), |(m, _)| ctx.meshes.add(m));
+                        ctx.carry.held = Some(CarriedItem {
+                            name: world.element_name(id),
+                            scale: pl.scale,
+                            physics: phys,
+                            speed_factor: check_carry(&phys, false, psize).speed_factor(),
+                            yaw: player.body.yaw,
+                            pitch: 0.0,
+                            flat: CarriedItem::is_rot_horizontal(orig_tf.rot),
+                            aim: None,
+                            mesh,
+                        });
                     }
-                } else {
-                    player.say("rooted in terrain — sculpt with B");
-                }
                 }
             }
-        } else {
-            player.say("aim at a placed object within reach to grab (G)");
+            None => player.say("aim at a placed object within reach to grab (G)"),
         }
     }
 
-    // Undo / redo, across sculpting, promotion, placing, chopping and moving (the world's history).
+}
+
+/// Undo and redo; saving and loading the world.
+fn history_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
+    let Asking { keys, ctrl, tool_active, .. } = *a;
     if (tool_active || ctrl) && keys.just_pressed(KeyCode::KeyZ) {
-        let _ = ctx.cancel_carry();
-        ctx.apply(&mut player, live::Action::Undo);
+        ctx.cancel_carry(player, false);
+        ctx.apply(player, live::Action::Undo);
     }
     if (tool_active || ctrl) && keys.just_pressed(KeyCode::KeyY) {
-        let _ = ctx.cancel_carry();
-        ctx.apply(&mut player, live::Action::Redo);
+        ctx.cancel_carry(player, false);
+        ctx.apply(player, live::Action::Redo);
     }
 
     // Save / reload the whole world (areas, sculpting, water, rules, placed elements).
     if keys.just_pressed(KeyCode::F5) || (ctrl && keys.just_pressed(KeyCode::KeyS)) {
-        let _ = ctx.cancel_carry();
+        ctx.cancel_carry(player, false);
         let path = ctx.sculpt.save_path.clone();
         let world = &mut ctx.world.0;
         world.finish_all_falls(Some(&mut player.body));
@@ -1157,6 +910,167 @@ fn look_and_ask(
         player.say(msg);
     }
 
+}
+
+/// The mouse turns the view; the keys say where to go, and change size, sit, sculpt, place, or interact.
+#[allow(clippy::too_many_arguments)]
+fn look_and_ask(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    cursor: Query<&CursorOptions, With<PrimaryWindow>>,
+    tour: Option<Res<Tour>>,
+    mut player: ResMut<Player>,
+    mut ctx: EditCtx,
+) {
+    if tour.is_some() {
+        return;
+    }
+    ctx.world.0.tick_falling(time.delta_secs().min(0.1), &mut player.body);
+    ctx.world.0.sync_viewer_size(player.body.size);
+
+    let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
+    if grabbed && player.body.change.is_none() {
+        player.body.yaw -= motion.delta.x * 0.0025;
+        player.pitch = (player.pitch - motion.delta.y * 0.0025).clamp(-1.55, 1.55);
+    }
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
+    let dt = time.delta_secs().min(0.1);
+
+    // Cycle active material-aware tool (`C`: Workshop -> Saw -> Pickaxe -> Shovel -> Hands).
+    if !ctrl && keys.just_pressed(KeyCode::KeyC) {
+        ctx.sculpt.tool = ctx.sculpt.tool.next();
+        player.say(format!("tool: {}", ctx.sculpt.tool.name()));
+    }
+
+    // Handle active boat/raft piloting & passive floating buoyancy.
+    let piloting = ctx.world.0.piloting.is_some();
+    let boat_fwd = if piloting && !ctrl { held(KeyCode::KeyW) - held(KeyCode::KeyS) } else { 0.0 };
+    let boat_turn = if piloting { held(KeyCode::KeyA) - held(KeyCode::KeyD) } else { 0.0 };
+    if piloting && keys.just_pressed(KeyCode::Space) {
+        ctx.apply(&mut player, live::Action::Pilot { id: None });
+    } else if piloting && (boat_fwd != 0.0 || boat_turn != 0.0) {
+        ctx.apply(&mut player, live::Action::Steer { forward: boat_fwd, turn: boat_turn, dt });
+    }
+    ctx.world.0.animate(dt, &mut player.body);
+
+    let carry_speed = ctx.carry.speed_factor();
+    player.intent = if ctx.world.0.piloting.is_some() {
+        Intent::default()
+    } else {
+        Intent {
+            forward: if ctrl { 0.0 } else { (held(KeyCode::KeyW) - held(KeyCode::KeyS)) * carry_speed },
+            right: (held(KeyCode::KeyD) - held(KeyCode::KeyA)) * carry_speed,
+            run: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+            jump: keys.pressed(KeyCode::Space),
+        }
+    };
+
+    // If shrinking made the carried object exceed current size's carry capacity, set it down safely.
+    if let Some(item) = &ctx.carry.held
+        && !check_carry(&item.physics, false, player.body.size).is_allowed()
+    {
+        let fwd = Vec3::new(-player.body.yaw.sin(), 0.0, -player.body.yaw.cos());
+        let dist = (player.body.size * 1.5).max(item.physics.world_radius(item.scale) + player.body.size * 0.5) as f64;
+        let drop_pos = [
+            player.body.feet[0] + fwd.x as f64 * dist,
+            player.body.feet[1],
+            player.body.feet[2] + fwd.z as f64 * dist,
+        ];
+        let name = item.name.clone();
+        if ctx.drop_carried_at(drop_pos, &mut player) {
+            player.say(format!("{name} too heavy at this size — set down"));
+        }
+    }
+
+    if keys.just_pressed(KeyCode::KeyB) {
+        if ctx.carry.is_carrying() {
+            ctx.cancel_carry(&mut player, false);
+        }
+        ctx.sculpt.active = !ctx.sculpt.active;
+        ctx.sculpt.hold_timer = 0.0;
+        ctx.sculpt.last_stamp = None;
+        if ctx.sculpt.active {
+            ctx.place.active = false;
+            ctx.place.aim = None;
+            ctx.place.fitted = None;
+            player.say(format!("sculpt mode: {} / {}", ctx.sculpt.preset.name(), ctx.sculpt.material().name()));
+        } else {
+            ctx.sculpt.aim = None;
+            player.say("sculpt mode off");
+        }
+    }
+
+    if keys.just_pressed(KeyCode::KeyP) {
+        if ctx.carry.is_carrying() {
+            ctx.cancel_carry(&mut player, false);
+        }
+        ctx.place.active = !ctx.place.active;
+        ctx.place.fitted = None;
+        if ctx.place.active {
+            ctx.sculpt.active = false;
+            ctx.sculpt.aim = None;
+            if let Some(el) = ctx.place.current() {
+                let kind = if el.is_sdf() { "SDF" } else { "Scene" };
+                player.say(format!("place mode: {} [{kind}] (O fits an opening)", el.name));
+            } else {
+                player.say("place mode: no .wasm elements found (run ./elements/build.sh)");
+            }
+        } else {
+            ctx.place.aim = None;
+            player.say("place mode off");
+        }
+    }
+
+    if ctrl && keys.just_pressed(KeyCode::KeyR) {
+        let n = ctx.place.rescan(&mut ctx.world.0);
+        place::clear_preview_cache(&mut ctx.preview);
+        player.say(format!("rescanned elements: {n} available"));
+    }
+
+    let tool_active = ctx.sculpt.active || ctx.place.active || ctx.carry.is_carrying();
+    if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
+        if ctx.world.0.piloting.is_some() {
+            ctx.apply(&mut player, live::Action::Pilot { id: None });
+        } else if let Some(boat_id) = ctx.world.0.scene.standing_on_placed(player.body.feet, player.body.size)
+            && ctx.world.0.floating.contains_key(&boat_id)
+        {
+            if ctx.apply(&mut player, live::Action::Pilot { id: Some(boat_id) }).is_done() {
+                ctx.sculpt.active = false;
+                ctx.sculpt.aim = None;
+                ctx.place.active = false;
+                ctx.place.aim = None;
+            }
+        } else {
+            let at = player.body.feet.map(|c| c as f32);
+            if ctx.apply(&mut player, live::Action::Interact { at }).is_done() {
+                ctx.live.interact_pressed = true;
+            }
+        }
+    }
+    ctx.live.holding_use = keys.pressed(KeyCode::KeyF) || (!tool_active && buttons.pressed(MouseButton::Right));
+
+    // Helper closure for camera-pivot raycast collinear with the `+` crosshair.
+    let eye = player.eye.unwrap_or(player.body.eye());
+    let dir = player.looking().to_array();
+    let psize = player.body.size;
+    let pivot = if player.third {
+        let per = (psize / DRAWN_AS) as f64;
+        [eye[0], eye[1] + player.lift as f64 * per, eye[2]]
+    } else {
+        eye
+    };
+    let asking = Asking { keys: &keys, buttons: &buttons, scroll: &scroll, time: &time, grabbed, ctrl, pivot, dir, psize, tool_active };
+
+    measure_site(&mut ctx, &mut player, &asking);
+    sculpt_input(&mut ctx, &mut player, &asking);
+    place_input(&mut ctx, &mut player, &asking);
+    chop_input(&mut ctx, &mut player, &asking);
+    carry_input(&mut ctx, &mut player, &asking);
+    history_input(&mut ctx, &mut player, &asking);
     let size = player.body.change.map_or(player.body.size, |c| c.to);
     let [tiny, person, giant] = sizes();
     let to = if keys.just_pressed(KeyCode::Digit1) {

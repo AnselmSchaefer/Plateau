@@ -11,13 +11,16 @@
 //! new SDF snapshots with the chunks each makes stale, the placed elements' scene layers to make
 //! again, move, or take away, and what to tell the player. The engine knows nothing of Bevy.
 //!
-//! **Transitional (phase E, first slice):** chopping, carrying, piloting, falling and buoyancy are
-//! still driven from `play`, through the primitives here (`spawn_placed`, `relocate_placed`,
-//! `take_held`, `tick_buoyancy`, …), and are not yet logged; the next slice makes them actions.
+//! **What is logical and what is only shown.** Everything a save keeps changes only by an action:
+//! a fall is decided when the cut is made, and ends (`finish_all_falls`) before the next action
+//! whether or not it was seen to; an element settles on water at rest, unloaded. What only the
+//! player sees and stands on (the topple under way, bobbing, a rider's weight pressing a boat down)
+//! is `animate`d between actions and moves no saved transform, so a log replays without it.
 
 pub mod action;
 pub mod history;
 pub mod log;
+mod objects;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +35,7 @@ use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, Plac
 use crate::cut::ObjectPhysics;
 use crate::edit::{Edit, EditLog, Op, SavedTile, WorldSave};
 use crate::modules::{ModuleCheck, SavedModule, relative_to_root};
-use crate::physics::{BuoyancyState, compute_buoyancy, player_mass_kg, step_floating_move};
+use crate::physics::{BuoyancyState, compute_buoyancy, player_mass_kg};
 use crate::rules::RuleBook;
 use crate::scene::{Applied, Combined, SceneWorld, is_area_owner};
 use crate::water::{WaterLog, bounds_affect_chunk};
@@ -133,6 +136,13 @@ impl FallingElement {
     }
 }
 
+/// The element carried, and where it was picked up from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Held {
+    pub id: u32,
+    pub from: PlacementTransform,
+}
+
 /// A floating element's buoyancy, kept while nothing about it changes, so still boats ask nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct CachedBuoyancy {
@@ -172,12 +182,15 @@ pub struct World {
     /// The height of whoever the world is shown to, for elements' macro proxies.
     pub viewer_size: f32,
     /// The element carried, if any: out of the SDF and of collisions while it is.
-    pub held: Option<u32>,
+    pub held: Option<Held>,
     pub falling: Vec<FallingElement>,
     /// Elements floating, by id (ordered, so every machine walks them alike).
     pub floating: BTreeMap<u32, CachedBuoyancy>,
     pub piloting: Option<u32>,
+    /// Time for bobbing (shown only).
     pub float_time: f32,
+    /// Where floating elements are shown, bobbing about their rest (their height), by id.
+    shown: BTreeMap<u32, f32>,
     /// Modules opened although their bytes are not those the save recorded
     /// (`ModuleCheck::AcceptChanged`).
     pub changed_modules: Vec<String>,
@@ -247,6 +260,7 @@ impl World {
             floating: BTreeMap::new(),
             piloting: None,
             float_time: 0.0,
+            shown: BTreeMap::new(),
             changed_modules,
             composed_revision: 0,
             changes: Changes::default(),
@@ -294,6 +308,7 @@ impl World {
         self.held = None;
         self.falling.clear();
         self.floating.clear();
+        self.shown.clear();
         self.piloting = None;
         self.modules = saved.modules.clone();
         self.catalog.expect_hashes(&saved.modules, self.module_check);
@@ -417,7 +432,7 @@ impl World {
     pub fn commit(&mut self, inv: Invalidation) {
         let _span = info_span!("commit").entered();
         let mut exclude: Vec<u32> = self.falling.iter().map(|f| f.id).collect();
-        exclude.extend(self.held);
+        exclude.extend(self.held.map(|h| h.id));
         self.composed_revision += 1;
         let mut sdf_elements = Vec::new();
         for pl in &self.placed {
@@ -504,6 +519,7 @@ impl World {
     fn forget_motion(&mut self, id: u32) {
         self.falling.retain(|f| f.id != id);
         self.floating.remove(&id);
+        self.shown.remove(&id);
         if self.piloting == Some(id) {
             self.piloting = None;
         }
@@ -516,6 +532,7 @@ impl World {
         let old_tf = self.placed[pos].transform();
         let old_bounds = self.sdf_bounds_of(&self.placed[pos]);
         self.placed[pos].set_transform(tf);
+        self.shown.remove(&id);
         let scale = self.placed[pos].scale;
         let mid_fall = self.falling.iter().any(|f| f.id == id);
         let skip_solid = if mid_fall { false } else { self.runtime.should_skip_solid(id) };
@@ -538,6 +555,7 @@ impl World {
         let Some(pos) = self.index_of(id) else { return false };
         let old_tf = self.placed[pos].transform();
         self.placed[pos].set_transform(tf);
+        self.shown.remove(&id);
         if self.runtime.relocate_fast(id, tf, &mut self.scene) {
             self.changes.layers.push(LayerChange::Moved { owner: id, from: old_tf, to: tf });
             true
@@ -613,20 +631,25 @@ impl World {
 
     /// Picks the element `id` up: out of collisions, its layer away, out of the SDF.
     pub fn take_held(&mut self, id: u32) {
-        let sdf_bounds = self.find(id).and_then(|pl| self.sdf_bounds_of(pl));
-        let tf = self.find(id).map(PlacedElement::transform);
+        let Some(pl) = self.find(id).cloned() else { return };
+        let sdf_bounds = self.sdf_bounds_of(&pl);
         self.runtime.set_held(id, true, &mut self.scene);
         self.changes.layers.push(LayerChange::Despawn { owner: id });
-        self.held = Some(id);
-        if let (Some(bounds), Some(tf)) = (sdf_bounds, tf) {
-            self.commit(Invalidation::element(tf, bounds));
+        self.held = Some(Held { id, from: pl.transform() });
+        self.floating.remove(&id);
+        self.shown.remove(&id);
+        if self.piloting == Some(id) {
+            self.piloting = None;
+        }
+        if let Some(bounds) = sdf_bounds {
+            self.commit(Invalidation::element(pl.transform(), bounds));
         }
     }
 
     /// Sets the element carried down at `tf`: back in collisions and the SDF, settled on water;
-    /// `undo_from`, if given, records the move for undo; `body`, if given, lifted out of it.
-    pub fn release_held(&mut self, tf: PlacementTransform, undo_from: Option<PlacementTransform>, body: Option<&mut Body>) -> Option<u32> {
-        let id = self.held.take()?;
+    /// the move recorded for undo if `undoable`; `body`, if given, lifted out of it.
+    pub fn release_held(&mut self, tf: PlacementTransform, undoable: bool, body: Option<&mut Body>) -> Option<u32> {
+        let Held { id, from } = self.held.take()?;
         let sdf_bounds = self.find(id).and_then(|pl| self.sdf_bounds_of(pl));
         let scale = self.find(id).map_or(1.0, |pl| pl.scale);
         if let Some(pos) = self.index_of(id) {
@@ -639,11 +662,11 @@ impl World {
         }
         let _ = self.settle_buoyancy_for(id, 0.0);
         if let Some(bounds) = sdf_bounds {
-            self.commit(Invalidation::element(tf, bounds));
+            self.commit(Invalidation::Some { edits: Vec::new(), bounds: vec![(from, bounds), (tf, bounds)], water: None });
         }
         self.dirty = true;
-        if let Some(before) = undo_from {
-            self.history.push(WorldAction::RelocateElement { id, before, after: tf });
+        if undoable {
+            self.history.push(WorldAction::RelocateElement { id, before: from, after: tf });
         }
         if let Some(body) = body {
             let max_lift = (scale * 3.0) as f64 + body.size as f64;
@@ -665,6 +688,7 @@ impl World {
         let pending = std::mem::take(&mut self.falling);
         for fall in pending {
             self.relocate_placed(fall.id, fall.end(), None);
+            let _ = self.settle_buoyancy_for(fall.id, 0.0);
         }
         if let Some(body) = body {
             let max_lift = body.size as f64 * 3.0;
@@ -748,121 +772,65 @@ impl World {
         }
     }
 
-    /// Bobbing, a rider's weight, and paddling (`forward_in`, `turn_in` from -1 to 1) for `dt`;
-    /// `body` is the player, carried along with a boat they pilot or stand on.
-    pub fn tick_buoyancy(&mut self, dt: f32, forward_in: f32, turn_in: f32, body: &mut Body) {
+    /// What is only shown, for `dt`: floating elements bobbing about their rest, a rider's weight
+    /// pressing a boat down (or under), and `body` carried up and down with what it stands on. No
+    /// saved transform moves.
+    pub fn animate(&mut self, dt: f32, body: &mut Body) {
+        let _span = info_span!("animate").entered();
         self.float_time += dt;
-        let standing_id = self.scene.standing_on_placed(body.feet, body.size);
+        let standing = self.scene.standing_on_placed(body.feet, body.size);
         let rider_kg = player_mass_kg(body.size);
         let world_rev = self.world_rev();
-
-        // Piloting (`F` aboard a floating boat or log).
-        if let Some(boat_id) = self.piloting {
-            let (still_exists, phys) = (self.index_of(boat_id), self.runtime.physics_of(boat_id));
-            if let (Some(pos), Some(phys)) = (still_exists, phys) {
-                let old_tf = self.placed[pos].transform();
-                let speed = forward_in * (2.8 * old_tf.scale.max(0.01));
-                let turn_rate = turn_in * 1.65;
-                let moving = speed.abs() > 1e-4 || turn_rate.abs() > 1e-4;
-                let cached = self.floating.get(&boat_id).copied();
-                let cache_valid = !moving && cached.is_some_and(|c| c.world_rev == world_rev && (c.rider_kg - rider_kg).abs() <= 1e-2);
-                let stepped = if let (true, Some(c)) = (cache_valid, cached) {
-                    let mut next_tf = old_tf;
-                    if let BuoyancyState::Floating { target_y, bob_amplitude, .. } = c.state {
-                        next_tf.pos[1] = target_y + math::sin(self.float_time * 2.2) * bob_amplitude;
-                    }
-                    Ok((next_tf, c.state))
-                } else {
-                    step_floating_move(&phys, old_tf, speed, turn_rate, dt, &mut self.region, rider_kg, self.float_time)
-                };
-                if let Ok((new_tf, buoy)) = stepped {
-                    if let BuoyancyState::Sinking { .. } = buoy {
-                        self.piloting = None;
-                        self.floating.remove(&boat_id);
-                        self.relocate_placed_fast(boat_id, new_tf);
-                        let name = self.element_name(boat_id);
-                        self.say(format!("too heavy — {name} is sinking!"));
-                        return;
-                    }
-                    self.floating.insert(boat_id, CachedBuoyancy { state: buoy, world_rev, rider_kg });
-                    let dyaw = turn_rate * dt;
-                    let d = [0, 1, 2].map(|a| (new_tf.pos[a] - old_tf.pos[a]) as f64);
-                    let rx = body.feet[0] - old_tf.pos[0] as f64;
-                    let rz = body.feet[2] - old_tf.pos[2] as f64;
-                    let (s, c) = (math::sin(dyaw) as f64, math::cos(dyaw) as f64);
-                    body.feet[0] = old_tf.pos[0] as f64 + (rx * c + rz * s) + d[0];
-                    body.feet[1] += d[1];
-                    body.feet[2] = old_tf.pos[2] as f64 + (-rx * s + rz * c) + d[2];
-                    body.yaw += dyaw;
-                    self.relocate_placed_fast(boat_id, new_tf);
-                    if moving {
-                        self.dirty = true;
-                    }
-                }
-            } else {
-                self.piloting = None;
-            }
-        }
-
-        // Bobbing and a rider's draft for floating elements not piloted.
-        let mut active: Vec<u32> = self.floating.keys().copied().collect();
-        if let Some(sid) = standing_id
-            && !active.contains(&sid)
+        let mut ids: Vec<u32> = self.floating.keys().copied().collect();
+        if let Some(sid) = standing
+            && !ids.contains(&sid)
         {
-            active.push(sid);
+            ids.push(sid);
         }
-        for id in active {
-            if self.piloting == Some(id) || self.held == Some(id) || self.falling.iter().any(|f| f.id == id) {
+        for id in ids {
+            if self.held.is_some_and(|h| h.id == id) || self.falling.iter().any(|f| f.id == id) {
                 continue;
             }
-            let Some(pos) = self.index_of(id) else {
+            let Some(pl) = self.find(id).cloned() else {
                 self.floating.remove(&id);
+                self.shown.remove(&id);
                 continue;
             };
-            if self.placed[pos].is_promoted() {
-                self.floating.remove(&id);
+            if pl.is_promoted() {
                 continue;
             }
             let Some(phys) = self.runtime.physics_of(id) else { continue };
             if phys.rooted {
-                self.floating.remove(&id);
                 continue;
             }
-            let old_tf = self.placed[pos].transform();
-            let load = if standing_id == Some(id) { rider_kg } else { 0.0 };
+            let rest = pl.transform();
+            let load = if standing == Some(id) { rider_kg } else { 0.0 };
             let buoy = match self.floating.get(&id).copied() {
                 Some(c) if c.world_rev == world_rev && (c.rider_kg - load).abs() <= 1e-2 => Some(c.state),
-                _ => compute_buoyancy(&phys, old_tf, &mut self.region, load).ok(),
+                _ => compute_buoyancy(&phys, rest, &mut self.region, load).ok(),
             };
             let Some(buoy) = buoy else { continue };
-            let next_y = match buoy {
+            let (desired, rate) = match buoy {
                 BuoyancyState::Floating { target_y, bob_amplitude, .. } => {
                     self.floating.insert(id, CachedBuoyancy { state: buoy, world_rev, rider_kg: load });
-                    let phase = self.float_time * 2.2 + id as f32 * 1.13;
-                    let desired_y = target_y + math::sin(phase) * bob_amplitude;
-                    Some(old_tf.pos[1] + (desired_y - old_tf.pos[1]) * (dt * 6.0).min(1.0))
+                    (target_y + math::sin(self.float_time * 2.2 + id as f32 * 1.13) * bob_amplitude, 6.0)
                 }
-                BuoyancyState::Sinking { target_y, .. } => {
-                    let next_y = old_tf.pos[1] + (target_y - old_tf.pos[1]) * (dt * 4.0).min(1.0);
-                    if (next_y - old_tf.pos[1]).abs() <= 1e-4 && load == 0.0 {
-                        self.floating.remove(&id);
-                    }
-                    Some(next_y)
-                }
-                BuoyancyState::Dry { .. } => {
-                    self.floating.remove(&id);
-                    None
-                }
+                BuoyancyState::Sinking { target_y, .. } => (target_y, 4.0),
+                BuoyancyState::Dry { .. } => (rest.pos[1], 6.0),
             };
-            if let Some(next_y) = next_y
-                && (next_y - old_tf.pos[1]).abs() > 1e-4
-            {
-                let mut tf = old_tf;
-                tf.pos[1] = next_y;
-                self.relocate_placed_fast(id, tf);
-                if standing_id == Some(id) {
-                    body.feet[1] += (next_y - old_tf.pos[1]) as f64;
-                }
+            let shown = self.shown.get(&id).copied().unwrap_or(rest.pos[1]);
+            let next = shown + (desired - shown) * (dt * rate).min(1.0);
+            if (next - shown).abs() <= 1e-5 {
+                continue;
+            }
+            let mut tf = rest;
+            tf.pos[1] = next;
+            if self.runtime.relocate_fast(id, tf, &mut self.scene) {
+                self.changes.layers.push(LayerChange::Moved { owner: id, from: rest, to: tf });
+            }
+            self.shown.insert(id, next);
+            if standing == Some(id) {
+                body.feet[1] += (next - shown) as f64;
             }
         }
     }
@@ -870,6 +838,7 @@ impl World {
     /// The areas' and elements' `tick` for `dt`, with the player as `ps` looking at `(hit_owner,
     /// hit_id)`.
     pub fn tick(&mut self, dt: f32, ps: &PlayerState, hit_owner: u32, hit_id: u32) -> Vec<Applied> {
+        let _span = info_span!("tick").entered();
         let mut effects = self.region.region.tick_all(dt, ps, hit_owner, hit_id, &mut self.scene);
         effects.extend(self.runtime.tick_all(dt, ps, hit_owner, hit_id, &mut self.scene));
         effects

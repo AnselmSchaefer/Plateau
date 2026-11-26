@@ -24,6 +24,8 @@ serde_json = "1.0.154"
 tracing = "0.1.44"
 
 [dev-dependencies]
+# A subscriber written in the tests, to see spans are there and change nothing (phase E).
+tracing = "0.1.44"
 # The areas of `areas/` played natively: what their modules must answer as.
 areas-played = { path = "../areas/played" }
 plateau-sdk = { path = "../sdk" }

@@ -46,6 +46,21 @@ pub enum Action {
     Place { module: String, pos: [f32; 3], yaw: f32, rot: Option<[f32; 4]>, scale: f32, fitted: bool },
     /// The placed element `id` taken away.
     Remove { id: u32 },
+    /// The placed element `id` chopped where `hit` is, with `tool`, which found `material` there;
+    /// what stood upright topples away along `dir`.
+    Cut { id: u32, hit: [f32; 3], dir: [f32; 3], tool: Tool, material: Option<Material> },
+    /// The placed element `id` picked up.
+    Grab { id: u32 },
+    /// What is carried set down at `pos`, turned by `rot`.
+    Drop { pos: [f32; 3], rot: [f32; 4] },
+    /// What is carried put back where it was picked up.
+    Return,
+    /// The helm of the floating element `id` taken, or let go (`None`).
+    Pilot { id: Option<u32> },
+    /// What is piloted paddled for `dt` seconds, `forward` and `turn` from -1 to 1.
+    Steer { forward: f32, turn: f32, dt: f32 },
+    /// `F` on what is at `at`: allowed or not (what it does is the element's own, not the world's).
+    Interact { at: [f32; 3] },
     Undo,
     Redo,
 }
@@ -56,6 +71,13 @@ impl Action {
             Action::Sculpt { .. } => "sculpt",
             Action::Place { .. } => "place",
             Action::Remove { .. } => "remove",
+            Action::Cut { .. } => "cut",
+            Action::Grab { .. } => "grab",
+            Action::Drop { .. } => "drop",
+            Action::Return => "return",
+            Action::Pilot { .. } => "pilot",
+            Action::Steer { .. } => "steer",
+            Action::Interact { .. } => "interact",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -110,6 +132,9 @@ impl World {
     /// and followed by what it entails. Written to the action log if one is open.
     pub fn apply(&mut self, mut actor: Actor<'_>, action: Action) -> Outcome {
         let _span = info_span!("apply", action = action.name()).entered();
+        // A topple under way has ended by the time anything else is done, seen or not: so a world
+        // replayed without frames between its actions is the world that was played.
+        self.finish_all_falls(None);
         let before = self.composed().revision();
         let feet = actor.body.feet;
         let size = actor.body.size;
@@ -119,6 +144,13 @@ impl World {
             Action::Sculpt { edit, hit, tool, target } => self.sculpt(&mut actor, *edit, *hit, *tool, *target),
             Action::Place { module, pos, yaw, rot, scale, fitted } => self.place(&mut actor, module, *pos, *yaw, *rot, *scale, *fitted),
             Action::Remove { id } => self.remove(&actor, *id),
+            Action::Cut { id, hit, dir, tool, material } => self.cut(&mut actor, *id, *hit, *dir, *tool, *material),
+            Action::Grab { id } => self.grab(&mut actor, *id),
+            Action::Drop { pos, rot } => self.drop_held(&mut actor, *pos, *rot),
+            Action::Return => self.return_held(),
+            Action::Pilot { id } => self.pilot(*id),
+            Action::Steer { forward, turn, dt } => self.steer(&mut actor, *forward, *turn, *dt),
+            Action::Interact { at } => self.may_interact(&actor, *at),
             Action::Undo => self.undo(actor.body),
             Action::Redo => self.redo(&mut actor),
         };

@@ -31,7 +31,7 @@ Keep a clean split between the two geometric representations so carving and port
 
 ## 4. Reference & Useful Commands
 
-- Architecture overview diagram: `docs/architecture.html` and `docs/architecture.png`
+- Architecture: `ARCHITECTURE.md` (crates, the two layers, how a change is made, glossary), the module map `docs/MODULES.md` (made from the code by `engine/tests/docs.rs`; `PLATEAU_KEEP=1` to write it again), and the diagram `docs/architecture.html` / `docs/architecture.png`
 - Concept & roadmap: `CONCEPT.md`, `POC_PLAN.md`
 - Current plan (phases D–K: `World::apply` + action log, world graph, support & falling, materials & tools, parametric elements, brick cache, inspector): `WORLD_PLAN.md`
 - Claude authoring guide: `make/GUIDE.md`

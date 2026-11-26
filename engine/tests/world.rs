@@ -204,3 +204,121 @@ fn a_saved_world_opens_again_as_it_was() {
     assert_eq!((edits, elements), (2, 1));
     assert_eq!(sampled(&mut world, LAWN, PERSON), sampled(&mut again, LAWN, PERSON));
 }
+
+/// The showcase's later half: the tree with a tiny's home in it is chopped, the trunk carried and
+/// laid flat as a bridge, stood on; moving it is undone and redone; and the whole session's log
+/// replays onto where it began.
+#[test]
+fn a_chopped_trunk_is_carried_and_laid_as_a_bridge_and_the_session_replays() {
+    use plateau_engine::compose::euler_quat;
+    use plateau_engine::cut::placement_pos_for_aim;
+
+    let dir = scratch("bridge");
+    let log_path = dir.join("session.jsonl");
+    let start = garden_save();
+    let mut world = open(start.clone());
+    world.set_log(Some(ActionLog::create(&log_path).unwrap()));
+    let mut body = person(&mut world);
+
+    let tree = place_tree(&mut world, &mut body);
+    let (home, hit) = trunk_carve(&world, tree);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: home, hit, tool: Tool::Saw, target: SculptTarget::Element(tree) }).is_done());
+
+    // A shovel does not chop a tree; a saw does, and the top topples east.
+    let pos = world.find(tree).unwrap().pos;
+    let chop_at = [pos[0], pos[1] + 0.9, pos[2]];
+    let cut = |tool| Action::Cut { id: tree, hit: chop_at, dir: [1.0, 0.0, 0.0], tool, material: Some(Material::Wood) };
+    assert!(matches!(act(&mut world, &mut body, cut(Tool::Shovel)), Outcome::Denied(_)));
+    let trunk = match act(&mut world, &mut body, cut(Tool::Saw)) {
+        Outcome::Done(s) => s.added[0],
+        other => panic!("not chopped: {other:?}"),
+    };
+    assert_eq!(world.placed.len(), 2);
+    assert_eq!(world.falling.len(), 1, "the top is toppling");
+    let stump = world.find(tree).unwrap().clone();
+    assert_eq!(stump.clips.len(), 1);
+
+    // Picked up (the fall ends first), carried, and laid flat across the lawn to the west.
+    assert!(act(&mut world, &mut body, Action::Grab { id: trunk }).is_done(), "a person carries the trunk");
+    assert!(world.falling.is_empty());
+    assert_eq!(world.held.map(|h| h.id), Some(trunk));
+    let picked_from = world.held.unwrap().from;
+    let phys = world.physics_of(trunk).unwrap();
+    let rot = euler_quat(0.0, std::f32::consts::FRAC_PI_2, 0.0);
+    let lawn_y = Body::standing(&mut world.combined(), [LAWN[0] as f64 - 8.0, 40.0, LAWN[2] as f64 - 4.0], PERSON).unwrap().feet[1];
+    let aim = [LAWN[0] - 8.0, lawn_y as f32, LAWN[2] - 4.0];
+    let at = placement_pos_for_aim(&phys, aim, rot, 1.0);
+    assert!(act(&mut world, &mut body, Action::Drop { pos: at, rot }).is_done());
+    assert!(world.held.is_none());
+    let laid = world.find(trunk).unwrap().transform();
+    let up = plateau_engine::compose::quat_rotate(laid.rot, [0.0, 1.0, 0.0]);
+    assert!(up[1].abs() < 1e-3, "laid flat: its up is {up:?}");
+
+    // Stood on: it holds a person up off the lawn, and the tiny's home went with it.
+    let on_it = Body::standing(&mut world.combined(), [aim[0] as f64, 40.0, aim[2] as f64], PERSON).unwrap();
+    assert!(on_it.feet[1] > lawn_y + 0.05, "standing on the laid trunk: {} over a lawn at {lawn_y}", on_it.feet[1]);
+    assert_eq!(world.find(trunk).unwrap().local_edits.len(), 1);
+
+    // Moving it is undone and redone.
+    assert!(act(&mut world, &mut body, Action::Undo).is_done());
+    assert_eq!(world.find(trunk).unwrap().transform(), picked_from);
+    assert!(act(&mut world, &mut body, Action::Redo).is_done());
+    assert_eq!(world.find(trunk).unwrap().transform(), laid);
+    world.set_log(None);
+
+    let log = ActionLog::read(&log_path).unwrap();
+    let names: Vec<&str> = log.iter().map(|l| l.action.name()).collect();
+    assert_eq!(names, ["place", "sculpt", "cut", "cut", "grab", "drop", "undo", "redo"]);
+    let mut replayed = open(start);
+    replay(&mut replayed, &log).unwrap();
+    assert_eq!(replayed.to_save().to_text(), world.to_save().to_text());
+    for size in [TINY, PERSON] {
+        assert_eq!(sampled(&mut replayed, aim, size), sampled(&mut world, aim, size));
+    }
+}
+
+/// A boat floats where it is put on the pond, is paddled east, let go, and the paddling replays.
+#[test]
+fn a_boat_is_paddled_across_the_pond_and_the_paddling_replays() {
+    let dir = scratch("boat");
+    let log_path = dir.join("session.jsonl");
+    let start = garden_save();
+    let mut world = open(start.clone());
+    world.set_log(Some(ActionLog::create(&log_path).unwrap()));
+    let mut body = person(&mut world);
+
+    let boat = match act(&mut world, &mut body, Action::Place {
+        module: "elements/modules/boat.wasm".into(),
+        pos: [24.0, -0.3, 36.0],
+        yaw: -std::f32::consts::FRAC_PI_2,
+        rot: None,
+        scale: 1.0,
+        fitted: false,
+    }) {
+        Outcome::Done(s) => s.added[0],
+        other => panic!("no boat: {other:?}"),
+    };
+    assert!(world.floating.contains_key(&boat), "the boat floats");
+    let rest = world.find(boat).unwrap().pos;
+
+    // Bobbing is only shown: the boat's saved place does not move.
+    for _ in 0..30 {
+        world.animate(1.0 / 30.0, &mut body);
+    }
+    assert_eq!(world.find(boat).unwrap().pos, rest);
+
+    assert!(matches!(act(&mut world, &mut body, Action::Steer { forward: 1.0, turn: 0.0, dt: 0.1 }), Outcome::Denied(_)), "not at the helm yet");
+    assert!(act(&mut world, &mut body, Action::Pilot { id: Some(boat) }).is_done());
+    for _ in 0..15 {
+        act(&mut world, &mut body, Action::Steer { forward: 1.0, turn: 0.2, dt: 1.0 / 30.0 });
+    }
+    assert!(act(&mut world, &mut body, Action::Pilot { id: None }).is_done());
+    let moved = world.find(boat).unwrap().pos;
+    assert!(moved[0] > rest[0] + 0.5, "paddled east: {rest:?} → {moved:?}");
+    world.set_log(None);
+
+    let log = ActionLog::read(&log_path).unwrap();
+    let mut replayed = open(start);
+    replay(&mut replayed, &log).unwrap();
+    assert_eq!(replayed.to_save().to_text(), world.to_save().to_text());
+}

@@ -30,7 +30,6 @@ pub struct CarriedItem {
     pub name: String,
     pub scale: f32,
     pub physics: ObjectPhysics,
-    pub original_tf: PlacementTransform,
     pub speed_factor: f32,
     pub yaw: f32,
     pub pitch: f32,

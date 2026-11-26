@@ -141,6 +141,7 @@ impl Default for Making {
 
 /// The chunk `key` of `area`, made as `Making::default()`.
 pub fn make(area: &mut dyn Region, key: Key) -> Result<Made> {
+    let _span = tracing::info_span!("chunk", level = key.level).entered();
     make_with(area, key, Making::default())
 }
 

@@ -156,11 +156,31 @@ its save bit for bit, and its chunk hashes are the same with tracing on and off.
   a cave, undo, redo) through `apply` alone; refusals by tool and rule book; a log replayed onto
   its starting save gives the same save text and the same samples; save and reload.
 
-Left for slice 2: chopping, grabbing and setting down, piloting, falling and bobbing are still
-driven from `play` (through `World`'s primitives) and are not yet actions, so a log of a session
-that chops or carries does not replay yet; `play` still has four `rules.check`s (those verbs) and
-the tool check for `K`. The Chrome trace export (`--trace`), the showcase's later half (chop, carry,
-bridge, walk across) in `world.rs`, `ARCHITECTURE.md` and its generated module map.
+*Slice 2 done 2026-11-26 (played by the tour, not yet by hand), and with it phase E:*
+
+- Actions for objects (`engine/src/live/objects.rs`): `Cut` (rule book, tool and size checked, the
+  cut plane, the topple decided and its rest found on terrain and water), `Grab`, `Drop`, `Return`,
+  `Pilot`, `Steer`, `Interact`. `play` has no rule or tool check left.
+- **Logical and shown, apart**: a topple is decided at the cut and ends before the next action
+  (`finish_all_falls` at the start of `apply`), seen or not; elements settle unloaded; bobbing and
+  a rider's weight are `World::animate`d and move no saved transform. So a session's log replays
+  with no frames between its actions.
+- `play --trace trace.json`: the engine's spans (`apply` and its stages, chunks made, `tick`) as
+  Chrome trace events, through a layer of Bevy's own subscriber (`play/src/trace.rs`); the tour
+  runs as fast with it.
+- `look_and_ask` 195 lines: each mode its own handler (`measure_site`, `sculpt_input`,
+  `place_input`, `chop_input`, `carry_input`, `history_input`); `main.rs` 2615 → ~1580 lines.
+- `ARCHITECTURE.md` (crates, the two layers, how a change is made, words) and `docs/MODULES.md`,
+  made from the code by `engine/tests/docs.rs` (each module's first sentence and what it uses,
+  across crates), failing while stale.
+- Tests: `engine/tests/world.rs` (6): the whole showcase (a tree placed, a tiny's home carved in
+  it, chopped, the trunk carried and laid flat as a bridge, stood on, the move undone and redone,
+  the session's log replayed to the same save and samples), a boat paddled across the pond and
+  replayed; `engine/tests/tracing.rs`: the same session traced and not gives the same world, and
+  the spans are there (alone in its binary: tracing's interest is process-wide).
+
+Short of the done-when: walking across the laid bridge is checked by standing on it at a person's
+size, not walked at each size; nothing yet played by hand.
 
 ### F. A world graph (one week)
 
