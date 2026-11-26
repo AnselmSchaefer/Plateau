@@ -136,6 +136,32 @@ lay it down as a bridge, walk across it at each size, save, reload, same chunk h
 check; `look_and_ask` is under 300 lines; the game plays as before; the showcase's log replays to
 its save bit for bit, and its chunk hashes are the same with tracing on and off.
 
+*Slice 1 done 2026-11-26 (played by the tour, not yet by hand):*
+
+- `engine/src/live/`: `World` owns the areas, the sculpting, water, rules, placed elements, their
+  runtimes and scenes, the history (`WorldAction`, moved from `play`), and what is falling, floating,
+  carried or piloted (by id, ordered, so every machine walks them alike). `World::open` checks every
+  module the save names; `save` seals; `reload` checks before it replaces anything.
+- `World::apply` for `Sculpt` (terrain or a placed element, the tool checked at the aimed point,
+  the rule book, water flooding a carve, promotion, the same stamp dropped), `Place`, `Remove`,
+  `Undo`, `Redo`: `Outcome::Done(Summary)`, `Denied(reason)` or `Unchanged`.
+- The window learns what changed from `World::take_changes`: SDF snapshots with the chunks they make
+  stale (`Invalidation`, owned, replacing `play`'s), elements' layers to make, move or take away,
+  and words for the player. `play` keeps only input, aiming, ghosts and the carried item's look:
+  `main.rs` 2615 → 1696 lines, `look_and_ask` ~1170 → 781.
+- The action log: `--log <file>.jsonl`, `plateau-log 1`, one line an action with its player, outcome
+  and revisions; `live::replay` applies a log and checks every outcome; `tracing` spans round
+  `apply`, the rule and tool checks, promotion, water and commits.
+- Tests: `engine/tests/world.rs` (4): the showcase's opening (place, hill, a tiny home in the trunk,
+  a cave, undo, redo) through `apply` alone; refusals by tool and rule book; a log replayed onto
+  its starting save gives the same save text and the same samples; save and reload.
+
+Left for slice 2: chopping, grabbing and setting down, piloting, falling and bobbing are still
+driven from `play` (through `World`'s primitives) and are not yet actions, so a log of a session
+that chops or carries does not replay yet; `play` still has four `rules.check`s (those verbs) and
+the tool check for `K`. The Chrome trace export (`--trace`), the showcase's later half (chop, carry,
+bridge, walk across) in `world.rs`, `ARCHITECTURE.md` and its generated module map.
+
 ### F. A world graph (one week)
 
 Objects know what they come from, rest on, belong to, and fill.

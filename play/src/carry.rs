@@ -12,9 +12,8 @@
 //! - **`RMB` or `X`**: cancel carry and return object to where it was picked up
 
 use bevy::prelude::*;
-use plateau_engine::compose::{PlacementTransform, euler_quat, quat_normalize, quat_rotate};
+use plateau_engine::compose::{PlacementTransform, euler_quat, quat_rotate};
 use plateau_engine::cut::{ObjectPhysics, placement_pos_for_aim};
-use plateau_engine::physics::BuoyancyState;
 
 use crate::surface::SurfaceMaterial;
 
@@ -28,7 +27,6 @@ pub struct CarryGhost;
 
 /// Active object currently carried by the player.
 pub struct CarriedItem {
-    pub id: u32,
     pub name: String,
     pub scale: f32,
     pub physics: ObjectPhysics,
@@ -63,54 +61,11 @@ impl CarriedItem {
     }
 }
 
-/// Smooth gravity-eased topple animation for a newly chopped standing element.
-pub struct FallingElement {
-    pub id: u32,
-    pub from_pos: [f32; 3],
-    pub from_rot: [f32; 4],
-    pub to_pos: [f32; 3],
-    pub to_rot: [f32; 4],
-    pub scale: f32,
-    pub elapsed: f32,
-    pub duration: f32,
-}
-
-impl FallingElement {
-    pub fn sample(&self) -> PlacementTransform {
-        let u = (self.elapsed / self.duration.max(1e-3)).clamp(0.0, 1.0);
-        // Quadratic ease-in simulates accelerating gravity tip-over.
-        let t = u * u;
-        let pos = [
-            self.from_pos[0] + (self.to_pos[0] - self.from_pos[0]) * t,
-            self.from_pos[1] + (self.to_pos[1] - self.from_pos[1]) * t,
-            self.from_pos[2] + (self.to_pos[2] - self.from_pos[2]) * t,
-        ];
-        let rot = nlerp_quat(self.from_rot, self.to_rot, t);
-        PlacementTransform::with_rot(pos, rot, self.scale)
-    }
-}
-
-/// Cached Archimedes buoyancy result for an idling/bobbing floating element so stationary boats
-/// make zero WASM `sample()` calls per frame until world revision, rider weight, or XZ changes.
-#[derive(Clone, Copy, Debug)]
-pub struct CachedBuoyancy {
-    pub state: BuoyancyState,
-    pub world_rev: u64,
-    pub rider_kg: f32,
-}
-
-/// Runtime resource holding the currently carried item (if any), active topple animations,
-/// floating/sinking water-tracked elements, and active boat/raft piloting state.
+/// The carrying the player is doing: the item in hand, as it is shown and aimed. Where things fall,
+/// float, and are piloted is the world's (`plateau_engine::live::World`).
 #[derive(Resource, Default)]
 pub struct CarryState {
     pub held: Option<CarriedItem>,
-    pub falling: Vec<FallingElement>,
-    /// Placed element IDs currently floating in water with cached buoyancy state.
-    pub floating: std::collections::HashMap<u32, CachedBuoyancy>,
-    /// Placed element ID currently being paddled/steered by the player (`F` while aboard).
-    pub piloting: Option<u32>,
-    /// Elapsed simulation time for smooth deterministic water bobbing.
-    pub float_time: f32,
 }
 
 impl CarryState {
@@ -118,24 +73,8 @@ impl CarryState {
         self.held.is_some()
     }
 
-    pub fn is_piloting(&self) -> bool {
-        self.piloting.is_some()
-    }
-
     pub fn speed_factor(&self) -> f32 {
         self.held.as_ref().map_or(1.0, |h| h.speed_factor)
-    }
-
-    pub fn cancel_fall(&mut self, id: u32) {
-        self.falling.retain(|f| f.id != id);
-    }
-
-    pub fn forget_element(&mut self, id: u32) {
-        self.cancel_fall(id);
-        self.floating.remove(&id);
-        if self.piloting == Some(id) {
-            self.piloting = None;
-        }
     }
 }
 
@@ -241,13 +180,3 @@ pub fn sync_visuals(
     }
 }
 
-fn nlerp_quat(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-    let s = if dot < 0.0 { -1.0 } else { 1.0 };
-    quat_normalize([
-        a[0] + (b[0] * s - a[0]) * t,
-        a[1] + (b[1] * s - a[1]) * t,
-        a[2] + (b[2] * s - a[2]) * t,
-        a[3] + (b[3] * s - a[3]) * t,
-    ])
-}

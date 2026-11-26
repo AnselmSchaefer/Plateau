@@ -16,6 +16,12 @@ wasmparser = { version = "0.263.0", default-features = false, features = ["std",
 png = "0.18.1"
 # A save names each module it was made of by its bytes' hash (WORLD_PLAN.md, phase D).
 sha2 = "0.10.9"
+# The action log (WORLD_PLAN.md, phase E): one JSON line an action; f32s written shortest and read
+# back to the same bits.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Spans round the stages an action passes through, for traces (phase E) and the inspector (K).
+tracing = "0.1.44"
 
 [dev-dependencies]
 # The areas of `areas/` played natively: what their modules must answer as.

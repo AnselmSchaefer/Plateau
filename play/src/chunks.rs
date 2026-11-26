@@ -14,47 +14,15 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use plateau_engine::atlas::{Atlas, CompiledAtlas};
 use plateau_engine::chunk::{self, Key, Made};
-use plateau_engine::compose::{Composed, ComposedLog, PlacementTransform};
-use plateau_engine::edit::Edit;
+use plateau_engine::compose::{Composed, ComposedLog};
+use plateau_engine::live::Invalidation;
 use plateau_engine::picture::colour;
-use plateau_engine::water::bounds_affect_chunk;
-use plateau_engine::{ElementBounds, Wasm, rings};
+use plateau_engine::{Wasm, rings};
 
 use crate::surface::{FADE_SECONDS, Materials, SurfaceMaterial, properties};
 
 const MOST_KEPT: usize = 12_000;
 const MOST_A_FRAME: usize = 64;
-
-/// Which cached chunks need rebuilding when `ComposedLog` changes.
-pub enum Invalidate<'a> {
-    /// Rebuild all cached chunks (e.g., on full reload).
-    All,
-    /// Rebuild only chunks affected by one added or undone SDF edit.
-    Edit(&'a Edit),
-    /// Rebuild only chunks affected by one placed or removed SDF `.wasm` element.
-    SdfElement(PlacementTransform, ElementBounds),
-    /// Rebuild chunks affected by an edit, water expansion AABB, and/or lazily promoted elements.
-    Combined {
-        edit: Option<&'a Edit>,
-        bounds: &'a [(PlacementTransform, ElementBounds)],
-        water: Option<([f32; 3], [f32; 3])>,
-    },
-}
-
-impl Invalidate<'_> {
-    fn affects(&self, key: Key) -> bool {
-        match *self {
-            Invalidate::All => true,
-            Invalidate::Edit(e) => e.affects_chunk(key),
-            Invalidate::SdfElement(tf, bounds) => tf.affects_chunk(bounds, key),
-            Invalidate::Combined { edit, bounds, water } => {
-                edit.is_some_and(|e| e.affects_chunk(key))
-                    || bounds.iter().any(|&(tf, b)| tf.affects_chunk(b, key))
-                    || water.is_some_and(|(lo, hi)| bounds_affect_chunk(lo, hi, key))
-            }
-        }
-    }
-}
 
 enum Known {
     Empty { revision: u64 },
@@ -161,7 +129,7 @@ impl Chunks {
     /// Publishes an updated `ComposedLog` snapshot to worker threads and invalidates affected chunks
     /// (both cached in `known` and currently in-flight in `jobs.making` so stale builds never
     /// overwrite or leave permanent holes).
-    pub fn set_composed(&mut self, composed: Arc<ComposedLog>, inv: Invalidate<'_>) {
+    pub fn set_composed(&mut self, composed: Arc<ComposedLog>, inv: &Invalidation) {
         let rev = composed.revision();
         let in_flight: Vec<Key> = {
             let mut jobs = self.queue.jobs.lock().unwrap();

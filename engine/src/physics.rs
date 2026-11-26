@@ -59,7 +59,7 @@ pub fn player_mass_kg(player_size: f32) -> f32 {
 }
 
 /// Active player tool governing material-aware cutting (`K`) and terrain/object carving (`B`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
     /// Workshop sandbox tool: cuts & carves every solid material.
     #[default]

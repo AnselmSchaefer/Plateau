@@ -20,6 +20,7 @@ pub mod cut;
 pub mod edit;
 pub mod fit;
 pub mod laws;
+pub mod live;
 pub mod math;
 pub mod mesh_sdf;
 pub mod modules;
@@ -144,7 +145,7 @@ pub const SMALLEST: f32 = 0.0085;
 pub const LARGEST: f32 = 34.0;
 
 /// The engine's materials, in the world's order: a material's number is its place here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Material {
     Soil,

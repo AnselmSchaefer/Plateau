@@ -28,7 +28,7 @@ use crate::water::{WaterBody, WaterLog};
 use crate::{Answer, Command, Description, ElementBounds, Material, PlayerState, Region, Result, Scene, chunk};
 
 /// Whether an SDF edit adds material or carves space away.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     Add,
     Carve,
@@ -52,7 +52,7 @@ impl Op {
 }
 
 /// Exact Euclidean SDF primitives (`|grad d| == 1` everywhere).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Shape {
     /// A ball of radius `radius` (smooth-blended hills, domes, caves, tunnels).
     Sphere { radius: f32 },
@@ -141,7 +141,7 @@ impl Shape {
 }
 
 /// One scale-stamped SDF sculpt or carve operation.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Edit {
     pub op: Op,
     pub shape: Shape,

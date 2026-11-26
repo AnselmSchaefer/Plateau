@@ -17,9 +17,8 @@ use std::sync::Arc;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use plateau_engine::compose::{CompiledElement, ComposedLog, ElementCatalog, PlacedElement, PlacementTransform, SdfElementEntry};
-use plateau_engine::edit::Edit;
-use plateau_engine::modules::{ModuleCheck, SavedModule};
+use plateau_engine::compose::{CompiledElement, ElementCatalog, PlacementTransform};
+use plateau_engine::live::World;
 use plateau_engine::site::SiteContext;
 use plateau_engine::{ElementBounds, Limits, Region, SIZES};
 
@@ -27,35 +26,6 @@ use crate::scene::build_merged_mesh;
 
 /// Person height in metres (default scale = `player_size / PERSON_HEIGHT`).
 const PERSON_HEIGHT: f32 = SIZES[1].1;
-
-/// Unified undoable world action across SDF sculpting (8a), element placement (8b),
-/// and cutting/relocating discrete procedural objects (8c).
-#[derive(Clone, Debug)]
-pub enum WorldAction {
-    SdfEdit {
-        edit: Edit,
-        /// Placed `Scene` elements lazily promoted to carvable SDF by this edit (demoted on undo).
-        promoted_ids: Vec<(u32, usize)>,
-    },
-    /// Local SDF edit sculpted directly onto a discrete `Scene` element (travels with it when cut/carried).
-    ElementSdfEdit {
-        id: u32,
-        edit: Edit,
-        newly_promoted: Option<usize>,
-    },
-    PlaceElement(PlacedElement),
-    RemoveElement(PlacedElement),
-    CutElement {
-        original: PlacedElement,
-        lower: PlacedElement,
-        upper: PlacedElement,
-    },
-    RelocateElement {
-        id: u32,
-        before: PlacementTransform,
-        after: PlacementTransform,
-    },
-}
 
 /// Active cavity/site auto-fit snap locked in Place Mode via `O`.
 #[derive(Clone, Debug)]
@@ -68,88 +38,37 @@ pub struct FittedSnap {
 #[derive(Resource)]
 pub struct PlaceMode {
     pub active: bool,
-    pub catalog: ElementCatalog,
     pub palette: Vec<Arc<CompiledElement>>,
     pub selected: usize,
+    /// `--element` modules offered beside those found on disk.
     pub extra_paths: Vec<PathBuf>,
     pub yaw: f32,
     pub scale_mult: f32,
-    pub next_id: u32,
-    pub placed: Vec<PlacedElement>,
-    pub undo_stack: Vec<WorldAction>,
-    pub redo_stack: Vec<WorldAction>,
     pub aim: Option<([f64; 3], [f32; 3])>,
     pub fitted: Option<FittedSnap>,
     pub last_site: Option<SiteContext>,
-    pub revision: u64,
-    /// The loaded save's module hashes, checked as elements load (kept across `rescan`).
-    pub expected_modules: Vec<SavedModule>,
-    pub module_check: ModuleCheck,
 }
 
 impl PlaceMode {
-    pub fn new(
-        root: PathBuf,
-        extra_paths: Vec<PathBuf>,
-        initial_placed: Vec<PlacedElement>,
-        expected_modules: Vec<SavedModule>,
-        module_check: ModuleCheck,
-    ) -> PlaceMode {
-        let mut catalog = ElementCatalog::new(root, Limits::default());
-        catalog.expect_hashes(&expected_modules, module_check);
-        let mut palette = catalog.discover();
-        for p in &extra_paths {
-            let key = p.to_string_lossy().into_owned();
-            if let Ok(el) = catalog.get_or_load(&key)
-                && !palette.iter().any(|e| e.module == el.module)
-            {
-                palette.push(el);
-            }
-        }
-        let next_id = initial_placed.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-        PlaceMode {
-            active: false,
-            catalog,
-            palette,
-            selected: 0,
-            extra_paths,
-            yaw: 0.0,
-            scale_mult: 1.0,
-            next_id,
-            placed: initial_placed,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            aim: None,
-            fitted: None,
-            last_site: None,
-            revision: 1,
-            expected_modules,
-            module_check,
-        }
+    /// The palette: the elements found under the world's root, and `extra_paths`.
+    pub fn new(extra_paths: Vec<PathBuf>, world: &mut World) -> PlaceMode {
+        let palette = palette_of(&mut world.catalog, &extra_paths);
+        PlaceMode { active: false, palette, selected: 0, extra_paths, yaw: 0.0, scale_mult: 1.0, aim: None, fitted: None, last_site: None }
     }
 
-    pub fn rescan(&mut self) -> usize {
+    /// Looks on disk again for elements (rebuilt or newly made), keeping the world's placed ones
+    /// loaded; how many there are.
+    pub fn rescan(&mut self, world: &mut World) -> usize {
         let prev_mod = self.current().map(|e| e.module.clone());
-        let mut catalog = ElementCatalog::new(self.catalog.root().to_path_buf(), Limits::default());
-        catalog.expect_hashes(&self.expected_modules, self.module_check);
-        let mut palette = catalog.discover();
-        for p in &self.extra_paths {
-            let key = p.to_string_lossy().into_owned();
-            if let Ok(el) = catalog.get_or_load(&key)
-                && !palette.iter().any(|e| e.module == el.module)
-            {
-                palette.push(el);
-            }
-        }
-        // Keep any already-placed modules loaded in the catalog so saving/rebuilding never drops them.
-        for pl in &self.placed {
+        let mut catalog = ElementCatalog::new(world.root.clone(), Limits::default());
+        catalog.expect_hashes(&world.modules, world.module_check);
+        let palette = palette_of(&mut catalog, &self.extra_paths);
+        for pl in &world.placed {
             let _ = catalog.get_or_load(&pl.module);
         }
-        self.catalog = catalog;
+        world.catalog = catalog;
         self.palette = palette;
-        self.selected = prev_mod
-            .and_then(|m| self.palette.iter().position(|e| e.module == m))
-            .unwrap_or(0);
+        self.selected = prev_mod.and_then(|m| self.palette.iter().position(|e| e.module == m)).unwrap_or(0);
         self.fitted = None;
         self.palette.len()
     }
@@ -171,9 +90,9 @@ impl PlaceMode {
     }
 
     /// Returns the `element.site` file beside a site-authored element module, if one exists.
-    pub fn element_site_path(&self, module: &str) -> Option<PathBuf> {
+    pub fn element_site_path(&self, module: &str, root: &Path) -> Option<PathBuf> {
         let p = Path::new(module);
-        let full = if p.is_absolute() { p.to_path_buf() } else { self.catalog.root().join(p) };
+        let full = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
         let site = full.with_extension("site");
         site.exists().then_some(site)
     }
@@ -182,110 +101,20 @@ impl PlaceMode {
     pub fn placement_scale(&self, player_size: f32) -> f32 {
         ((player_size / PERSON_HEIGHT) * self.scale_mult).clamp(0.002, 50.0)
     }
-
-    pub fn alloc_id(&mut self) -> u32 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    /// Rebuilds an immutable `ComposedLog` snapshot from `edits` + `water` + all currently placed SDF
-    /// elements (both native SDF landforms and lazily promoted `Scene` meshes), optionally
-    /// excluding element ids that are currently carried in-hand or mid-fall.
-    pub fn build_composed(&mut self, edits: Arc<plateau_engine::EditLog>, water: Arc<plateau_engine::WaterLog>) -> Arc<ComposedLog> {
-        self.build_composed_excluding(edits, water, &[])
-    }
-
-    pub fn build_composed_excluding(
-        &mut self,
-        edits: Arc<plateau_engine::EditLog>,
-        water: Arc<plateau_engine::WaterLog>,
-        exclude_ids: &[u32],
-    ) -> Arc<ComposedLog> {
-        self.revision += 1;
-        let mut sdf_elements = Vec::new();
-        for pl in &self.placed {
-            if exclude_ids.contains(&pl.id) {
-                continue;
-            }
-            if let Ok(compiled) = self.catalog.get_or_load(&pl.module) {
-                if let Some(bounds) = compiled.sdf_bounds {
-                    sdf_elements.push(SdfElementEntry::new(pl.clone(), compiled.compiled.clone(), bounds));
-                } else if pl.is_promoted()
-                    && let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)
-                {
-                    sdf_elements.push(SdfElementEntry::from_promoted_mesh(pl.clone(), mesh_sdf));
-                }
-            }
-        }
-        Arc::new(ComposedLog::new_with_water(edits, sdf_elements, water, self.revision))
-    }
-
-    /// Returns the local SDF bounds of a placed element if it is currently represented in the SDF
-    /// layer (either natively or via lazy Scene→SDF promotion, expanded for any local `Op::Add`).
-    pub fn sdf_bounds_of(&self, pl: &PlacedElement) -> Option<ElementBounds> {
-        if let Some(el) = self.catalog.get(&pl.module)
-            && let Some(bounds) = el.sdf_bounds
-        {
-            return Some(bounds);
-        }
-        if pl.is_promoted()
-            && let Some(mesh_sdf) = self.catalog.cached_mesh_sdf(&pl.module, pl.seed, &pl.clips)
-        {
-            let mut b = mesh_sdf.bounds();
-            for e in &pl.local_edits {
-                if e.op == plateau_engine::edit::Op::Add {
-                    let (elo, ehi) = e.influence_bounds();
-                    for a in 0..3 {
-                        b.lo[a] = b.lo[a].min(elo[a]);
-                        b.hi[a] = b.hi[a].max(ehi[a]);
-                    }
-                }
-            }
-            return Some(b);
-        }
-        None
-    }
-
-    /// Finds the nearest placed SDF element (native or promoted) whose world bounding box is hit
-    /// by ray `(origin, dir)`.
-    pub fn raycast_placed_sdf(&self, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<(u32, f32)> {
-        let mut best_t = max_dist;
-        let mut best_id = None;
-        for pl in &self.placed {
-            let Some(bounds) = self.sdf_bounds_of(pl) else { continue };
-            let (lo, hi) = pl.transform().world_bounds(bounds);
-            if let Some(t) = ray_aabb(origin, dir, lo, hi, best_t) {
-                best_t = t;
-                best_id = Some(pl.id);
-            }
-        }
-        best_id.map(|id| (id, best_t))
-    }
 }
 
-fn ray_aabb(ro: [f32; 3], rd: [f32; 3], lo: [f32; 3], hi: [f32; 3], max_t: f32) -> Option<f32> {
-    let (mut tmin, mut tmax) = (0.0f32, max_t);
-    for a in 0..3 {
-        if rd[a].abs() < 1e-6 {
-            if ro[a] < lo[a] || ro[a] > hi[a] {
-                return None;
-            }
-        } else {
-            let inv = 1.0 / rd[a];
-            let mut t0 = (lo[a] - ro[a]) * inv;
-            let mut t1 = (hi[a] - ro[a]) * inv;
-            if t0 > t1 {
-                std::mem::swap(&mut t0, &mut t1);
-            }
-            tmin = tmin.max(t0);
-            tmax = tmax.min(t1);
-            if tmin > tmax {
-                return None;
-            }
+/// The elements found under `catalog`'s root, then `extra_paths` not among them.
+fn palette_of(catalog: &mut ElementCatalog, extra_paths: &[PathBuf]) -> Vec<Arc<CompiledElement>> {
+    let mut palette = catalog.discover();
+    for p in extra_paths {
+        let key = p.to_string_lossy().into_owned();
+        if let Ok(el) = catalog.get_or_load(&key)
+            && !palette.iter().any(|e| e.module == el.module)
+        {
+            palette.push(el);
         }
     }
-    Some(tmin)
+    palette
 }
 
 /// Marker component for the translucent 3D element placement preview ghost.
