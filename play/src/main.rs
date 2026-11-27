@@ -283,7 +283,7 @@ fn setup(
     let mut visuals = scene::spawn_areas(&mut commands, &mut meshes, surface.opaque.clone(), &area_scenes, &world.scene);
     // The elements the save placed; the chunks are made from the SDF as it now is.
     let changes = world.take_changes();
-    show_layers(&mut commands, &mut meshes, &mut visuals, None, &world.scene, changes.layers);
+    show_layers(&mut commands, &mut meshes, &mut visuals, &world.scene, changes.layers);
     commands.insert_resource(visuals);
     let composed = world.composed();
     let surface_opaque = surface.opaque.clone();
@@ -390,51 +390,15 @@ impl EditCtx<'_> {
     }
 }
 
-/// Shows a placed element's scene layer changes (`World::take_changes`).
-/// Newly promoted solid layers (`skip_solid: true`) are deferred until the rebuilt SDF chunks
-/// carrying their `MeshSdf` are committed, so sculpted objects never flash invisible.
-fn show_layers(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    visuals: &mut SceneVisuals,
-    mut chunks: Option<&mut Chunks>,
-    world: &SceneWorld,
-    layers: Vec<LayerChange>,
-) {
+/// Shows a placed element's scene layer changes (`World::take_changes`): every layer is drawn
+/// whole (a promoted element's solid is in it, carved; the chunks do not draw it).
+fn show_layers(commands: &mut Commands, meshes: &mut Assets<Mesh>, visuals: &mut SceneVisuals, world: &SceneWorld, layers: Vec<LayerChange>) {
     for change in layers {
         match change {
-            LayerChange::Spawn { owner, scene, skip_solid: true }
-                if chunks.as_deref().is_some_and(|c| c.has_wanted_stale_for(c.composed_revision())) =>
-            {
-                if let Some(c) = chunks.as_deref_mut() {
-                    let rev = c.composed_revision();
-                    c.defer_hide_solid(owner, rev, scene);
-                }
-            }
-            LayerChange::Spawn { owner, scene, skip_solid } => {
-                if let Some(c) = chunks.as_deref_mut() {
-                    c.cancel_deferred_hide(owner);
-                }
-                scene::spawn_layer_filtered(commands, meshes, visuals, owner, &scene, world, skip_solid);
-            }
-            LayerChange::Despawn { owner } => {
-                if let Some(c) = chunks.as_deref_mut() {
-                    c.cancel_deferred_hide(owner);
-                }
-                scene::despawn_layer(commands, visuals, owner);
-            }
-            LayerChange::DespawnAllPlaced => {
-                if let Some(c) = chunks.as_deref_mut() {
-                    c.clear_deferred_hides();
-                }
-                scene::despawn_placed_layers(commands, visuals);
-            }
-            LayerChange::Moved { owner, from, to } => {
-                if let Some(c) = chunks.as_deref_mut() {
-                    c.cancel_deferred_hide(owner);
-                }
-                visuals.set_layer_reloc(owner, from, to);
-            }
+            LayerChange::Spawn { owner, scene } => scene::spawn_layer(commands, meshes, visuals, owner, &scene, world),
+            LayerChange::Despawn { owner } => scene::despawn_layer(commands, visuals, owner),
+            LayerChange::DespawnAllPlaced => scene::despawn_placed_layers(commands, visuals),
+            LayerChange::Moved { owner, from, to } => visuals.set_layer_reloc(owner, from, to),
         }
     }
 }
@@ -457,7 +421,7 @@ fn show_world_changes(
     for (composed, inv) in changes.composed {
         chunks.set_composed(composed, &inv);
     }
-    show_layers(&mut commands, &mut meshes, &mut visuals, Some(&mut chunks), &world.scene, changes.layers);
+    show_layers(&mut commands, &mut meshes, &mut visuals, &world.scene, changes.layers);
     for said in changes.said {
         player.say(said);
     }
@@ -887,7 +851,7 @@ fn carry_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
                     let world = &ctx.world.0;
                     if let (Some(pl), Some(phys)) = (world.find(id), world.physics_of(id)) {
                         let orig_tf = pl.transform();
-                        let merged = world.runtime.local_scene_of(id).and_then(|sc| scene::build_merged_mesh(sc, false, false));
+                        let merged = world.runtime.drawn_scene_of(id).and_then(|sc| scene::build_merged_mesh(sc, false));
                         let mesh = merged.map_or_else(|| ctx.carry_assets.fallback.clone(), |(m, _)| ctx.meshes.add(m));
                         ctx.carry.held = Some(CarriedItem {
                             name: world.element_name(id),
@@ -1328,9 +1292,6 @@ fn draw(
     let scale = (DRAWN_AS / size) as f64;
     chunks.materials.sync_eye(&mut surface_materials, eye, scale);
     chunks.update(eye, look_dir, size, scale, here, &ahead, time.delta_secs(), &mut commands, &mut meshes);
-    for (owner, scene) in chunks.take_ready_deferred_hides() {
-        scene::spawn_layer_filtered(&mut commands, &mut meshes, &mut visuals, owner, &scene, &world.scene, true);
-    }
     chunks.place(eye, scale, &mut transforms);
     scene::sync(&mut commands, &mut visuals, &world.scene, eye, scale, &mut static_q, &mut dynamic_q, &mut light_q);
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());

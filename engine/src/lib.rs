@@ -13,6 +13,7 @@
 
 pub mod atlas;
 pub mod body;
+pub mod carved;
 pub mod check;
 pub mod chunk;
 pub mod compose;

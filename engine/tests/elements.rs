@@ -872,8 +872,8 @@ fn carved_trunk_stays_solid_at_giant_scale_and_tunnel_travels_when_chopped_and_r
     let mut runtime = ElementRuntime::new();
     runtime.spawn_for_size(pl.clone(), &tree, &mut world, SIZES[1].1).unwrap();
 
-    // At Person scale (1.7 m <= 1.0 * PROMOTED_SDF_MAX_SIZE_RATIO), solid trunk is rendered via SDF
-    // (skip_solid == true) so the carved tunnel is visible and open!
+    // At Person scale (1.7 m <= 1.0 * PROMOTED_SDF_MAX_SIZE_RATIO), the solid trunk collides via
+    // the SDF (skip_solid == true) so the carved tunnel is open (it is drawn carved, `carved`).
     assert!(SIZES[1].1 <= pl.scale * PROMOTED_SDF_MAX_SIZE_RATIO);
     assert!(runtime.should_skip_solid(1));
     assert!(!world.dynamic.contains_key(&(1, 1)), "at person scale, promoted trunk lives in SDF");

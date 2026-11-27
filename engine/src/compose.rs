@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use wasmtime::{bail, format_err};
 
+use crate::carved::{Carver, Carving};
 use crate::cut::{ClipPlane, ObjectPhysics, clip_scene, cull_non_solid_by_mask};
 use crate::edit::{Edit, EditLog, Op};
 use crate::mesh_sdf::MeshSdf;
@@ -605,6 +606,14 @@ impl ComposedLog {
         self.revision
     }
 
+    /// The same log without its promoted `Scene` elements: what the terrain's chunks draw (a
+    /// promoted element draws itself, carved: `carved`). Physics and `reach` read the whole log.
+    pub fn without_promoted(&self) -> ComposedLog {
+        let mut out = self.clone();
+        out.sdf_elements.retain(|e| !matches!(e.source, SdfSource::PromotedMesh(_)));
+        out
+    }
+
     pub fn with_edits(edits: Arc<EditLog>) -> ComposedLog {
         let rev = edits.revision();
         ComposedLog { edits, sdf_elements: Vec::new(), water: Arc::new(WaterLog::new()), revision: rev }
@@ -796,12 +805,20 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
 /// One live placed element running on the main thread for `tick` / `interact`.
 struct LiveElement {
     placed: PlacedElement,
+    /// Its scene as its module makes it, cut by its clips (and, promoted, culled by its split
+    /// masks): what its physics, supports and collisions are of.
     local_scene: Scene,
+    /// What it draws: `local_scene`, or once promoted and carved, that with its solid carved as
+    /// `carving` says (`carved::Carver::carve`; its other meshes at the same indices).
+    drawn_scene: Scene,
+    /// What its promoted solid is carved by (`None` until the world says, or unpromoted).
+    carving: Option<Carving>,
     physics: ObjectPhysics,
     wasm: Wasm,
     held: bool,
     /// When true for a promoted element (viewer size > `scale * PROMOTED_SDF_MAX_SIZE_RATIO`),
-    /// keeps the crisp procedural solid mesh visible & collidable as a macro-scale LOD proxy.
+    /// keeps its solid mesh collidable in `SceneWorld` as a macro-scale proxy (the coarse SDF
+    /// skips it).
     solid_proxy: bool,
 }
 
@@ -816,6 +833,7 @@ impl LiveElement {
 #[derive(Default)]
 pub struct ElementRuntime {
     live: Vec<LiveElement>,
+    carver: Carver,
 }
 
 impl ElementRuntime {
@@ -851,6 +869,12 @@ impl ElementRuntime {
         self.live.iter().find(|l| l.placed.id == id).map(|l| &l.local_scene)
     }
 
+    /// The element-local `Scene` a live element is drawn as: its `local_scene`, its promoted solid
+    /// carved (in-hand previews and drop ghosts show it so).
+    pub fn drawn_scene_of(&self, id: u32) -> Option<&Scene> {
+        self.live.iter().find(|l| l.placed.id == id).map(|l| &l.drawn_scene)
+    }
+
     /// Whether `id` should currently omit its solid meshes from `SceneWorld` / Bevy rendering.
     pub fn should_skip_solid(&self, id: u32) -> bool {
         self.live.iter().find(|l| l.placed.id == id).is_some_and(LiveElement::skip_solid)
@@ -865,6 +889,18 @@ impl ElementRuntime {
 
     /// Like `spawn`, initializing the macro-LOD solid proxy state for `viewer_size`.
     pub fn spawn_for_size(&mut self, placed: PlacedElement, compiled: &CompiledElement, world: &mut SceneWorld, viewer_size: f32) -> Result<Scene> {
+        self.spawn_carved(placed, compiled, world, viewer_size, None)
+    }
+
+    /// Like `spawn_for_size`, its promoted solid drawn as `carving` carves it.
+    pub fn spawn_carved(
+        &mut self,
+        placed: PlacedElement,
+        compiled: &CompiledElement,
+        world: &mut SceneWorld,
+        viewer_size: f32,
+        carving: Option<Carving>,
+    ) -> Result<Scene> {
         placed.validate()?;
         let mut wasm = compiled.compiled.instantiate(placed.seed)?;
         let raw_scene = wasm.scene()?;
@@ -875,13 +911,44 @@ impl ElementRuntime {
         } else {
             clipped
         };
+        let carving = carving.filter(|_| placed.is_promoted());
+        let drawn_scene = match &carving {
+            Some(c) => self.carver.carve(&local_scene, c),
+            None => local_scene.clone(),
+        };
         let solid_proxy = placed.is_promoted() && viewer_size > placed.scale * PROMOTED_SDF_MAX_SIZE_RATIO;
         let skip_solid = placed.is_promoted() && !solid_proxy;
         let tf = placed.transform();
         world.add_layer_filtered(placed.id, &local_scene, Some(tf), skip_solid);
-        let world_scene = transform_scene(&local_scene, tf);
-        self.live.push(LiveElement { placed, local_scene, physics, wasm, held: false, solid_proxy });
+        let world_scene = transform_scene(&drawn_scene, tf);
+        self.live.push(LiveElement { placed, local_scene, drawn_scene, carving, physics, wasm, held: false, solid_proxy });
         Ok(world_scene)
+    }
+
+    /// Draws the element `id`'s promoted solid as `carving` carves it (`None`: as its module made
+    /// it). Its world scene, if that changed what it draws.
+    pub fn set_carving(&mut self, id: u32, carving: Option<Carving>) -> Option<Scene> {
+        let l = self.live.iter_mut().find(|l| l.placed.id == id)?;
+        let carving = carving.filter(|_| l.placed.is_promoted());
+        let same = match (&l.carving, &carving) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_as(b),
+            _ => false,
+        };
+        if same {
+            return None;
+        }
+        l.drawn_scene = match &carving {
+            Some(c) => self.carver.carve(&l.local_scene, c),
+            None => l.local_scene.clone(),
+        };
+        l.carving = carving;
+        Some(transform_scene(&l.drawn_scene, l.placed.transform()))
+    }
+
+    /// Whether the element `id` is drawn carved (its solid as its carving makes it).
+    pub fn is_carved(&self, id: u32) -> bool {
+        self.live.iter().any(|l| l.placed.id == id && l.carving.is_some())
     }
 
     /// Syncs macro-LOD solid proxies for all promoted elements against `viewer_size`.
@@ -898,7 +965,7 @@ impl ElementRuntime {
                 let tf = l.placed.transform();
                 let skip = l.skip_solid();
                 world.add_layer_filtered(l.placed.id, &l.local_scene, Some(tf), skip);
-                changed.push((l.placed.id, transform_scene(&l.local_scene, tf), skip));
+                changed.push((l.placed.id, transform_scene(&l.drawn_scene, tf), skip));
             }
         }
         changed
@@ -915,7 +982,7 @@ impl ElementRuntime {
         if !l.held {
             world.add_layer_filtered(id, &l.local_scene, Some(tf), l.skip_solid());
         }
-        Some(transform_scene(&l.local_scene, tf))
+        Some(transform_scene(&l.drawn_scene, tf))
     }
 
     /// Fast in-place transform update for bobbing, sailing, or falling un-held elements: updates
@@ -950,7 +1017,7 @@ impl ElementRuntime {
         } else {
             world.add_layer_filtered(id, &l.local_scene, Some(tf), l.skip_solid());
         }
-        Some(transform_scene(&l.local_scene, tf))
+        Some(transform_scene(&l.drawn_scene, tf))
     }
 
     /// Updates a live element's promotion state (`promoted: Option<usize>`), refreshing its
@@ -962,12 +1029,15 @@ impl ElementRuntime {
         l.placed.promoted = promoted;
         if promoted.is_none() {
             l.solid_proxy = false;
+            if l.carving.take().is_some() {
+                l.drawn_scene = l.local_scene.clone();
+            }
         }
         let tf = l.placed.transform();
         if !l.held {
             world.add_layer_filtered(id, &l.local_scene, Some(tf), l.skip_solid());
         }
-        Some(transform_scene(&l.local_scene, tf))
+        Some(transform_scene(&l.drawn_scene, tf))
     }
 
     /// Removes a placed element by `id`, dropping its Wasmtime store and removing its `SceneWorld` layer.

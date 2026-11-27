@@ -63,7 +63,7 @@ pub fn material_density(mat: Material) -> f32 {
 }
 
 /// Fresh-cut interior RGB tint multiplier so chopped wood/stone faces look distinct and natural.
-fn cut_face_tint(mat: Material) -> [u8; 3] {
+pub(crate) fn cut_face_tint(mat: Material) -> [u8; 3] {
     match mat {
         Material::Wood => [248, 228, 192],
         Material::Stone => [216, 212, 206],
@@ -840,7 +840,7 @@ fn clip_edge(a: Vertex, da: f32, b: Vertex, db: f32) -> Vertex {
     }
 }
 
-fn lerp_vertex(a: Vertex, b: Vertex, t: f32) -> Vertex {
+pub(crate) fn lerp_vertex(a: Vertex, b: Vertex, t: f32) -> Vertex {
     let t = clamp_f32(t, 0.0, 1.0);
     let mix = |x: f32, y: f32| x + (y - x) * t;
     let nx = mix(a.normal[0], b.normal[0]);

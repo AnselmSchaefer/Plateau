@@ -44,7 +44,8 @@ use crate::atlas::{Atlas, CompiledAtlas, TileSpec};
 use crate::compose;
 use crate::body::Body;
 use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, quat_normalize};
-use crate::cut::ObjectPhysics;
+use crate::carved::Carving;
+use crate::cut::{ObjectPhysics, world_edit_to_local};
 use crate::edit::{Edit, EditLog, Op, SavedTile, WorldSave};
 use crate::graph::{Graph, GraphDelta, Node};
 use crate::modules::{ModuleCheck, SavedModule, relative_to_root};
@@ -102,9 +103,9 @@ impl Invalidation {
 /// A placed element's scene layer, as a window must show it.
 #[derive(Clone, Debug)]
 pub enum LayerChange {
-    /// Make the layer of `owner` again from `scene` (world space), leaving out its solid meshes if
-    /// `skip_solid` (they are in the SDF instead).
-    Spawn { owner: u32, scene: Scene, skip_solid: bool },
+    /// Make the layer of `owner` again from `scene` (world space): all of it is drawn (a promoted
+    /// element's solid is in it carved, `carved`; the terrain's chunks do not draw it).
+    Spawn { owner: u32, scene: Scene },
     /// Take the layer of `owner` away.
     Despawn { owner: u32 },
     /// Every placed element's layer away (a reload).
@@ -516,27 +517,58 @@ impl World {
         self.region.log = composed.clone();
         self.region.prune_instances();
         self.changes.composed.push((composed, inv));
+        let carved: Vec<u32> = self.placed.iter().filter(|pl| pl.is_promoted() || self.runtime.is_carved(pl.id)).map(|pl| pl.id).collect();
+        for id in carved {
+            self.sync_carving(id);
+        }
     }
 
-    /// Promoted elements keep a solid proxy for viewers far larger than they are: made again when the
-    /// viewer grows or shrinks past it.
+    /// What the promoted element `pl` is carved by, in its frame: its own edits, then the terrain's
+    /// carves since it was promoted that reach where it is (as `Composed` applies them to it).
+    pub fn carving_of(&mut self, pl: &PlacedElement) -> Option<Carving> {
+        if !pl.is_promoted() || self.is_sdf_element(pl) {
+            return None;
+        }
+        let sdf = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips).ok().flatten()?;
+        let mut edits = pl.local_edits.clone();
+        if let Some(bounds) = self.sdf_bounds_of(pl) {
+            let tf = pl.transform();
+            let (blo, bhi) = tf.world_bounds(bounds);
+            for e in &self.edits.edits()[pl.sdf_after_edits().min(self.edits.len())..] {
+                let (lo, hi) = e.influence_bounds();
+                if e.op == Op::Carve && (0..3).all(|a| hi[a] >= blo[a] && lo[a] <= bhi[a]) {
+                    edits.push(world_edit_to_local(e, tf));
+                }
+            }
+        }
+        Some(Carving { source: Carving::source_of(&pl.module, pl.seed, &pl.clips), sdf, edits })
+    }
+
+    /// Draws the element `id` as it is now carved (its layer made again if that changed).
+    fn sync_carving(&mut self, id: u32) {
+        let Some(pl) = self.find(id).cloned() else { return };
+        let carving = self.carving_of(&pl);
+        if let Some(scene) = self.runtime.set_carving(id, carving) {
+            self.changes.layers.push(LayerChange::Spawn { owner: id, scene });
+        }
+    }
+
+    /// Promoted elements keep a solid proxy (in collisions) for viewers far larger than they are.
     pub fn sync_viewer_size(&mut self, viewer_size: f32) {
         self.viewer_size = viewer_size;
-        for (owner, scene, skip_solid) in self.runtime.sync_macro_proxies(viewer_size, &mut self.scene) {
-            self.changes.layers.push(LayerChange::Spawn { owner, scene, skip_solid });
-        }
+        self.runtime.sync_macro_proxies(viewer_size, &mut self.scene);
     }
 
     /// Spawns `pl`'s runtime and scene layer, adds it to the placed elements in order of id (no SDF
     /// commit).
     fn spawn_layer_for(&mut self, pl: PlacedElement) -> Result<Arc<crate::compose::CompiledElement>> {
         let compiled = self.catalog.get_or_load(&pl.module)?;
-        let scene = self.runtime.spawn_for_size(pl.clone(), &compiled, &mut self.scene, self.viewer_size)?;
-        let skip_solid = self.runtime.should_skip_solid(pl.id);
-        self.changes.layers.push(LayerChange::Spawn { owner: pl.id, scene, skip_solid });
         if pl.is_promoted() {
             self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)?;
         }
+        let carving = self.carving_of(&pl);
+        let scene = self.runtime.spawn_carved(pl.clone(), &compiled, &mut self.scene, self.viewer_size, carving)?;
+        self.changes.layers.push(LayerChange::Spawn { owner: pl.id, scene });
         // In order of id, so a world undone to where it was saves as it did.
         let at = self.placed.partition_point(|e| e.id < pl.id);
         self.placed.insert(at, pl);
@@ -601,9 +633,8 @@ impl World {
         self.shown.remove(&id);
         let scale = self.placed[pos].scale;
         let mid_fall = self.falling.iter().any(|f| f.id == id);
-        let skip_solid = if mid_fall { false } else { self.runtime.should_skip_solid(id) };
         if let Some(scene) = self.runtime.relocate(id, tf, &mut self.scene) {
-            self.changes.layers.push(LayerChange::Spawn { owner: id, scene, skip_solid });
+            self.changes.layers.push(LayerChange::Spawn { owner: id, scene });
         }
         if !mid_fall && let Some(bounds) = old_bounds {
             self.commit(Invalidation::Some { edits: Vec::new(), bounds: vec![(old_tf, bounds), (tf, bounds)], water: None });
@@ -630,14 +661,20 @@ impl World {
         }
     }
 
-    /// Promotes or demotes the element `id` (`Some(edit index)` / `None`), its layer made again.
-    pub fn set_promoted(&mut self, id: u32, state: Option<usize>, skip_solid: Option<bool>) {
+    /// Promotes or demotes the element `id` (`Some(edit index)` / `None`), its layer made again
+    /// (carved as it now is).
+    pub fn set_promoted(&mut self, id: u32, state: Option<usize>) {
         if let Some(pos) = self.index_of(id) {
             self.placed[pos].promoted = state;
         }
-        if let Some(scene) = self.runtime.set_promoted(id, state, &mut self.scene) {
-            let skip_solid = skip_solid.unwrap_or_else(|| self.runtime.should_skip_solid(id));
-            self.changes.layers.push(LayerChange::Spawn { owner: id, scene, skip_solid });
+        let was_carved = self.runtime.is_carved(id);
+        let Some(scene) = self.runtime.set_promoted(id, state, &mut self.scene) else { return };
+        let Some(pl) = self.find(id).cloned() else { return };
+        let carving = self.carving_of(&pl);
+        match self.runtime.set_carving(id, carving) {
+            Some(scene) => self.changes.layers.push(LayerChange::Spawn { owner: id, scene }),
+            None if was_carved => self.changes.layers.push(LayerChange::Spawn { owner: id, scene }),
+            None => {}
         }
     }
 
@@ -650,7 +687,7 @@ impl World {
             if let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) {
                 bounds_list.push((pl.transform(), mesh_sdf.bounds()));
             }
-            self.set_promoted(id, next_state, None);
+            self.set_promoted(id, next_state);
         }
         bounds_list
     }
@@ -699,7 +736,7 @@ impl World {
                 continue;
             }
             let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) else { continue };
-            self.set_promoted(id, Some(edit_idx), None);
+            self.set_promoted(id, Some(edit_idx));
             promoted.push((id, edit_idx));
             bounds_list.push((pl.transform(), mesh_sdf.bounds()));
             names.push(compiled.name.clone());
@@ -735,8 +772,7 @@ impl World {
         }
         let _ = self.runtime.relocate(id, tf, &mut self.scene);
         if let Some(scene) = self.runtime.set_held(id, false, &mut self.scene) {
-            let skip_solid = self.runtime.should_skip_solid(id);
-            self.changes.layers.push(LayerChange::Spawn { owner: id, scene, skip_solid });
+            self.changes.layers.push(LayerChange::Spawn { owner: id, scene });
         }
         let _ = self.settle_buoyancy_for(id, 0.0);
         if let Some(bounds) = sdf_bounds {
@@ -753,11 +789,10 @@ impl World {
         Some(id)
     }
 
-    /// Shows the element `id` at `tf` with all its solid meshes (as it starts to fall, before its SDF
-    /// is back where it lands).
+    /// Shows the element `id` at `tf` (as it starts to fall: a carved one carved, as it lands).
     pub fn show_solid_at(&mut self, id: u32, tf: PlacementTransform) {
         if let Some(scene) = self.runtime.relocate(id, tf, &mut self.scene) {
-            self.changes.layers.push(LayerChange::Spawn { owner: id, scene, skip_solid: false });
+            self.changes.layers.push(LayerChange::Spawn { owner: id, scene });
         }
     }
 

@@ -25,7 +25,10 @@ plan is `WORLD_PLAN.md`.
 - **The scene layer** owns what is thin, repeated, built, or moved: grass, reeds, trees, bridges,
   boats, lanterns. Meshes from `MeshBuilder`, instanced; solid ones collide through
   `scene::Combined`. A scene element carved into is **promoted**: its solid meshes become an exact
-  SDF (`mesh_sdf::MeshSdf`) so the carve cuts it, and it can still be chopped and carried.
+  SDF (`mesh_sdf::MeshSdf`) so the carve cuts it, and it can still be chopped and carried. It is
+  still drawn from its own triangles, not by the terrain's chunks (which leave it out,
+  `ComposedLog::without_promoted`): `carved` keeps every triangle away from the carves as made and
+  dual-contours only the carved surface, sharp-rimmed, in bark and fresh-cut tints.
 
 ## How a change is made
 
@@ -107,7 +110,8 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Placed element | An element in a world: module, seed, transform, scale, cut planes, its own edits | `compose::PlacedElement` |
 | After-edits | How many edits existed when an element was placed: edits before it are under it, after it cut it | `PlacedElement::after_edits` |
 | Promoted | A scene element turned to an exact SDF by the first carve into it | `mesh_sdf`, `PlacedElement::promoted` |
-| Macro proxy | A promoted element's crisp mesh kept for viewers far larger than it (whose voxels would lose it) | `compose::PROMOTED_SDF_MAX_SIZE_RATIO` |
+| Carved mesh | How a promoted element is drawn: its own triangles, remade only about its carves | `carved::Carver`, `ElementRuntime::drawn_scene_of` |
+| Macro proxy | A promoted element's mesh kept in collisions for viewers far larger than it (whose coarse SDF skips it) | `compose::PROMOTED_SDF_MAX_SIZE_RATIO` |
 | Clip | A plane an element was chopped along: a piece is its scene clipped and capped | `cut::ClipPlane` |
 | Water body, basin | Engine-owned water flooding a carve that opens onto it, at its level | `engine::water` |
 | Rule book | Who may do what where, up to which size | `engine::rules` |

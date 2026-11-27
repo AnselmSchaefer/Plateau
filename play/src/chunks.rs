@@ -84,9 +84,6 @@ pub struct Chunks {
     pending_stale: HashMap<Key, Done>,
     stale_wait_frames: u32,
     composed_rev: u64,
-    /// Newly promoted solid Scene layers held back from hiding (`skip_solid: true`) until the
-    /// rebuilt SDF chunks carrying their `MeshSdf` are applied in the same frame.
-    deferred_hide: HashMap<u32, (u64, plateau_engine::Scene)>,
     tiles: Vec<[i32; 2]>,
     rings: rings::Rings,
     wanted: HashSet<Key>,
@@ -101,7 +98,7 @@ pub struct Chunks {
 impl Chunks {
     pub fn new(atlas: Arc<CompiledAtlas>, composed: Arc<ComposedLog>, materials: Materials) -> Chunks {
         let queue = Arc::new(Queue {
-            jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashMap::new(), composed, stop: false }),
+            jobs: Mutex::new(Jobs { todo: Vec::new(), making: HashMap::new(), composed: drawn(&composed), stop: false }),
             more: Condvar::new(),
         });
         let (tell, done) = channel();
@@ -119,7 +116,6 @@ impl Chunks {
             pending_stale: HashMap::new(),
             stale_wait_frames: 0,
             composed_rev: 0,
-            deferred_hide: HashMap::new(),
             rings: rings::Rings::with_tiles(tiles.clone()),
             tiles,
             wanted: HashSet::new(),
@@ -140,7 +136,7 @@ impl Chunks {
         self.composed_rev = rev;
         let in_flight: Vec<Key> = {
             let mut jobs = self.queue.jobs.lock().unwrap();
-            jobs.composed = composed;
+            jobs.composed = drawn(&composed);
             jobs.making
                 .iter()
                 .filter(|&(&k, &r)| r < rev && inv.affects(k))
@@ -165,45 +161,6 @@ impl Chunks {
         });
         self.stale_wait_frames = 0;
         self.queue.more.notify_all();
-    }
-
-    pub fn composed_revision(&self) -> u64 {
-        self.composed_rev
-    }
-
-    /// Whether any visible chunk still awaits an SDF rebuild up to `rev`.
-    pub fn has_wanted_stale_for(&self, rev: u64) -> bool {
-        self.wanted
-            .iter()
-            .any(|k| self.stale.get(k).is_some_and(|&r| r <= rev) || self.pending_stale.contains_key(k))
-    }
-
-    /// Holds a `skip_solid: true` layer replacement until the SDF chunks for `rev` have been
-    /// applied, so promoted wood/stone never disappears while background chunk workers mesh it.
-    pub fn defer_hide_solid(&mut self, owner: u32, rev: u64, scene: plateau_engine::Scene) {
-        self.deferred_hide.insert(owner, (rev, scene));
-    }
-
-    pub fn cancel_deferred_hide(&mut self, owner: u32) {
-        self.deferred_hide.remove(&owner);
-    }
-
-    pub fn clear_deferred_hides(&mut self) {
-        self.deferred_hide.clear();
-    }
-
-    /// Drains deferred `skip_solid: true` layers whose SDF chunks are now committed and visible.
-    pub fn take_ready_deferred_hides(&mut self) -> Vec<(u32, plateau_engine::Scene)> {
-        let ready: Vec<u32> = self
-            .deferred_hide
-            .iter()
-            .filter(|&(_, &(rev, _))| !self.has_wanted_stale_for(rev))
-            .map(|(&owner, _)| owner)
-            .collect();
-        ready
-            .into_iter()
-            .filter_map(|owner| self.deferred_hide.remove(&owner).map(|(_, sc)| (owner, sc)))
-            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -550,6 +507,12 @@ fn work(queue: &Queue, tell: &Sender<Done>, atlas: &CompiledAtlas) {
             return;
         }
     }
+}
+
+/// What the chunks draw of `composed`: all but promoted elements, which draw themselves carved
+/// (`plateau_engine::carved`), so a sculpted tree looks as it did before it was sculpted.
+fn drawn(composed: &Arc<ComposedLog>) -> Arc<ComposedLog> {
+    if composed.sdf_elements.iter().any(|e| e.placed.is_promoted()) { Arc::new(composed.without_promoted()) } else { composed.clone() }
 }
 
 fn to_bevy(mesh: chunk::Mesh) -> Mesh {

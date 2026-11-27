@@ -17,16 +17,17 @@ Made from the code by `engine/tests/docs.rs`, never by hand: each crate's module
 |---|---|---|
 | `atlas` | Multi-area world atlas & seamless border stitching (POC_PLAN.md, step 9). | `chunk`, `compose`, `reach`, `scene` |
 | `body` | A player's body (POC_PLAN.md, step 2): a capsule as tall as the player's size, colliding with the area's distances asked at that size, walking, jumping and sitting, growing and shrinking. | `chunk`, `math` |
+| `carved` | How a sculpted `Scene` element is drawn (AGENTS.md §1.2 and §2): from its own triangles, made again only where it was carved. | `cut`, `edit`, `mesh_sdf` |
 | `check` | The engine's check of an area's module, every time it is loaded, never trusted (POC_PLAN.md, step 1): what it may import and must export, its memory, and the WebAssembly it may use. |  |
 | `chunk` | Chunks of an area's surface (POC_PLAN.md, step 2, "Meshing"): surface nets over a cube of `CELLS` cells a side, asked of the area at the size the chunk's voxel is detail for. |  |
-| `compose` | Composable standalone `.wasm` elements (POC_PLAN.md, step 8b; AGENTS.md). | `chunk`, `cut`, `edit`, `math`, `mesh_sdf`, `modules`, `scene`, `wasm`, `water` |
+| `compose` | Composable standalone `.wasm` elements (POC_PLAN.md, step 8b; AGENTS.md). | `carved`, `chunk`, `cut`, `edit`, `math`, `mesh_sdf`, `modules`, `scene`, `wasm`, `water` |
 | `cut` | Deterministic procedural `Scene` cutting, watertight cross-section capping, and scale-aware object physics / carry limits (Step 8c; AGENTS.md §1.3 & §2). | `compose`, `edit`, `physics` |
 | `edit` | Scale-stamped SDF sculpting & digging overlay (POC_PLAN.md, step 8; AGENTS.md). | `chunk`, `compose`, `cut`, `graph`, `modules`, `rules`, `water` |
 | `fit` | Whether an element fits the site it is for (Phase C): the laws a site-made element is held to, and where a carried one (a round door of any size) goes to fit an opening. | `body`, `compose`, `laws`, `mesh_sdf`, `scene`, `site` |
 | `graph` | The world graph (`WORLD_PLAN.md`, phase F): what each placed object comes from, rests on, and belongs to, as typed relations between nodes. | `cut` |
 | `laws` | The laws an area, and a live world's graph, must keep (CONCEPT.md, "Laws"; POC_PLAN.md, step 3; WORLD_PLAN.md, phase F), searched for rather than proved. | `atlas`, `chunk`, `edit`, `graph`, `live`, `reach`, `rings`, `sketch`, `wasm` |
 | `lib` | Plateau's engine (POC_PLAN.md). | `atlas`, `compose`, `cut`, `edit`, `fit`, `mesh_sdf`, `modules`, `physics`, `rules`, `site`, `wasm`, `water`, `world` |
-| `live` | The live world (`WORLD_PLAN.md`, phase E): everything a world is while someone plays it, and every change to it. | `atlas`, `body`, `chunk`, `compose`, `cut`, `edit`, `graph`, `math`, `modules`, `physics`, `rules`, `scene`, `water` |
+| `live` | The live world (`WORLD_PLAN.md`, phase E): everything a world is while someone plays it, and every change to it. | `atlas`, `body`, `carved`, `chunk`, `compose`, `cut`, `edit`, `graph`, `math`, `modules`, `physics`, `rules`, `scene`, `water` |
 | `live::action` | What a player asks of the world, and what came of it (`WORLD_PLAN.md`, phase E). | `body`, `compose`, `cut`, `edit`, `graph`, `physics`, `rules`, `water` |
 | `live::falls` | Support and falling in the live world (`WORLD_PLAN.md`, phase G): after every action that changed the world, what no longer holds together comes apart, and what nothing holds up falls. | `compose`, `cut`, `edit`, `graph`, `math`, `support`, `water` |
 | `live::history` | Undo and redo (`WORLD_PLAN.md`, phase E): what each change did, kept so it can be undone, across sculpting, promotion, placing, chopping and moving. | `compose`, `edit`, `graph` |

@@ -30,6 +30,23 @@ struct SdfTri {
     hi: [f32; 3],
     centroid: [f32; 3],
     material: Material,
+    /// Vertex normals and tint as the mesh made them (for drawing a carved element like the
+    /// original: `MeshSdf::surface_at`).
+    na: [f32; 3],
+    nb: [f32; 3],
+    nc: [f32; 3],
+    tint: [u8; 3],
+}
+
+/// The nearest point of an element's original solid surface: how far, and how it was drawn there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfacePoint {
+    /// Unsigned distance to the nearest original triangle.
+    pub distance: f32,
+    /// The triangle's vertex normals, interpolated at the nearest point (unit, outward).
+    pub normal: [f32; 3],
+    pub material: Material,
+    pub tint: [u8; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,6 +175,46 @@ impl ComponentSdf {
             }
         }
         best_mat.map(|m| (best_d, m))
+    }
+
+    /// The index of the triangle nearest `p` (and its distance), if any is nearer than `max_dist`.
+    fn nearest_index(&self, p: [f32; 3], max_dist: f32) -> Option<(f32, usize)> {
+        let mut best: Option<(f32, usize)> = None;
+        let mut best_d = max_dist;
+        let mut stack = [0u32; 64];
+        let mut sp = 1usize;
+        stack[0] = 0;
+        while sp > 0 {
+            sp -= 1;
+            let node = self.nodes[stack[sp] as usize];
+            if point_to_aabb_distance(p, node.lo, node.hi) >= best_d {
+                continue;
+            }
+            match node.kind {
+                NodeKind::Leaf { start, count } => {
+                    for i in start as usize..(start + count) as usize {
+                        let tri = &self.tris[i];
+                        if point_to_aabb_distance(p, tri.lo, tri.hi) >= best_d {
+                            continue;
+                        }
+                        let d = point_triangle_distance(p, tri.a, tri.b, tri.c);
+                        if d < best_d {
+                            best_d = d;
+                            best = Some((d, i));
+                        }
+                    }
+                }
+                NodeKind::Branch { left, right } => {
+                    for child in [right, left] {
+                        if sp < stack.len() {
+                            stack[sp] = child;
+                            sp += 1;
+                        }
+                    }
+                }
+            }
+        }
+        best
     }
 
     /// Fast BVH ray-winding when the ray passes strictly through triangle interiors (99%+ of
@@ -316,6 +373,78 @@ impl MeshSdf {
         }
         best
     }
+
+    /// The nearest point of the original solid surface to local point `p`, if one is nearer than
+    /// `max_dist`: its distance, interpolated vertex normal, material and tint (how the element's
+    /// own triangles draw it there).
+    pub fn surface_at(&self, p: [f32; 3], max_dist: f32) -> Option<SurfacePoint> {
+        let mut best: Option<(f32, &SdfTri)> = None;
+        let mut best_d = max_dist;
+        for comp in &self.components {
+            if point_to_aabb_distance(p, comp.lo, comp.hi) >= best_d {
+                continue;
+            }
+            if let Some((d, i)) = comp.nearest_index(p, best_d) {
+                best_d = d;
+                best = Some((d, &comp.tris[i]));
+            }
+        }
+        let (distance, tri) = best?;
+        let [u, v, w] = closest_barycentric(p, tri.a, tri.b, tri.c);
+        let n = [0, 1, 2].map(|k| tri.na[k] * u + tri.nb[k] * v + tri.nc[k] * w);
+        let l = len3(n);
+        let normal = if l > 1e-8 {
+            n.map(|c| c / l)
+        } else {
+            let g = cross3(sub3(tri.b, tri.a), sub3(tri.c, tri.a));
+            let gl = len3(g).max(1e-20);
+            g.map(|c| c / gl)
+        };
+        Some(SurfacePoint { distance, normal, material: tri.material, tint: tri.tint })
+    }
+}
+
+/// Barycentric weights `(u, v, w)` of the point of triangle `(a, b, c)` nearest `p` (Ericson, RTCD).
+fn closest_barycentric(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let ab = sub3(b, a);
+    let ac = sub3(c, a);
+    let ap = sub3(p, a);
+    let d1 = dot3(ab, ap);
+    let d2 = dot3(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return [1.0, 0.0, 0.0];
+    }
+    let bp = sub3(p, b);
+    let d3 = dot3(ab, bp);
+    let d4 = dot3(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return [0.0, 1.0, 0.0];
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return [1.0 - v, v, 0.0];
+    }
+    let cp = sub3(p, c);
+    let d5 = dot3(ab, cp);
+    let d6 = dot3(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return [0.0, 0.0, 1.0];
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return [1.0 - w, 0.0, w];
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return [0.0, 1.0 - w, w];
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    [1.0 - v - w, v, w]
 }
 
 /// Partitions `tris` into connected components by welding shared vertex positions (within 0.1 mm),
@@ -410,18 +539,19 @@ fn append_instance_tris(inst: &Instance, mesh: &crate::MeshData, out: &mut Vec<S
         }
 
         let na = xform_n(va.normal);
-        let nb = xform_n(vb.normal);
-        let nc = xform_n(vc.normal);
+        let mut nb = xform_n(vb.normal);
+        let mut nc = xform_n(vc.normal);
         let vn = [na[0] + nb[0] + nc[0], na[1] + nb[1] + nc[1], na[2] + nb[2] + nc[2]];
         // Orient `(a, b, c)` strictly outward so solid-angle winding is always positive inside.
         if dot3(g, vn) < 0.0 {
             std::mem::swap(&mut b, &mut c);
+            std::mem::swap(&mut nb, &mut nc);
         }
 
         let lo = [min_f32(a[0], min_f32(b[0], c[0])), min_f32(a[1], min_f32(b[1], c[1])), min_f32(a[2], min_f32(b[2], c[2]))];
         let hi = [max_f32(a[0], max_f32(b[0], c[0])), max_f32(a[1], max_f32(b[1], c[1])), max_f32(a[2], max_f32(b[2], c[2]))];
         let centroid = [(a[0] + b[0] + c[0]) * (1.0 / 3.0), (a[1] + b[1] + c[1]) * (1.0 / 3.0), (a[2] + b[2] + c[2]) * (1.0 / 3.0)];
-        out.push(SdfTri { a, b, c, lo, hi, centroid, material: va.material });
+        out.push(SdfTri { a, b, c, lo, hi, centroid, material: va.material, na, nb, nc, tint: va.tint });
     }
 }
 
@@ -611,7 +741,7 @@ fn point_to_aabb_distance(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> f32 {
 }
 
 /// Exact unsigned Euclidean distance from point `p` to triangle `(a, b, c)` (Ericson, RTCD).
-fn point_triangle_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+pub(crate) fn point_triangle_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
     let dist = |u: [f32; 3], v: [f32; 3]| len3(sub3(u, v));
     let ab = sub3(b, a);
     let ac = sub3(c, a);

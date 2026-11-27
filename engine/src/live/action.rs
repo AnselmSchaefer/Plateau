@@ -293,7 +293,7 @@ impl World {
         self.placed[pos].local_edits.push(local_edit);
         self.dirty = true;
         if let Some(idx) = newly_promoted {
-            self.set_promoted(id, Some(idx), None);
+            self.set_promoted(id, Some(idx));
             let bounds = self.sdf_bounds_of(&self.placed[pos]).into_iter().map(|b| (tf, b)).collect();
             self.commit(Invalidation::Some { edits: vec![edit], bounds, water: None });
         } else {
@@ -523,7 +523,7 @@ impl World {
                 let tf = self.placed[pos].transform();
                 self.placed[pos].local_edits.pop();
                 if newly_promoted.is_some() {
-                    self.set_promoted(id, None, Some(false));
+                    self.set_promoted(id, None);
                 }
                 self.dirty = true;
                 self.commit(old_bounds.map_or(Invalidation::All, |b| Invalidation::element(tf, b)));
@@ -612,7 +612,7 @@ impl World {
                 let _ = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips);
                 self.placed[pos].local_edits.push(edit);
                 if let Some(idx) = newly_promoted {
-                    self.set_promoted(id, Some(idx), None);
+                    self.set_promoted(id, Some(idx));
                 }
                 self.dirty = true;
                 let tf = self.placed[pos].transform();

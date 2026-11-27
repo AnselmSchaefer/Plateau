@@ -234,7 +234,7 @@ fn preview_mesh_for(elem: &CompiledElement, meshes: &mut Assets<Mesh>, assets: &
     if let Some(handle) = assets.cache.get(&elem.module) {
         return handle.clone();
     }
-    let built = build_merged_mesh(&elem.preview_scene, false, false)
+    let built = build_merged_mesh(&elem.preview_scene, false)
         .map(|(m, _)| m)
         .or_else(|| elem.sdf_bounds.and_then(|b| build_sdf_preview_mesh(elem, b)));
     let handle = match built {

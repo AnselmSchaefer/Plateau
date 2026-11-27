@@ -9,7 +9,7 @@
 //! - Dynamic point lights (`SceneWorld::lights`) are spawned/updated/despawned per `(owner, id)`
 //!   with physically scaled intensities (`intensity * scale²`) across tiny, person, and giant scales.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -91,7 +91,7 @@ pub fn to_bevy_mesh(m: &MeshData) -> Option<Mesh> {
     Some(out)
 }
 
-pub fn build_merged_mesh(scene: &Scene, static_only: bool, skip_solid: bool) -> Option<(Mesh, usize)> {
+pub fn build_merged_mesh(scene: &Scene, static_only: bool) -> Option<(Mesh, usize)> {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut colors = Vec::new();
@@ -99,7 +99,7 @@ pub fn build_merged_mesh(scene: &Scene, static_only: bool, skip_solid: bool) -> 
     let mut indices = Vec::new();
 
     for inst in &scene.instances {
-        if (static_only && inst.id != 0) || (skip_solid && inst.solid) {
+        if static_only && inst.id != 0 {
             continue;
         }
         let Some(m) = scene.meshes.get(inst.mesh as usize) else { continue };
@@ -197,26 +197,12 @@ pub fn spawn_layer(
     scene: &Scene,
     world: &SceneWorld,
 ) {
-    spawn_layer_filtered(commands, meshes, visuals, owner, scene, world, false);
-}
-
-/// Uploads and spawns one scene layer, optionally omitting `solid: true` static instances when the
-/// layer's solid geometry has been lazily promoted into the carvable SDF layer.
-pub fn spawn_layer_filtered(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    visuals: &mut SceneVisuals,
-    owner: u32,
-    scene: &Scene,
-    world: &SceneWorld,
-    skip_solid: bool,
-) {
     despawn_layer(commands, visuals, owner);
 
     let mut entities = Vec::new();
     let mut tris = 0usize;
 
-    if let Some((batch, batch_tris)) = build_merged_mesh(scene, true, skip_solid) {
+    if let Some((batch, batch_tris)) = build_merged_mesh(scene, true) {
         tris += batch_tris;
         let entity = commands
             .spawn((
@@ -231,19 +217,23 @@ pub fn spawn_layer_filtered(
         entities.push(entity);
     }
 
+    // Only what the drawn scene still has: a promoted element's solid instances are drawn carved,
+    // in its static batch, even where `SceneWorld` keeps them to collide with (a giant's proxy).
+    let drawn: HashSet<u32> = scene.instances.iter().filter(|i| i.id != 0).map(|i| i.id).collect();
     let mesh_handles: Vec<Option<Handle<Mesh>>> = scene.meshes.iter().map(|m| to_bevy_mesh(m).map(|bm| meshes.add(bm))).collect();
 
     for (&(inst_owner, id), live) in &world.dynamic {
-        if inst_owner != owner {
+        if inst_owner != owner || !drawn.contains(&id) {
             continue;
         }
         let Some(Some(handle)) = mesh_handles.get(live.instance.mesh as usize) else { continue };
+        let handle = handle.clone();
         if let Some(m) = scene.meshes.get(live.instance.mesh as usize) {
             tris += m.indices.len() / 3;
         }
         let entity = commands
             .spawn((
-                Mesh3d(handle.clone()),
+                Mesh3d(handle),
                 MeshMaterial3d(visuals.material.clone()),
                 Transform::default(),
                 if live.visible { Visibility::Visible } else { Visibility::Hidden },
