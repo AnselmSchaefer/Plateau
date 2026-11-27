@@ -45,19 +45,19 @@ use crate::compose;
 use crate::body::Body;
 use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, quat_normalize};
 use crate::carved::Carving;
-use crate::cut::{ObjectPhysics, world_edit_to_local};
+use crate::cut::{ObjectPhysics, check_carry_with_load, max_carry_mass_kg, world_edit_to_local};
 use crate::edit::{Edit, EditLog, Op, SavedTile, WorldSave};
 use crate::graph::{Graph, GraphDelta, Node};
 use crate::modules::{ModuleCheck, SavedModule, relative_to_root};
-use crate::physics::{BuoyancyState, compute_buoyancy, player_mass_kg};
+use crate::physics::{BuoyancyState, Inventory, Tool, WorldMode, compute_buoyancy, player_mass_kg};
 use crate::rules::RuleBook;
 use crate::scene::{Applied, Combined, SceneWorld, is_area_owner};
 use crate::water::{WaterLog, bounds_affect_chunk};
-use crate::{Compiled, ElementBounds, Limits, PlayerState, Result, Scene, Wasm, chunk, math};
+use crate::{Compiled, ElementBounds, Limits, Material, PlayerState, Result, Scene, Wasm, chunk, math};
 
 pub use action::{Action, Actor, Outcome, SculptTarget, Summary};
 pub use history::{History, WorldAction};
-pub use log::{ActionLog, LOG_VERSION, Logged, replay};
+pub use log::{ActionLog, LOG_VERSION, Logged, replay, verify_save_edits};
 pub use falls::{FALL_LIMIT, MAX_ROUNDS};
 pub use relations::Footing;
 
@@ -199,6 +199,10 @@ pub struct World {
     pub edit_authors: Vec<Option<String>>,
     pub water: Arc<WaterLog>,
     pub rules: RuleBook,
+    /// Play vs workshop mode (`WORLD_PLAN.md`, phase H).
+    pub mode: WorldMode,
+    /// Per-player carried bulk materials in kilograms (`world` mode economy).
+    pub inventories: BTreeMap<String, Inventory>,
     /// What each element was cut from, rests on, and is owned by.
     pub graph: Graph,
     pub tiles: Vec<SavedTile>,
@@ -233,6 +237,8 @@ pub struct World {
     log: Option<ActionLog>,
     /// The graph's changes during the action being applied.
     journal: GraphDelta,
+    /// Inventory deltas `(player_id, material, delta_kg)` during the action being applied.
+    inv_journal: Vec<(String, Material, f32)>,
     /// The most falls one action may set off (`FALL_LIMIT`); what is still loose falls with the next.
     pub fall_limit: usize,
     /// What the action being applied may have shaken (`falls`).
@@ -290,6 +296,8 @@ impl World {
             edit_authors: save.edit_authors.clone(),
             water,
             rules: save.rules.clone(),
+            mode: save.mode,
+            inventories: save.inventories.clone(),
             graph,
             tiles,
             modules: save.modules.clone(),
@@ -312,6 +320,7 @@ impl World {
             changes: Changes::default(),
             log: None,
             journal: GraphDelta::default(),
+            inv_journal: Vec::new(),
             fall_limit: FALL_LIMIT,
             pending: falls::Pending::default(),
             cells: BTreeMap::new(),
@@ -336,12 +345,14 @@ impl World {
     /// The world as it would be saved now.
     pub fn to_save(&self) -> WorldSave {
         let mut save = WorldSave::with_elements(self.area_name.clone(), self.seed, self.edits.edits().to_vec(), self.placed.clone());
+        save.mode = self.mode;
         save.tiles = self.tiles.clone();
         save.modules = self.modules.clone();
         save.rules = self.rules.clone();
         save.water = self.water.bodies().to_vec();
         save.edit_authors = self.edit_authors.clone();
         save.relations = self.graph.relations().collect();
+        save.inventories = self.inventories.iter().filter(|(_, inv)| !inv.is_empty()).map(|(k, v)| (k.clone(), *v)).collect();
         save
     }
 
@@ -375,6 +386,8 @@ impl World {
         self.edit_authors = saved.edit_authors;
         self.water = Arc::new(WaterLog::from_bodies(saved.water)?);
         self.rules = saved.rules;
+        self.mode = saved.mode;
+        self.inventories = saved.inventories;
         self.graph = Graph::from_relations(saved.relations.iter().cloned())?;
         self.runtime.clear(&mut self.scene);
         self.changes.layers.push(LayerChange::DespawnAllPlaced);
@@ -420,6 +433,111 @@ impl World {
     /// Something to tell the player.
     pub fn say(&mut self, what: impl Into<String>) {
         self.changes.said.push(what.into());
+    }
+
+    /// Carried bulk materials for `player` (empty if none).
+    pub fn inventory(&self, player: &str) -> Inventory {
+        self.inventories.get(player).copied().unwrap_or_default()
+    }
+
+    /// Total carried bulk material mass (kg) for `player`.
+    pub fn inventory_mass_kg(&self, player: &str) -> f32 {
+        self.inventories.get(player).map_or(0.0, Inventory::total_mass_kg)
+    }
+
+    /// Extra carried pack mass counted toward carry limits & speed (`0.0` in `workshop` mode).
+    pub fn carried_pack_kg(&self, player: &str) -> f32 {
+        if self.mode == WorldMode::World { self.inventory_mass_kg(player) } else { 0.0 }
+    }
+
+    /// Movement speed multiplier in `[0.35..=1.0]` accounting for both any held object and carried
+    /// bulk materials in `world` mode (`WORLD_PLAN.md`, phase H).
+    pub fn carry_speed_factor(&self, player: &str, player_size: f32) -> f32 {
+        let obj_kg = self.held.and_then(|h| self.physics_of(h.id)).map_or(0.0, |p| p.world_mass_kg);
+        let total = obj_kg + self.carried_pack_kg(player);
+        if total <= 0.0 {
+            return 1.0;
+        }
+        let max_m = max_carry_mass_kg(player_size).max(1e-9);
+        if total <= max_m {
+            1.0 - 0.36 * (total / max_m).clamp(0.0, 1.0)
+        } else {
+            let over = ((total - max_m) / max_m).clamp(0.0, 1.0);
+            (0.64 - 0.29 * over).max(0.35)
+        }
+    }
+
+    /// Whether `player` at `player_size` can still hold whatever object they are currently carrying
+    /// (counting their carried material pack in `world` mode).
+    pub fn can_still_hold(&self, player: &str, player_size: f32) -> bool {
+        let Some(held) = self.held else { return true };
+        let Some(phys) = self.physics_of(held.id) else { return false };
+        check_carry_with_load(&phys, false, player_size, self.carried_pack_kg(player)).is_allowed()
+    }
+
+    /// Default tool for the world's current mode (`Hands` in `world`, `All` in `workshop`).
+    pub fn default_tool(&self) -> Tool {
+        self.mode.default_tool()
+    }
+
+    /// Next tool to cycle to for the world's current mode (so `play` never inspects `Tool` variants).
+    pub fn next_tool(&self, cur: Tool) -> Tool {
+        let tools = self.mode.tools();
+        let i = tools.iter().position(|&t| t == cur).map_or(0, |p| (p + 1) % tools.len());
+        tools[i]
+    }
+
+    pub(super) fn record_inventory(&mut self, player: &str, mat: Material, delta_kg: f32) {
+        if !delta_kg.is_finite() || delta_kg == 0.0 {
+            return;
+        }
+        let inv = self.inventories.entry(player.to_string()).or_default();
+        inv.apply_delta(mat, delta_kg);
+        if inv.is_empty() {
+            self.inventories.remove(player);
+        }
+        self.inv_journal.push((player.to_string(), mat, delta_kg));
+    }
+
+    pub(super) fn take_inv_journal(&mut self) -> Vec<(String, Material, f32)> {
+        std::mem::take(&mut self.inv_journal)
+    }
+
+    pub(super) fn revert_inventory(&mut self, deltas: &[(String, Material, f32)], redo: bool) {
+        let iter: Box<dyn Iterator<Item = &(String, Material, f32)>> =
+            if redo { Box::new(deltas.iter()) } else { Box::new(deltas.iter().rev()) };
+        for (player, mat, delta) in iter {
+            let signed = if redo { *delta } else { -*delta };
+            let inv = self.inventories.entry(player.clone()).or_default();
+            inv.apply_delta(*mat, signed);
+            if inv.is_empty() {
+                self.inventories.remove(player);
+            }
+        }
+    }
+
+    /// Exact `MeshSdf`s of unpromoted solid scene elements that `edit` (or `target_id`) overlaps,
+    /// so whole-brush tool checks and material yields see exact signed distance and per-triangle
+    /// materials inside unpromoted objects without promoting them.
+    pub(super) fn unpromoted_sdfs_near(&mut self, edit: &Edit, target_id: Option<u32>) -> Vec<(PlacementTransform, Arc<crate::mesh_sdf::MeshSdf>)> {
+        let (elo, ehi) = edit.influence_bounds();
+        let mut ids = self.scene.solid_placed_overlapping(elo, ehi);
+        if let Some(id) = target_id
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(pl) = self.find(id).cloned() else { continue };
+            if pl.is_promoted() || self.is_sdf_element(&pl) {
+                continue;
+            }
+            if let Ok(Some(msdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) {
+                out.push((pl.transform(), msdf));
+            }
+        }
+        out
     }
 
     pub fn find(&self, id: u32) -> Option<&PlacedElement> {

@@ -15,6 +15,7 @@
 //!   designed to accommodate future composable `.wasm` elements and portable `Scene` objects.
 
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use crate::compose::PlacedElement;
 use crate::cut::ClipPlane;
 use crate::graph::{Kind, Node as GraphNode, Relation};
 use crate::modules::{SavedModule, parse_module_line, write_module_records};
+use crate::physics::{Inventory, Tool, WorldMode};
 use crate::rules::RuleBook;
 use crate::water::{WaterBody, WaterLog};
 use crate::{Answer, Command, Description, ElementBounds, Material, PlayerState, Region, Result, Scene, chunk};
@@ -79,6 +81,26 @@ impl Shape {
             Shape::Sphere { radius } => radius,
             Shape::Box { half, .. } => max_f32(half[0], max_f32(half[1], half[2])),
             Shape::Cylinder { radius, half_height, .. } => max_f32(radius, half_height),
+        }
+    }
+
+    /// Scales every linear dimension of this shape uniformly by `s`.
+    pub fn scaled(self, s: f32) -> Shape {
+        match self {
+            Shape::Sphere { radius } => Shape::Sphere { radius: radius * s },
+            Shape::Box { half, round } => Shape::Box { half: [half[0] * s, half[1] * s, half[2] * s], round: round * s },
+            Shape::Cylinder { radius, half_height, round } => {
+                Shape::Cylinder { radius: radius * s, half_height: half_height * s, round: round * s }
+            }
+        }
+    }
+
+    /// Analytical geometric volume of this shape in cubic metres (deterministic).
+    pub fn volume_m3(self) -> f32 {
+        match self {
+            Shape::Sphere { radius } => (4.0 / 3.0) * std::f32::consts::PI * radius * radius * radius,
+            Shape::Box { half, .. } => 8.0 * half[0] * half[1] * half[2],
+            Shape::Cylinder { radius, half_height, .. } => std::f32::consts::PI * radius * radius * (2.0 * half_height),
         }
     }
 
@@ -153,15 +175,23 @@ pub struct Edit {
     pub material: Option<Material>,
     /// Player height in metres when this edit was stamped.
     pub stamp_size: f32,
+    /// Tool used to make this edit (`Tool::All` for legacy saves/logs that omit it; `WORLD_PLAN.md`, phase H).
+    #[serde(default)]
+    pub tool: Tool,
 }
 
 impl Edit {
     pub fn add(shape: Shape, center: [f32; 3], blend: f32, material: Material, stamp_size: f32) -> Edit {
-        Edit { op: Op::Add, shape, center, blend, material: Some(material), stamp_size }
+        Edit { op: Op::Add, shape, center, blend, material: Some(material), stamp_size, tool: Tool::All }
     }
 
     pub fn carve(shape: Shape, center: [f32; 3], blend: f32, material: Option<Material>, stamp_size: f32) -> Edit {
-        Edit { op: Op::Carve, shape, center, blend, material, stamp_size }
+        Edit { op: Op::Carve, shape, center, blend, material, stamp_size, tool: Tool::All }
+    }
+
+    pub fn with_tool(mut self, tool: Tool) -> Edit {
+        self.tool = tool;
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -564,6 +594,8 @@ pub struct WorldSave {
     pub version: u32,
     pub area: String,
     pub seed: u64,
+    /// Play vs workshop mode (`mode world` in `plateau-world 2`; defaults to `Workshop` when omitted).
+    pub mode: WorldMode,
     /// Optional explicit multi-area tile manifest (`tile` records). Empty for legacy single-area saves.
     pub tiles: Vec<SavedTile>,
     /// The modules its tiles and elements were made of, with their bytes' hashes (`module`
@@ -579,6 +611,8 @@ pub struct WorldSave {
     pub elements: Vec<PlacedElement>,
     /// The world graph (`rel` records, `graph`), in its order; empty in saves made before it.
     pub relations: Vec<Relation>,
+    /// Per-player carried materials (`inv <player> <mat> <kg>` records in `plateau-world 2`).
+    pub inventories: BTreeMap<String, Inventory>,
 }
 
 impl WorldSave {
@@ -587,6 +621,7 @@ impl WorldSave {
             version: SAVE_VERSION,
             area: area.into(),
             seed,
+            mode: WorldMode::Workshop,
             tiles: Vec::new(),
             modules: Vec::new(),
             rules: RuleBook::new(),
@@ -595,6 +630,7 @@ impl WorldSave {
             edit_authors: Vec::new(),
             elements: Vec::new(),
             relations: Vec::new(),
+            inventories: BTreeMap::new(),
         }
     }
 
@@ -603,6 +639,7 @@ impl WorldSave {
             version: SAVE_VERSION,
             area: area.into(),
             seed,
+            mode: WorldMode::Workshop,
             tiles: Vec::new(),
             modules: Vec::new(),
             rules: RuleBook::new(),
@@ -611,6 +648,7 @@ impl WorldSave {
             edit_authors: Vec::new(),
             elements,
             relations: Vec::new(),
+            inventories: BTreeMap::new(),
         }
     }
 
@@ -620,6 +658,9 @@ impl WorldSave {
         s.push_str(&format!("plateau-world {SAVE_VERSION}\n"));
         s.push_str(&format!("area {}\n", self.area.replace(['\n', '\r'], " ")));
         s.push_str(&format!("seed {}\n", self.seed));
+        if self.mode == WorldMode::World {
+            s.push_str("mode world\n");
+        }
         for t in &self.tiles {
             s.push_str(&format!("tile {} {} {} seed {}\n", t.at[0], t.at[1], t.module, t.seed));
         }
@@ -661,6 +702,11 @@ impl WorldSave {
             s.push_str(&r.to_record());
             s.push('\n');
         }
+        for (player, inv) in &self.inventories {
+            for (mat, kg) in inv.iter() {
+                s.push_str(&format!("inv {player} {} {kg}\n", mat.name()));
+            }
+        }
         s
     }
 
@@ -669,6 +715,7 @@ impl WorldSave {
         let mut version = None;
         let mut area = String::new();
         let mut seed = None;
+        let mut mode = WorldMode::Workshop;
         let mut tiles = Vec::new();
         let mut modules: Vec<SavedModule> = Vec::new();
         let mut rules = RuleBook::new();
@@ -678,6 +725,7 @@ impl WorldSave {
         let mut any_edit_author = false;
         let mut elements: Vec<PlacedElement> = Vec::new();
         let mut relations: Vec<Relation> = Vec::new();
+        let mut inventories: BTreeMap<String, Inventory> = BTreeMap::new();
         for (line_no, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -693,6 +741,12 @@ impl WorldSave {
                 area = rest.trim().to_string();
             } else if let Some(rest) = line.strip_prefix("seed ") {
                 seed = Some(rest.trim().parse::<u64>().map_err(|e| wasmtime::format_err!("line {}: invalid seed: {e}", line_no + 1))?);
+            } else if let Some(rest) = line.strip_prefix("mode ") {
+                if version == Some(1) {
+                    bail!("line {}: `mode` records need `plateau-world 2`", line_no + 1);
+                }
+                mode = WorldMode::from_name(rest.trim())
+                    .ok_or_else(|| wasmtime::format_err!("line {}: unknown mode `{}`", line_no + 1, rest.trim()))?;
             } else if line.starts_with("tile ") {
                 tiles.push(parse_tile_line(line, line_no + 1)?);
             } else if line.starts_with("module ") {
@@ -761,6 +815,14 @@ impl WorldSave {
                     }
                 }
                 relations.push(rel);
+            } else if line.starts_with("inv ") {
+                if version == Some(1) {
+                    bail!("line {}: `inv` records need `plateau-world 2`", line_no + 1);
+                }
+                let (player, mat, kg) = parse_inv_line(line, line_no + 1)?;
+                if kg > 0.0 {
+                    inventories.entry(player).or_default().add(mat, kg);
+                }
             } else {
                 bail!("line {}: unknown record `{line}`", line_no + 1);
             }
@@ -772,7 +834,7 @@ impl WorldSave {
         }
         modules.sort();
         crate::graph::Graph::from_relations(relations.iter().cloned())?;
-        Ok(WorldSave { version, area, seed, tiles, modules, rules, water, edits, edit_authors, elements, relations })
+        Ok(WorldSave { version, area, seed, mode, tiles, modules, rules, water, edits, edit_authors, elements, relations, inventories })
     }
 
     /// Writes the save file atomically (write temp file in same directory, then rename).
@@ -809,11 +871,12 @@ fn parse_tile_line(line: &str, line_no: usize) -> Result<SavedTile> {
 fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit, author: Option<&str>) {
     let mat = e.material.map_or("none", Material::name);
     let [cx, cy, cz] = e.center;
+    let tool = format!(" tool {}", e.tool.save_name());
     let auth = author.map_or_else(String::new, |a| format!(" author {a}"));
     match e.shape {
         Shape::Sphere { radius } => {
             s.push_str(&format!(
-                "{prefix} {} sphere {} {} {} {} blend {} mat {} size {}{auth}\n",
+                "{prefix} {} sphere {} {} {} {} blend {} mat {} size {}{tool}{auth}\n",
                 e.op.name(),
                 cx,
                 cy,
@@ -826,7 +889,7 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit, author: Option<&str>
         }
         Shape::Box { half: [hx, hy, hz], round } => {
             s.push_str(&format!(
-                "{prefix} {} box {} {} {} {} {} {} round {} blend {} mat {} size {}{auth}\n",
+                "{prefix} {} box {} {} {} {} {} {} round {} blend {} mat {} size {}{tool}{auth}\n",
                 e.op.name(),
                 cx,
                 cy,
@@ -842,7 +905,7 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit, author: Option<&str>
         }
         Shape::Cylinder { radius, half_height, round } => {
             s.push_str(&format!(
-                "{prefix} {} cyl {} {} {} {} {} round {} blend {} mat {} size {}{auth}\n",
+                "{prefix} {} cyl {} {} {} {} {} round {} blend {} mat {} size {}{tool}{auth}\n",
                 e.op.name(),
                 cx,
                 cy,
@@ -856,6 +919,20 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit, author: Option<&str>
             ));
         }
     }
+}
+
+fn parse_inv_line(line: &str, line_no: usize) -> Result<(String, Material, f32)> {
+    let tok: Vec<&str> = line.split_whitespace().collect();
+    if tok.len() != 4 {
+        bail!("line {line_no}: expected `inv <player> <material> <kg>`, got `{line}`");
+    }
+    let player = tok[1].to_string();
+    let mat = material_from_name(tok[2]).ok_or_else(|| wasmtime::format_err!("line {line_no}: unknown material `{}`", tok[2]))?;
+    let kg: f32 = tok[3].parse().map_err(|e| wasmtime::format_err!("line {line_no}: bad inventory mass: {e}"))?;
+    if !kg.is_finite() || kg < 0.0 {
+        bail!("line {line_no}: inventory mass must be finite and non-negative, got {kg}");
+    }
+    Ok((player, mat, kg))
 }
 
 fn parse_sdf_line(line: &str, line_no: usize) -> Result<(Edit, Option<String>)> {
@@ -908,14 +985,31 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<(Edit, Option<String>)> 
     };
     expect(tail + 4, "size")?;
     let stamp_size = pf(tail + 5)?;
-    let author = if tok.len() == tail + 6 {
-        None
-    } else if tok.len() == tail + 8 && tok[tail + 6] == "author" {
-        Some(tok[tail + 7].to_string())
-    } else {
-        bail!("line {line_no}: trailing tokens in sdf record");
-    };
-    Ok((Edit { op, shape, center, blend, material, stamp_size }, author))
+    let mut tool: Option<Tool> = None;
+    let mut author: Option<String> = None;
+    let mut idx = tail + 6;
+    while idx < tok.len() {
+        match tok[idx] {
+            "tool" => {
+                if tool.is_some() {
+                    bail!("line {line_no}: duplicate `tool` in sdf record");
+                }
+                let name = tok.get(idx + 1).copied().ok_or_else(|| wasmtime::format_err!("line {line_no}: missing tool name"))?;
+                tool = Some(Tool::from_name(name).ok_or_else(|| wasmtime::format_err!("line {line_no}: unknown tool `{name}`"))?);
+                idx += 2;
+            }
+            "author" => {
+                if author.is_some() {
+                    bail!("line {line_no}: duplicate `author` in sdf record");
+                }
+                let a = tok.get(idx + 1).copied().ok_or_else(|| wasmtime::format_err!("line {line_no}: missing author"))?;
+                author = Some(a.to_string());
+                idx += 2;
+            }
+            other => bail!("line {line_no}: trailing token `{other}` in sdf record"),
+        }
+    }
+    Ok((Edit { op, shape, center, blend, material, stamp_size, tool: tool.unwrap_or(Tool::All) }, author))
 }
 
 fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {

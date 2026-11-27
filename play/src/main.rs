@@ -37,13 +37,14 @@ use chunks::Chunks;
 use place::{ElementGhost, FittedSnap, PlaceMode, PreviewAssets};
 use plateau_engine::atlas::{CompiledAtlas, Side};
 use plateau_engine::body::{self, Body, Intent};
-use plateau_engine::cut::{check_carry, format_mass};
+use plateau_engine::cut::format_mass;
 use plateau_engine::edit::{Op, SavedTile, WorldSave, surface_normal};
 use plateau_engine::fit::fit_transform;
 use plateau_engine::graph::Opening;
 use plateau_engine::laws::length;
 use plateau_engine::live::{self, ActionLog, Actor, LayerChange, Outcome, SculptTarget, World};
 use plateau_engine::modules::{self, ModuleCheck};
+use plateau_engine::physics::WorldMode;
 use plateau_engine::rules::LOCAL_PLAYER;
 use plateau_engine::scene::{Applied, BASE_OWNER, SceneWorld};
 use plateau_engine::site::{SiteContext, SiteProbe};
@@ -73,11 +74,17 @@ fn main() {
     let mut extra_tiles: Vec<([i32; 2], PathBuf)> = Vec::new();
     let mut module_given = false;
     let mut module_check = ModuleCheck::Strict;
+    let mut mode_arg: Option<WorldMode> = None;
     let mut log_arg: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => seed = args.next().and_then(|s| s.parse().ok()).expect("--seed takes a number"),
             "--player" => player_id = args.next().expect("--player takes a player id"),
+            "--mode" => {
+                let name = args.next().expect("--mode takes `world` or `workshop`");
+                mode_arg = Some(WorldMode::from_name(&name).unwrap_or_else(|| panic!("unknown --mode `{name}` (use `world` or `workshop`)")));
+            }
+            "--workshop" => mode_arg = Some(WorldMode::Workshop),
             "--tour" => tour = Some(PathBuf::from(args.next().expect("--tour takes a folder"))),
             "--behind" => behind = true,
             "--save" => save_arg = Some(PathBuf::from(args.next().expect("--save takes a file path"))),
@@ -115,7 +122,18 @@ fn main() {
         eprintln!("note: save {} uses seed {} (overriding --seed {seed})", path.display(), loaded.seed);
         seed = loaded.seed;
     }
-    let save = loaded.as_ref().map_or_else(|| WorldSave::new("", seed, Vec::new()), |(_, l)| l.clone());
+    let mut save = loaded.as_ref().map_or_else(
+        || {
+            let mut s = WorldSave::new("", seed, Vec::new());
+            // Fresh play sessions start in `world` mode (restrictions on unless switched off).
+            s.mode = WorldMode::World;
+            s
+        },
+        |(_, l)| l.clone(),
+    );
+    if let Some(m) = mode_arg {
+        save.mode = m;
+    }
     // The areas the save was played on, unless others are named.
     let save_tiles = !module_given && extra_tiles.is_empty() && save.tiles.iter().any(|t| t.at == [0, 0]);
     let tiles = (!save_tiles).then(|| {
@@ -176,7 +194,7 @@ fn main() {
             flags,
             initial_area_scenes: area_scenes,
         })
-        .insert_resource(Sculpt::new(player_id, save_path))
+        .insert_resource(Sculpt::new(player_id, save_path, world.default_tool()))
         .insert_resource(place_mode)
         .insert_resource(CarryState::default())
         .insert_resource(LiveScene { elapsed: 0.0, interact_pressed: false, holding_use: false })
@@ -311,7 +329,7 @@ fn setup(
     commands.spawn((
         Text::new(
             "W A S D walk  /  Shift run  /  Space jump  /  F interact  /  K chop  /  G grab & carry (H flat, R/T turn, Wheel tilt)  /  B sculpt  /  P place (O fit cavity)  /  I measure site\n\
-             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  N tool  /  C sit  /  V view  /  M flags  /  F12 shot",
+             1 2 3 tiny, person, giant  /  Q E shrink, grow  /  Z/Y undo/redo  /  Ctrl+S save  /  Ctrl+L load  /  N tool  /  U mode  /  C sit  /  V view  /  M flags  /  F12 shot",
         ),
         text(14.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
@@ -853,11 +871,12 @@ fn carry_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
                         let orig_tf = pl.transform();
                         let merged = world.runtime.drawn_scene_of(id).and_then(|sc| scene::build_merged_mesh(sc, false));
                         let mesh = merged.map_or_else(|| ctx.carry_assets.fallback.clone(), |(m, _)| ctx.meshes.add(m));
+                        let speed_factor = world.carry_speed_factor(&ctx.sculpt.player_id, psize);
                         ctx.carry.held = Some(CarriedItem {
                             name: world.element_name(id),
                             scale: pl.scale,
                             physics: phys,
-                            speed_factor: check_carry(&phys, false, psize).speed_factor(),
+                            speed_factor,
                             yaw: player.body.yaw,
                             pitch: 0.0,
                             flat: CarriedItem::is_rot_horizontal(orig_tf.rot),
@@ -902,7 +921,10 @@ fn history_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
         ctx.carry.held = None;
         let path = ctx.sculpt.save_path.clone();
         let msg = match ctx.world.0.reload(&path) {
-            Ok((edits_n, elems_n)) => format!("reloaded {edits_n} edits & {elems_n} elements from {}", path.display()),
+            Ok((edits_n, elems_n)) => {
+                ctx.sculpt.tool = ctx.world.0.default_tool();
+                format!("reloaded {edits_n} edits & {elems_n} elements from {}", path.display())
+            }
             Err(e) => format!("reload failed: {e:#}"),
         };
         println!("{msg}");
@@ -939,10 +961,16 @@ fn look_and_ask(
     let held = |k: KeyCode| keys.pressed(k) as i32 as f32;
     let dt = time.delta_secs().min(0.1);
 
-    // Cycle active material-aware tool (`N`: Workshop -> Saw -> Pickaxe -> Shovel -> Hands). `C` is sitting.
+    // Cycle active material-aware tool (`N`) and toggle world/workshop mode (`U`). `C` is sitting.
     if !ctrl && keys.just_pressed(KeyCode::KeyN) {
-        ctx.sculpt.tool = ctx.sculpt.tool.next();
+        ctx.sculpt.tool = ctx.world.0.next_tool(ctx.sculpt.tool);
         player.say(format!("tool: {}", ctx.sculpt.tool.name()));
+    }
+    if !ctrl && keys.just_pressed(KeyCode::KeyU) {
+        let next_mode = ctx.world.0.mode.toggle();
+        if ctx.apply(&mut player, live::Action::SetMode { mode: next_mode }).is_done() {
+            ctx.sculpt.tool = ctx.world.0.default_tool();
+        }
     }
 
     // Handle active boat/raft piloting & passive floating buoyancy.
@@ -956,7 +984,10 @@ fn look_and_ask(
     }
     ctx.world.0.animate(dt, &mut player.body);
 
-    let carry_speed = ctx.carry.speed_factor();
+    let carry_speed = ctx.world.0.carry_speed_factor(&ctx.sculpt.player_id, player.body.size);
+    if let Some(item) = &mut ctx.carry.held {
+        item.speed_factor = carry_speed;
+    }
     player.intent = if ctx.world.0.piloting.is_some() {
         Intent::default()
     } else {
@@ -968,9 +999,9 @@ fn look_and_ask(
         }
     };
 
-    // If shrinking made the carried object exceed current size's carry capacity, set it down safely.
+    // If shrinking made the carried object (+ pack weight) exceed current size's carry capacity, set it down safely.
     if let Some(item) = &ctx.carry.held
-        && !check_carry(&item.physics, false, player.body.size).is_allowed()
+        && !ctx.world.0.can_still_hold(&ctx.sculpt.player_id, player.body.size)
     {
         let fwd = Vec3::new(-player.body.yaw.sin(), 0.0, -player.body.yaw.cos());
         let dist = (player.body.size * 1.5).max(item.physics.world_radius(item.scale) + player.body.size * 0.5) as f64;
@@ -1358,8 +1389,9 @@ fn hud(
         String::new()
     };
     let mut s = format!(
-        "{}  /  {doing}  /  tool: {} (N){tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
+        "{}  /  {doing}  /  mode: {} (U)  /  tool: {} (N){tile_note}{mods_note}\n{fps:.0} frames a second  /  {} chunks shown, {} being made{holes}, {} ahead  /  {}k triangles ({}k scene)\nat {:.3}, {:.3}, {:.3}",
         size_name(b.size),
+        world.mode.name(),
         sculpt.tool.short_name(),
         c.shown,
         c.waiting,
@@ -1370,6 +1402,11 @@ fn hud(
         feet[1],
         feet[2]
     );
+    let inv = world.inventory(&sculpt.player_id);
+    if world.mode == WorldMode::World && !inv.is_empty() {
+        let pace = (world.carry_speed_factor(&sculpt.player_id, b.size) * 100.0).round() as i32;
+        s += &format!("\nPACK: {} (pace {pace}%) — {}", format_mass(inv.total_mass_kg()), inv.summary());
+    }
     let grabbed = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
     if let Some(boat_id) = world.piloting {
         let name = world.element_name(boat_id);
@@ -1401,10 +1438,16 @@ fn hud(
         } else {
             ""
         };
+        let mat = sculpt.material();
+        let stock = if world.mode == WorldMode::World {
+            format!(" [have {}]", format_mass(inv.get(mat)))
+        } else {
+            String::new()
+        };
         s += &format!(
-            "\nSCULPT: {}  /  {}  /  radius {r_str}{hint}  (LMB add, RMB/X carve, Tab shape, R mat, Wheel size, Ctrl+S save)",
+            "\nSCULPT: {}  /  {}{stock}  /  radius {r_str}{hint}  (LMB add, RMB/X carve, Tab shape, R mat, Wheel size, Ctrl+S save)",
             sculpt.preset.name(),
-            sculpt.material().name()
+            mat.name()
         );
     } else if place.active {
         let hint = if !grabbed {

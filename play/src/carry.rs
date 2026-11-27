@@ -71,10 +71,6 @@ impl CarryState {
     pub fn is_carrying(&self) -> bool {
         self.held.is_some()
     }
-
-    pub fn speed_factor(&self) -> f32 {
-        self.held.as_ref().map_or(1.0, |h| h.speed_factor)
-    }
 }
 
 #[derive(Resource)]

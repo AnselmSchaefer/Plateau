@@ -41,12 +41,15 @@ pub mod world;
 
 pub use atlas::{Atlas, AtlasTile, BorderProfile, BorderSample, CompiledAtlas, SEAM_HALF, Side, TileSpec};
 pub use compose::{CompiledElement, Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, SdfSource};
-pub use cut::{CarryDecision, ClipPlane, ObjectPhysics};
+pub use cut::{CarryDecision, ClipPlane, ObjectPhysics, check_carry, check_carry_with_load};
 pub use edit::{Edit, EditLog, Edited, Op, SavedTile, Shape, WorldSave};
 pub use fit::{CavityFit, RimFit, SiteRegion, cavity_fit, fit_check, fit_transform, ground_fit};
 pub use mesh_sdf::MeshSdf;
 pub use modules::{ModuleCheck, ModuleRead, SavedModule};
-pub use physics::{BuoyancyState, MaterialProps, Tool, WATER_DENSITY, compute_buoyancy, effective_displacement_m3, material_props, player_mass_kg, step_floating_move};
+pub use physics::{
+    BrushCheck, BuoyancyState, Inventory, MaterialProps, Tool, WATER_DENSITY, WorldMode, check_carve_brush, compute_buoyancy,
+    effective_displacement_m3, estimate_add_mass_kg, material_props, player_mass_kg, step_floating_move, verify_edit_tool,
+};
 pub use rules::{Action, AreaPolicy, CutCarryPolicy, Denial, LOCAL_PLAYER, Plot, Role, RolePolicy, RuleBook};
 pub use site::{Cavity, SiteContext, SiteProbe};
 pub use wasm::{Compiled, Limits, Wasm};

@@ -13,10 +13,15 @@
 //!   **both** base area ponds and Phase A dynamically expanded pond channels, while stones sink and
 //!   oversized riders (e.g. a Giant stepping on a person-scale boat) swamp the hull!
 
+use std::sync::Arc;
+
 use crate::chunk;
 use crate::compose::{PlacementTransform, quat_mul, quat_rotate};
-use crate::cut::ObjectPhysics;
-use crate::{Material, Region, Result, SIZES, math};
+use crate::cut::{ObjectPhysics, format_mass};
+use crate::edit::{Edit, Shape};
+use crate::mesh_sdf::MeshSdf;
+use crate::scene::SceneWorld;
+use crate::{Answer, Material, Region, Result, SIZES, math};
 
 const PERSON_HEIGHT: f32 = SIZES[1].1;
 /// Water density in kg/m³.
@@ -97,9 +102,63 @@ impl Tool {
         }
     }
 
+    /// Stable lowercase token used in `plateau-world 2` save files (`tool <name>`).
+    pub fn save_name(self) -> &'static str {
+        match self {
+            Tool::All => "all",
+            Tool::Saw => "saw",
+            Tool::Pickaxe => "pickaxe",
+            Tool::Shovel => "shovel",
+            Tool::Hands => "hands",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Tool> {
+        match s {
+            "all" | "workshop" => Some(Tool::All),
+            "saw" => Some(Tool::Saw),
+            "pickaxe" => Some(Tool::Pickaxe),
+            "shovel" => Some(Tool::Shovel),
+            "hands" => Some(Tool::Hands),
+            _ => None,
+        }
+    }
+
     pub fn next(self) -> Tool {
         let i = Tool::ALL.iter().position(|&t| t == self).unwrap_or(0);
         Tool::ALL[(i + 1) % Tool::ALL.len()]
+    }
+
+    /// Checks whether this tool can place/raise an SDF volume of material `mat` (`Op::Add`).
+    pub fn can_add(self, mat: Material) -> std::result::Result<(), String> {
+        let p = material_props(mat);
+        match self {
+            Tool::All => Ok(()),
+            Tool::Saw => {
+                if p.fibrous {
+                    Ok(())
+                } else {
+                    let hint = if mat == Material::Stone { "Pickaxe" } else { "Shovel" };
+                    Err(format!("Saw cannot place {} — switch to {hint}", mat.name()))
+                }
+            }
+            Tool::Pickaxe => {
+                if mat == Material::Stone || p.earthy {
+                    Ok(())
+                } else {
+                    Err(format!("Pickaxe cannot place {} — switch to Saw", mat.name()))
+                }
+            }
+            Tool::Shovel => {
+                if p.earthy {
+                    Ok(())
+                } else {
+                    let hint = if mat == Material::Stone { "Pickaxe" } else { "Saw" };
+                    Err(format!("Shovel cannot place {} — switch to {hint}", mat.name()))
+                }
+            }
+            Tool::Hands => Err("Bare hands cannot place terrain — switch tool".into()),
+        }
     }
 
     /// Checks whether this tool can chop/split a discrete object made of `mat`.
@@ -168,6 +227,431 @@ impl Tool {
         }
     }
 }
+
+/// Whether building is free (`Workshop`) or governed by tools and carried materials (`World`)
+/// (`WORLD_PLAN.md`, phase H).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum WorldMode {
+    /// Sandbox for authors: `Tool::All` allowed, free `Add`, carves may repaint walls.
+    #[default]
+    Workshop,
+    /// Play mode: `Tool::All` refused, carves may not repaint walls, `Add` gated by tool and
+    /// inventory, carving yields material (volume × density) into inventory, and carrying weight
+    /// counts inventory.
+    World,
+}
+
+impl WorldMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            WorldMode::Workshop => "workshop",
+            WorldMode::World => "world",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<WorldMode> {
+        match s {
+            "workshop" => Some(WorldMode::Workshop),
+            "world" => Some(WorldMode::World),
+            _ => None,
+        }
+    }
+
+    /// Default tool when entering this mode (`Hands` in `world`, `All` in `workshop`).
+    pub fn default_tool(self) -> Tool {
+        match self {
+            WorldMode::Workshop => Tool::All,
+            WorldMode::World => Tool::Hands,
+        }
+    }
+
+    /// Tools available to cycle through in this mode.
+    pub fn tools(self) -> &'static [Tool] {
+        const WORLD_TOOLS: [Tool; 4] = [Tool::Hands, Tool::Shovel, Tool::Pickaxe, Tool::Saw];
+        match self {
+            WorldMode::Workshop => &Tool::ALL,
+            WorldMode::World => &WORLD_TOOLS,
+        }
+    }
+
+    pub fn toggle(self) -> WorldMode {
+        match self {
+            WorldMode::Workshop => WorldMode::World,
+            WorldMode::World => WorldMode::Workshop,
+        }
+    }
+}
+
+/// Per-player carried bulk materials in kilograms, indexed by `Material as usize`
+/// (`WORLD_PLAN.md`, phase H). Deterministic and bit-exact.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Inventory {
+    pub kg: [f32; 9],
+}
+
+impl Inventory {
+    pub fn new() -> Inventory {
+        Inventory::default()
+    }
+
+    pub fn get(&self, mat: Material) -> f32 {
+        self.kg[mat as usize]
+    }
+
+    pub fn total_mass_kg(&self) -> f32 {
+        let mut sum = 0.0f32;
+        for &m in &self.kg {
+            sum += m;
+        }
+        sum
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kg.iter().all(|&m| m <= 0.0)
+    }
+
+    pub fn add(&mut self, mat: Material, kg: f32) {
+        if kg.is_finite() && kg > 0.0 {
+            self.kg[mat as usize] += kg;
+        }
+    }
+
+    pub fn take(&mut self, mat: Material, kg: f32) -> std::result::Result<(), String> {
+        if !kg.is_finite() || kg < 0.0 {
+            return Err("invalid material amount".into());
+        }
+        let have = self.kg[mat as usize];
+        // Tiny relative slack so placing back the exact scoop just dug never fails to float rounding.
+        let slack = max_f32(kg * 1e-4, 1e-7);
+        if have + slack < kg {
+            return Err(format!(
+                "not enough {} (have {}, need {}) — dig {} first",
+                mat.name(),
+                format_mass(have),
+                format_mass(kg),
+                mat.name()
+            ));
+        }
+        let next = have - kg;
+        self.kg[mat as usize] = if next <= 1e-9 { 0.0 } else { next };
+        Ok(())
+    }
+
+    /// Applies a signed mass delta (used by undo/redo), clamping tiny residuals to zero.
+    pub fn apply_delta(&mut self, mat: Material, delta_kg: f32) {
+        if !delta_kg.is_finite() {
+            return;
+        }
+        let next = self.kg[mat as usize] + delta_kg;
+        self.kg[mat as usize] = if next <= 1e-9 { 0.0 } else { next };
+    }
+
+    /// Non-zero `(Material, kg)` entries in `Material::ALL` order.
+    pub fn iter(&self) -> impl Iterator<Item = (Material, f32)> + '_ {
+        Material::ALL.into_iter().filter_map(|m| {
+            let v = self.kg[m as usize];
+            (v > 0.0).then_some((m, v))
+        })
+    }
+
+    /// Human-readable pack summary (e.g. `"soil 120 kg, stone 45 kg"`).
+    pub fn summary(&self) -> String {
+        let parts: Vec<String> = self.iter().map(|(m, kg)| format!("{} {}", m.name(), format_mass(kg))).collect();
+        parts.join(", ")
+    }
+}
+
+/// Outcome of the whole-brush material check before a carve (`WORLD_PLAN.md`, phase H).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrushCheck {
+    /// Full brush fits without hitting any disallowed solid material.
+    Ok { yield_kg: [f32; 9] },
+    /// Brush hit disallowed solid `blocked` and was shrunk to `edit` until only allowed materials remain.
+    Shrunk { edit: Edit, blocked: Material, yield_kg: [f32; 9] },
+    /// Brush cannot fit at any valid size because of disallowed solid `blocked`.
+    Refused { blocked: Material, reason: String },
+}
+
+const BRUSH_GRID: usize = 5;
+const SHRINK_STEPS: [f32; 4] = [0.75, 0.50, 0.35, 0.25];
+
+/// Combines `sdf` (from `region`) with exact signed distances of any unpromoted `MeshSdf` elements.
+fn sample_with_unpromoted(
+    p: [f32; 3],
+    mut sdf: Answer,
+    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
+) -> Answer {
+    for (tf, msdf) in unpromoted {
+        let lp = tf.world_to_local_point(p);
+        if let Some(ans) = msdf.sample(lp, f32::INFINITY) {
+            let d = ans.distance * tf.scale;
+            if d < sdf.distance || (sdf.material == Material::Water && d <= 0.0) {
+                sdf = Answer { distance: d, material: ans.material };
+            }
+        }
+    }
+    sdf
+}
+
+/// Evaluates a `5×5×5` cell-centered grid inside `edit`'s shape against `region`, `scene`, and
+/// `unpromoted` solid scene elements, returning `(first_disallowed_material, solid_cell_count,
+/// yield_kg_per_material)`.
+fn probe_carve_volume(
+    tool: Tool,
+    edit: &Edit,
+    region: &mut dyn Region,
+    scene: &SceneWorld,
+    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
+) -> Result<(Option<Material>, usize, [f32; 9])> {
+    let half = edit.shape.half_extents();
+    let mut pts = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
+    let mut depths = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
+    for iz in 0..BRUSH_GRID {
+        let uz = -1.0 + (2.0 * iz as f32 + 1.0) / BRUSH_GRID as f32;
+        for iy in 0..BRUSH_GRID {
+            let uy = -1.0 + (2.0 * iy as f32 + 1.0) / BRUSH_GRID as f32;
+            for ix in 0..BRUSH_GRID {
+                let ux = -1.0 + (2.0 * ix as f32 + 1.0) / BRUSH_GRID as f32;
+                let p = [
+                    edit.center[0] + ux * half[0],
+                    edit.center[1] + uy * half[1],
+                    edit.center[2] + uz * half[2],
+                ];
+                let bd = edit.distance(p);
+                if bd <= 0.0 {
+                    pts.push(p);
+                    depths.push(-bd);
+                }
+            }
+        }
+    }
+    if pts.is_empty() {
+        pts.push(edit.center);
+        depths.push(edit.shape.radius());
+    }
+    let mut out = Vec::new();
+    chunk::sample(region, &pts, edit.stamp_size, &mut out)?;
+
+    let dx = half[0] / BRUSH_GRID as f32;
+    let dy = half[1] / BRUSH_GRID as f32;
+    let dz = half[2] / BRUSH_GRID as f32;
+    let cell_r = (dx * dx + dy * dy + dz * dz).sqrt();
+    let per_cell_vol = edit.shape.volume_m3() / pts.len() as f32;
+
+    let mut blocked: Option<Material> = None;
+    let mut solid_count = 0usize;
+    let mut yield_kg = [0.0f32; 9];
+
+    for ((&p, &d_in), &raw_ans) in pts.iter().zip(&depths).zip(&out) {
+        let ans = sample_with_unpromoted(p, raw_ans, unpromoted);
+        let mat = if ans.distance <= 0.0 && ans.material != Material::Water {
+            Some(ans.material)
+        } else if unpromoted.is_empty() {
+            // Fallback for base-area scene solids not in `unpromoted`.
+            let margin = min_f32(cell_r, d_in);
+            if margin > 0.0 {
+                scene.distance_to_solids(p, margin).map(|h| h.material)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(m) = mat {
+            solid_count += 1;
+            if blocked.is_none() && tool.can_carve(m).is_err() {
+                blocked = Some(m);
+            }
+            yield_kg[m as usize] += per_cell_vol * material_props(m).density_kg_m3;
+        }
+    }
+    Ok((blocked, solid_count, yield_kg))
+}
+
+/// Checks the whole brush volume (`5×5×5` grid at `edit.stamp_size`) before carving (`WORLD_PLAN.md`,
+/// phase H). If a disallowed solid material lies inside the brush, tries shrinking the brush toward
+/// `hit` until only allowed materials remain; if it still cannot fit (or `hit` itself is disallowed),
+/// refuses the stroke with a message naming the blocking material.
+pub fn check_carve_brush(
+    tool: Tool,
+    edit: Edit,
+    hit: [f32; 3],
+    region: &mut dyn Region,
+    scene: &SceneWorld,
+    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
+) -> Result<BrushCheck> {
+    if tool == Tool::Hands {
+        return Ok(BrushCheck::Refused {
+            blocked: Material::Stone,
+            reason: tool.can_carve(Material::Stone).unwrap_err(),
+        });
+    }
+    if tool == Tool::All {
+        let (_, _, yield_kg) = probe_carve_volume(tool, &edit, region, scene, unpromoted)?;
+        return Ok(BrushCheck::Ok { yield_kg });
+    }
+
+    // 1. Check the aimed point itself first: shrinking around `hit` can never avoid `hit`.
+    let r = edit.shape.radius();
+    let hit_margin = max_f32(0.05 * r, 0.01 * edit.stamp_size);
+    let mut hit_out = Vec::new();
+    chunk::sample(region, &[hit], edit.stamp_size, &mut hit_out)?;
+    let hit_mat = {
+        let sdf = sample_with_unpromoted(hit, hit_out[0], unpromoted);
+        if sdf.distance <= 0.0 && sdf.material != Material::Water {
+            Some(sdf.material)
+        } else if let Some(sh) = scene.distance_to_solids(hit, hit_margin) {
+            if sdf.distance <= hit_margin && sdf.distance < sh.distance && sdf.material != Material::Water {
+                Some(sdf.material)
+            } else {
+                Some(sh.material)
+            }
+        } else if sdf.distance <= hit_margin && sdf.material != Material::Water {
+            Some(sdf.material)
+        } else {
+            None
+        }
+    };
+    if let Some(m) = hit_mat
+        && let Err(reason) = tool.can_carve(m)
+    {
+        return Ok(BrushCheck::Refused { blocked: m, reason });
+    }
+
+    // 2. Check the full brush volume.
+    let (blocked, _, yield_kg) = probe_carve_volume(tool, &edit, region, scene, unpromoted)?;
+    let Some(blocked_mat) = blocked else {
+        return Ok(BrushCheck::Ok { yield_kg });
+    };
+
+    // 3. Try shrinking the brush toward `hit` until only allowed materials lie inside it.
+    let min_radius = max_f32(0.05 * edit.stamp_size, 0.003);
+    for &s in &SHRINK_STEPS {
+        let shape = edit.shape.scaled(s);
+        if shape.radius() < min_radius {
+            continue;
+        }
+        let center = [
+            hit[0] + (edit.center[0] - hit[0]) * s,
+            hit[1] + (edit.center[1] - hit[1]) * s,
+            hit[2] + (edit.center[2] - hit[2]) * s,
+        ];
+        let shrunk = Edit { shape, center, blend: edit.blend * s, ..edit };
+        let (b, solid_n, y_kg) = probe_carve_volume(tool, &shrunk, region, scene, unpromoted)?;
+        if b.is_none() && (solid_n > 0 || hit_mat.is_some()) {
+            return Ok(BrushCheck::Shrunk { edit: shrunk, blocked: blocked_mat, yield_kg: y_kg });
+        }
+    }
+
+    let detail = tool.can_carve(blocked_mat).unwrap_err();
+    Ok(BrushCheck::Refused {
+        blocked: blocked_mat,
+        reason: format!("{} stopped at {} inside brush ({detail})", tool.short_name(), blocked_mat.name()),
+    })
+}
+
+/// Estimates the mass (kg) of `mat` needed to add `edit` into open space (`WORLD_PLAN.md`, phase H):
+/// fraction of brush cells currently in air/water × `shape.volume_m3()` × `density_kg_m3`.
+pub fn estimate_add_mass_kg(
+    edit: &Edit,
+    mat: Material,
+    region: &mut dyn Region,
+    scene: &SceneWorld,
+    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
+) -> Result<f32> {
+    let half = edit.shape.half_extents();
+    let mut pts = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
+    let mut depths = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
+    for iz in 0..BRUSH_GRID {
+        let uz = -1.0 + (2.0 * iz as f32 + 1.0) / BRUSH_GRID as f32;
+        for iy in 0..BRUSH_GRID {
+            let uy = -1.0 + (2.0 * iy as f32 + 1.0) / BRUSH_GRID as f32;
+            for ix in 0..BRUSH_GRID {
+                let ux = -1.0 + (2.0 * ix as f32 + 1.0) / BRUSH_GRID as f32;
+                let p = [
+                    edit.center[0] + ux * half[0],
+                    edit.center[1] + uy * half[1],
+                    edit.center[2] + uz * half[2],
+                ];
+                let bd = edit.distance(p);
+                if bd <= 0.0 {
+                    pts.push(p);
+                    depths.push(-bd);
+                }
+            }
+        }
+    }
+    if pts.is_empty() {
+        pts.push(edit.center);
+        depths.push(edit.shape.radius());
+    }
+    let mut out = Vec::new();
+    chunk::sample(region, &pts, edit.stamp_size, &mut out)?;
+
+    let dx = half[0] / BRUSH_GRID as f32;
+    let dy = half[1] / BRUSH_GRID as f32;
+    let dz = half[2] / BRUSH_GRID as f32;
+    let cell_r = (dx * dx + dy * dy + dz * dz).sqrt();
+
+    let mut open_count = 0usize;
+    for ((&p, &d_in), &raw_ans) in pts.iter().zip(&depths).zip(&out) {
+        let ans = sample_with_unpromoted(p, raw_ans, unpromoted);
+        let occupied = (ans.distance <= 0.0 && ans.material != Material::Water)
+            || (unpromoted.is_empty() && min_f32(cell_r, d_in) > 0.0 && scene.distance_to_solids(p, min_f32(cell_r, d_in)).is_some());
+        if !occupied {
+            open_count += 1;
+        }
+    }
+    let vol = edit.shape.volume_m3() * (open_count as f32 / pts.len() as f32);
+    Ok(vol * material_props(mat).density_kg_m3)
+}
+
+/// Checks whether `edit`'s tool is valid against the world state *without* shrinking (for server /
+/// save-replay verification of recorded edits; `WORLD_PLAN.md`, phase H).
+pub fn verify_edit_tool(
+    mode: WorldMode,
+    edit: &Edit,
+    region: &mut dyn Region,
+    scene: &SceneWorld,
+    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
+) -> Result<std::result::Result<(), String>> {
+    if mode == WorldMode::World {
+        if edit.tool == Tool::All {
+            return Ok(Err("workshop tool (all) is not allowed in world mode".into()));
+        }
+        if edit.op == crate::edit::Op::Carve && edit.material.is_some() {
+            return Ok(Err("carving cannot repaint walls in world mode".into()));
+        }
+    }
+    match edit.op {
+        crate::edit::Op::Add => {
+            let mat = edit.material.unwrap_or(Material::Soil);
+            Ok(edit.tool.can_add(mat))
+        }
+        crate::edit::Op::Carve => {
+            if edit.tool == Tool::All {
+                return Ok(Ok(()));
+            }
+            if edit.tool == Tool::Hands {
+                return Ok(Err(edit.tool.can_carve(Material::Stone).unwrap_err()));
+            }
+            let (blocked, _, _) = probe_carve_volume(edit.tool, edit, region, scene, unpromoted)?;
+            match blocked {
+                None => Ok(Ok(())),
+                Some(m) => Ok(Err(format!(
+                    "{} cannot carve {} inside brush ({})",
+                    edit.tool.short_name(),
+                    m.name(),
+                    edit.tool.can_carve(m).unwrap_err()
+                ))),
+            }
+        }
+    }
+}
+
+/// Computes `Shape::volume_m3` helper validation (sanity check for `Shape`).
+#[allow(dead_code)]
+fn _shape_uses(_: Shape) {}
 
 /// Deterministic buoyancy & resting result for a discrete `Scene` object at a given world placement.
 #[derive(Clone, Copy, Debug, PartialEq)]

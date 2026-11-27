@@ -29,6 +29,16 @@ no `std::f32` maths functions.
 - **Materials**, each with its physics, owned by the engine: soil, grass, sand, mud, stone, wood,
   leaf, moss, water. Water holds up the tiny (they walk on it); everyone else wades through it to
   what is under it. A giant sinks a little into mud, sand and soil.
+- **Materials go down (strata below the surface).** Players dig into ground, banks, hills and
+  rock with material-aware tools (a shovel digs turf and soil, then stops at the bedrock stone).
+  Thin surface coats (`Material::Grass`, `Material::Moss`, `Material::Leaf`) belong on the outside
+  skin only — never 30 cm deep inside solid ground or stone. Layer materials by depth inside the
+  local surface with `strata(depth, &[(Material, thickness)])` (the last entry is the core):
+  ```rust
+  let mat = strata(surface - p.y, &[(Material::Grass, 0.08), (Material::Soil, 0.7), (Material::Stone, 0.0)]);
+  ```
+  On mossy stone or rock, use `strata(-wall_dist, &[(Material::Moss, 0.03), (Material::Stone, 0.0)])`
+  so the moss is a thin skin over real stone.
 
 ## The three sizes
 
@@ -232,6 +242,7 @@ the place and size where it broke and what to do.
 | NaNs unseen | The same answers whatever the machine's NaNs |
 | Distances never too long | No distance is longer than the way to the surface |
 | Surfaces have an inside | Wherever the distance comes to nought, something is solid right by it |
+| Materials go down | Below every solid surface, thin coats (grass, moss, leaf) give way to subsoil or core material (soil, mud, sand, stone, wood) |
 | Borders match (when beside a neighbour) | Ground height (within 15 cm), water level (within 5 cm), and surface material are continuous along the shared edge |
 
 ## How finished

@@ -332,6 +332,7 @@ pub fn judge_with_neighbors(module: &[u8], sketch: Option<&Sketch>, neighbors: &
     with!("sizes agree", |a: &mut Wasm| laws::sizes_agree(a, &d, 1, settings.rays));
     with!("distances never too long", |a: &mut Wasm| laws::never_too_long(a, &d, 1, settings.rays));
     with!("surfaces have an inside", |a: &mut Wasm| laws::surfaces_have_an_inside(a, &d, 1, settings.rays));
+    with!("materials go down", |a: &mut Wasm| laws::materials_go_down(a, &d, 1, settings.rays));
     if let Some(s) = sketch {
         with!("sketch materials", |a: &mut Wasm| laws::sketch_materials(a, s));
     }

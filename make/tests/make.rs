@@ -41,7 +41,8 @@ impl Area for Blocks {
     }
 
     fn sample(&self, p: Point, _view: &View) -> Answer {
-        let ground = Answer::new(p.y, Material::Grass);
+        let ground_mat = strata(-p.y, &[(Material::Grass, 0.08), (Material::Soil, 0.6), (Material::Stone, 0.0)]);
+        let ground = Answer::new(p.y, ground_mat);
         // A block of stone 40 cm a side; inside, a room 6 cm a side, and a slot 1.6 cm wide and
         // 3 cm high from its west face into the room, each cut from a millimetre below the ground
         // (so no lid is left where it meets it) and the slot from beyond the face.
@@ -397,7 +398,10 @@ fn with_a_neighbour_claude_gets_its_border_and_is_held_to_borders_match() {
 
     // Round 1: ground lifted by 0.6 m -> breaks `borders match (west)`. Round 2: matches `AREA` (y = 0) -> keeps every law.
     let bad_border = right()
-        .replace("let ground = Answer::new(p.y, Material::Grass);", "let ground = Answer::new(p.y - 0.6, Material::Grass);")
+        .replace(
+            "let ground_mat = strata(-p.y, &[(Material::Grass, 0.08), (Material::Soil, 0.6), (Material::Stone, 0.0)]);\n        let ground = Answer::new(p.y, ground_mat);",
+            "let ground_mat = strata(0.6 - p.y, &[(Material::Grass, 0.08), (Material::Soil, 0.6), (Material::Stone, 0.0)]);\n        let ground = Answer::new(p.y - 0.6, ground_mat);",
+        )
         .replace("Borders::of_ground(|_, _| 0.0)", "Borders::of_ground(|_, _| 0.6)")
         .replace("point(40.0, 0.0, 30.0)", "point(40.0, 0.6, 30.0)")
         .replace("point(40.0, 0.2, 30.0)", "point(40.0, 0.8, 30.0)")

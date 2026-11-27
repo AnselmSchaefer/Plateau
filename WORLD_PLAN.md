@@ -462,6 +462,44 @@ A shovel stops at the rock.
 shrunk; a saw cannot raise stone in `world` mode; replaying a save checks every edit's tool; every
 carried area keeps "materials go down".
 
+*Done 2026-11-27 (headless tests only; not yet played by hand; masked carve remains for J):*
+
+- **Materials below the surface**: `plateau_sdk::strata(depth, &[(Material, thickness)])`
+  (deterministic SDK math only, documented in `make/GUIDE.md`); new law `laws::materials_go_down`
+  (16×16 downward grid + seeded rays probing 30 cm / 60 cm / 1.2 m along the inward normal, refusing
+  thin surface coats `Grass`, `Moss`, `Leaf` deep inside solid, wired into `engine/tests/laws.rs`
+  and `make::judge_with_neighbors`). `areas/garden/area.rs` (lawn `Grass → Soil → Stone`, pond shore
+  `Mud → Soil → Stone`, mossy wall `Moss 3 cm → Stone`) and `elements/hill/element.rs` updated,
+  rebuilt (`./areas/build.sh`, `./elements/build.sh`), and `areas/garden/hashes.txt` updated.
+- **Whole-brush tool check** (`physics::check_carve_brush`, `physics::Tool::can_add`): samples a
+  `5×5×5` cell-centered grid inside the brush at `edit.stamp_size` against `Region` + exact
+  `MeshSdf`s of overlapping unpromoted scene elements. Any disallowed solid material refuses the
+  stroke or shrinks the brush toward `hit` (`[0.75, 0.50, 0.35, 0.25]`) until it fits, naming the
+  blocking material; `Op::Add` is gated by `Tool::can_add`.
+- **Edits record their tool** (`edit::Edit::tool`, `Tool::save_name` / `from_name`): persisted as
+  `tool <name>` in `plateau-world 2` (backward-compatible with v1/older saves omitting it, which
+  default to `Tool::All`). `live::verify_save_edits` replays every `sdf` and non-mask `el-sdf` edit
+  chronologically against its base area(s) and placed elements to check every edit's recorded tool
+  and mode rules.
+- **World vs workshop mode & material economy** (`physics::WorldMode`, `physics::Inventory`,
+  `Action::SetMode`): persisted as `mode world` and `inv <player> <mat> <kg>` in `plateau-world 2`
+  (legacy saves default to `Workshop`). In `world` mode: default tool is `Hands`; `Tool::All` is
+  refused; carves may not repaint walls (`material: Some(_)` disallowed); carving yields material
+  (volume × density) into the player's `Inventory`; `Add` consumes carried material; carrying weight
+  (`cut::check_carry_with_load`, `World::carry_speed_factor`, `World::can_still_hold`, boat rider
+  load) counts the pack; undo/redo reverts and reapplies inventory deltas bit-exactly (`Done::inventory`).
+- **`play/`**: defaults fresh sessions to `world` mode (`--mode world|workshop`, `--workshop`, `U`
+  toggles via `Action::SetMode`, `N` cycles `world.next_tool(...)`), shows mode, tool, pack weight &
+  selected material stock in HUD, and delegates all carry-weight/tool checks to `World`.
+- **Tests**: `engine/tests/tools.rs` (7): `strata` unit/determinism; every carried area keeps
+  `materials_go_down`; shovel aimed at moss over stone core refused at person scale and shrunk at
+  tiny scale (plus lawn over bedrock and `MossyHill`); saw refused raising stone in `world` mode,
+  wall repainting refused in `world` mode & allowed in `workshop` mode, dig-to-build consumption and
+  undo/redo; carrying weight counting carried material pack (slowing pace and blocking heavy log
+  grab); save & action-log replay verifying every edit's tool (catching 5 tampered cases) and
+  canonical-NaN determinism; legacy v1 save backward compatibility. `engine/tests/laws.rs` adds
+  `grass_thirty_centimetres_underground_breaks_materials_go_down`.
+
 ### I. Parametric elements and general fit (one to one and a half weeks)
 
 One element fits every site it is made for, and keeps fitting.

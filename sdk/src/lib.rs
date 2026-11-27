@@ -591,6 +591,27 @@ impl Answer {
     }
 }
 
+/// Chooses a material by `depth` (metres inside the local surface; `<= 0.0` on or outside it)
+/// through ordered `(material, thickness)` layers from outside in (`WORLD_PLAN.md`, phase H).
+///
+/// The last layer is the core material and is returned for any deeper point, regardless of its
+/// thickness (`0.0` is idiomatic for the core). Returns `Material::Stone` if `layers` is empty.
+/// Uses deterministic SDK arithmetic only.
+pub fn strata(depth: f32, layers: &[(Material, f32)]) -> Material {
+    if layers.is_empty() {
+        return Material::Stone;
+    }
+    let d = max(depth, 0.0);
+    let mut acc = 0.0;
+    for &(mat, thickness) in &layers[..layers.len() - 1] {
+        acc += max(thickness, 0.0);
+        if d < acc {
+            return mat;
+        }
+    }
+    layers[layers.len() - 1].0
+}
+
 // Noise.
 
 /// A number for each whole point and seed, the same everywhere.

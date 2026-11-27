@@ -36,14 +36,15 @@ plan is `WORLD_PLAN.md`.
 play (input, aim)          engine (live::World)                                play (shown)
 ──────────────────         ─────────────────────────────────────────────       ─────────────────
 key, ray, brush  ──Action──▶ apply ─▶ fall under way finished                   take_changes:
+                            ├─ mode & tool (WorldMode, check_carve_brush, can_add) ─▶ Denied / Shrunk
                             ├─ rule book (rules::RuleBook) ─▶ Denied           ├─ SDF snapshot +
-                            ├─ tool (physics::Tool)        ─▶ Denied           │  Invalidation ─▶ chunks
-                            ├─ the change (edit, place, cut, carry, steer)     ├─ LayerChange ─▶ scene meshes
+                            ├─ the change (edit, place, cut, carry, steer)     │  Invalidation ─▶ chunks
+                            ├─ material economy (Inventory yield/consume)      ├─ LayerChange ─▶ scene meshes
                             ├─ what follows (promotion, water, buoyancy)       └─ words ─▶ HUD
                             ├─ support (live::falls): mended, come apart, fallen
                             ├─ the graph (derived_from, rests_on, owned_by, attached_to, fills, carved_into, flooded_by, uprooted)
                             ├─ commit: a new ComposedLog snapshot
-                            ├─ history (undo/redo, with the graph's delta)
+                            ├─ history (undo/redo, with graph & inventory deltas)
                             └─ action log line (--log) ─▶ Outcome
 ```
 
@@ -105,7 +106,9 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Size | The player's height: tiny 1.7 cm, person 1.7 m, giant 17 m, or between | `engine::SIZES` |
 | Sample | An area's answer at a point for a viewer of a size: distance to the surface and material | `Region::sample` |
 | Chunk | A cube of surface made by surface nets, at a level of detail for the viewer | `engine::chunk`, `rings` |
-| Edit, stamp | One brush stroke: add or carve a shape, made at the player's size (`stamp_size`) | `engine::edit` |
+| Edit, stamp | One brush stroke: add or carve a shape, made at the player's size (`stamp_size`), recording the `tool` that made it | `engine::edit` |
+| Strata | Layering materials by depth below the local surface (`strata(depth, &[(Material, thickness)])`) so surface coats (`Grass`, `Moss`, `Leaf`) give way to subsoil and core material (`laws::materials_go_down`) | `plateau_sdk::strata`, `laws::materials_go_down` |
+| World mode, inventory | `WorldMode::World` (tools gated, no wall repainting on carves, carving yields volume × density kg into per-player `Inventory`, adding consumes it, carrying weight counts it) vs `WorldMode::Workshop` (free sandbox) | `physics::WorldMode`, `physics::Inventory` |
 | Element | A standalone `.wasm` placed onto any area: an SDF landform or a procedural scene | `engine::compose` |
 | Placed element | An element in a world: module, seed, transform, scale, cut planes, its own edits | `compose::PlacedElement` |
 | After-edits | How many edits existed when an element was placed: edits before it are under it, after it cut it | `PlacedElement::after_edits` |
@@ -115,11 +118,11 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Clip | A plane an element was chopped along: a piece is its scene clipped and capped | `cut::ClipPlane` |
 | Water body, basin | Engine-owned water flooding a carve that opens onto it, at its level | `engine::water` |
 | Rule book | Who may do what where, up to which size | `engine::rules` |
-| Tool | What the player holds; each carves and cuts some materials | `physics::Tool` |
+| Tool | What the player holds; each carves, adds, and cuts its own materials, checked over the whole `5×5×5` brush volume (`check_carve_brush`) | `physics::Tool`, `physics::check_carve_brush` |
 | Site, cavity, opening | A place measured at the player's size; an opening's rim, outline, depth, floor | `engine::site` |
 | Fit | Whether an element meets its site (rim fit, ground fit), and where it goes to | `engine::fit` |
 | Law | A property every area must keep, searched for, never assumed (sizes agree, gates are real, …) | `engine::laws` |
-| World save | `plateau-world 2`: tiles, module hashes, rules, water, edits, elements, relations (`rel`) | `edit::WorldSave`, `modules` |
+| World save | `plateau-world 2`: mode, tiles, module hashes, rules, water, edits (with `tool`), elements, relations (`rel`), player inventories (`inv`) | `edit::WorldSave`, `modules` |
 | World graph, relation | What each element was cut from (`derived_from`), rests on (`rests_on`), is owned by (`owned_by`), is attached to (`attached_to`) and fills (`fills`); what each carve cut (`carved_into`) and let water into (`flooded_by`); which elements lost their roots (`uprooted`) | `engine::graph` |
 | Host | What an opening is in: the terrain or an element, solid just behind its wall | `World::host_at` |
 | Neighbourhood | A site's surroundings in the world, in words, for Claude | `live::near`, `SiteContext::near` |

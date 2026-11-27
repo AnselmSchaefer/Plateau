@@ -92,11 +92,11 @@ pub struct Sculpt {
 }
 
 impl Sculpt {
-    pub fn new(player_id: String, save_path: PathBuf) -> Sculpt {
+    pub fn new(player_id: String, save_path: PathBuf, tool: Tool) -> Sculpt {
         Sculpt {
             active: false,
             preset: BrushPreset::HillSphere,
-            tool: Tool::All,
+            tool,
             material_idx: 0, // Soil
             radius_mult: 0.75,
             player_id,

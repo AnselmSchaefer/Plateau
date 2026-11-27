@@ -766,19 +766,19 @@ fn falls_and_hashes_match_natively_as_modules_and_across_o_and_o0() {
 
     // 4. Cross-build golden digest: verified bit-identical whether `plateau-engine` itself is
     //    built with `-O` (`--release`), dev (`opt-level=1`), or `-O0` (`-C opt-level=0`).
-    const KEPT_SAVE_SHA: &str = "45886be98dba6ec69c971083df6c77c108aa5c343f5809677df7becddc77308b";
-    const KEPT_LOG_SHA: &str = "111447177223c99e224266d8c180d4bf46efaf33c5caee51fa1a5468ca2f0b8f";
+    const KEPT_SAVE_SHA: &str = "ba3ab7c7bfd27f7b9b517847f37b7fa2efdd4beaa75ce5f54f054206bd1b59b9";
+    const KEPT_LOG_SHA: &str = "24f8c8ea62febe425f1f2d49d531ecb5f96554c79e9bd9b42922a3295375b911";
     const KEPT_SDF: [u64; 8] = [
-        0xdff4_4c27_baed_66a8,
-        0xe633_462b_d040_5c6f,
-        0x0d79_bdce_3081_5401,
-        0x461c_ba38_0c6a_0280,
-        0xcc2f_5671_92ae_8ff8,
-        0x408b_abae_2d5d_04e0,
-        0x94a1_8c76_694c_5f5b,
-        0xdc80_fa30_c327_4040,
+        0xa4ec_3407_8b19_e715,
+        0xf95f_54d6_4d05_8f32,
+        0x3fd8_a32e_0aba_484c,
+        0x59bb_1e64_c28b_f175,
+        0xe85c_710d_081c_0e6b,
+        0x5e53_5fc4_d142_a1a2,
+        0xf0c2_409f_d742_3532,
+        0x49bf_f506_4429_177a,
     ];
-    const KEPT_CHUNKS: [u64; 2] = [0x76ae_0037_39d4_e29a, 0xbc99_9ac9_c45c_26c6];
+    const KEPT_CHUNKS: [u64; 2] = [0x76ae_0037_39d4_e29a, 0xcea0_89ce_53c6_447e];
 
     let save_sha = sha256_hex(save_o.as_bytes());
     let log_sha = sha256_hex(log_o.as_bytes());
@@ -823,7 +823,7 @@ fn aiming_at_a_stumps_root_or_the_grass_beside_it_never_targets_the_fallen_trunk
     let s = done(act(&mut world, &mut body, Action::Sculpt {
         edit: bowl,
         hit: grass_hit,
-        tool: Tool::Saw,
+        tool: Tool::All,
         target: SculptTarget::Terrain { aimed: None },
     }));
     assert_eq!(s.promoted, vec![stump], "only the stump is touched by the carve near its root");

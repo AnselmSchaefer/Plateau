@@ -6,7 +6,7 @@ mod played;
 
 use plateau_engine::reach::{Reach, World};
 use plateau_engine::{Description, Region, Size, laws};
-use plateau_sdk::{Answer, Area, Material, Place, Point, View, cuboid, cut, point, union};
+use plateau_sdk::{Answer, Area, Material, Place, Point, View, cuboid, cut, point, strata, union};
 use played::Native;
 
 const SEED: u64 = 7;
@@ -29,6 +29,7 @@ fn verdicts(area: &mut dyn Region) -> Vec<(&'static str, laws::Verdict)> {
     let sizes = laws::sizes_agree(area, &d, LOOKS, RAYS).unwrap();
     let long = laws::never_too_long(area, &d, LOOKS, RAYS).unwrap();
     let inside = laws::surfaces_have_an_inside(area, &d, LOOKS, RAYS).unwrap();
+    let strata_law = laws::materials_go_down(area, &d, LOOKS, RAYS).unwrap();
     let mut world = World::new(area, &d.places);
     let all: Reach = world.reach(&Size::ALL).unwrap();
     let gates = laws::gates_are_real(&mut world, &all, &d).unwrap();
@@ -37,6 +38,7 @@ fn verdicts(area: &mut dyn Region) -> Vec<(&'static str, laws::Verdict)> {
         ("sizes agree", sizes),
         ("never too long", long),
         ("surfaces have an inside", inside),
+        ("materials go down", strata_law),
         ("gates are real", gates),
         ("no traps", traps),
     ]
@@ -101,6 +103,8 @@ const LONG: u8 = 5;
 /// A hollow by the start cut out exactly down from the ground's surface: across its mouth the
 /// distance is nought, a surface with nothing inside it.
 const LID: u8 = 6;
+/// Ground that stays `Grass` all the way down instead of layering into soil/stone.
+const DEEP_GRASS: u8 = 7;
 
 struct Yard<const KIND: u8>;
 
@@ -133,7 +137,12 @@ impl<const KIND: u8> Area for Yard<KIND> {
         let slot = if wide > 0.0 { cuboid(p - point(40.3 + east, high * 0.5, 32.0), point(0.35, high * 0.5, wide)) } else { 1000.0 };
         let stone = cut(block, union(room, slot));
         let ground = cut(ground, union(room, slot));
-        Answer::new(ground, Material::Grass).or(Answer::new(stone, Material::Stone))
+        let ground_mat = if KIND == DEEP_GRASS {
+            Material::Grass
+        } else {
+            strata(-p.y, &[(Material::Grass, 0.08), (Material::Soil, 0.6), (Material::Stone, 0.0)])
+        };
+        Answer::new(ground, ground_mat).or(Answer::new(stone, Material::Stone))
     }
 }
 
@@ -204,6 +213,14 @@ fn a_hollow_cut_down_from_the_ground_s_very_surface_breaks_surfaces_have_an_insi
     assert_eq!(broken, ["surfaces have an inside"], "{v:#?}");
     let why = why(&v, "surfaces have an inside");
     assert!(why.contains("comes to nought") && why.contains(", 0.0"), "{why}");
+}
+
+#[test]
+fn grass_thirty_centimetres_underground_breaks_materials_go_down() {
+    let (broken, v) = broken::<DEEP_GRASS>();
+    assert_eq!(broken, ["materials go down"], "{v:#?}");
+    let why = why(&v, "materials go down");
+    assert!(why.contains("materials do not go down") && why.contains("grass") && why.contains("strata"), "{why}");
 }
 
 /// For looking at what the laws take and find over the garden: `cargo test --release -p

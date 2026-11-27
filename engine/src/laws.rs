@@ -13,6 +13,7 @@
 //! | `nans_unseen` | The same answers with every NaN made one and with the machine's own |
 //! | `never_too_long` | No distance is longer than the way to the surface |
 //! | `surfaces_have_an_inside` | Wherever the distance comes to nought, something is solid right by it |
+//! | `materials_go_down` | Below every solid surface reached, thin surface coats (grass, moss, leaf) give way to subsoil or core material (soil, mud, sand, stone, wood) |
 //! | `sketch_materials` | Blue is water, grey is stone rock/cliff, brown is land (not water), within a tolerance |
 //! | `sketch_places` | Every orange mark is reached by the tiny alone, and every purple mark by giants alone |
 //! | `borders_match` | Ground height, water level, and surface material are continuous along a shared edge with a neighbouring area |
@@ -423,6 +424,133 @@ pub fn surfaces_have_an_inside(area: &mut dyn Region, description: &Description,
              body stands on it or walks into it, though nothing is there. It is where a shape cut out ends exactly at the surface of \
              what it is cut from: make what is cut out reach a little beyond it (a pit from above the ground, a door through more \
              than the wall's thickness), and answer a bound only well away from what it bounds."
+        )),
+    })
+}
+
+/// **Materials go down** (`WORLD_PLAN.md`, phase H): below every solid surface reached, at a few
+/// depths inside the solid (30 cm, 60 cm, 1.2 m), the material is plausible — thin surface coats
+/// (`Grass`, `Moss`, `Leaf`) do not persist deep inside solid ground, rock or walls, giving way to
+/// subsoil or core material (`Soil`, `Mud`, `Sand`, `Stone`, `Wood`).
+pub fn materials_go_down(area: &mut dyn Region, description: &Description, seed: u32, rays_a_size: usize) -> Result<Verdict> {
+    const DEPTHS: [f32; 3] = [0.30, 0.60, 1.20];
+    const GRID: usize = 16;
+    let size = Size::Person.height();
+    let close = 0.01f32;
+    let spots = spots(description);
+    let mut next = numbers(seed);
+
+    // Combine a 16×16 downward grid (covering all terrain) with seeded rays around `spots` and the
+    // area (hitting vertical walls, mossy rock faces, and overhangs).
+    let mut all_rays: Vec<([f32; 3], [f32; 3])> = Vec::with_capacity(GRID * GRID + rays_a_size);
+    for gz in 0..GRID {
+        for gx in 0..GRID {
+            let x = (gx as f32 + 0.5) * (WIDTH / GRID as f32);
+            let z = (gz as f32 + 0.5) * (WIDTH / GRID as f32);
+            all_rays.push(([x, HIGHEST, z], [0.0, -1.0, 0.0]));
+        }
+    }
+    all_rays.extend(rays(&spots, size, rays_a_size, &mut next));
+
+    let far_grid = HIGHEST - LOWEST;
+    let far_ray = 6.0 * size;
+    let mut t = vec![0.0f32; all_rays.len()];
+    let mut active: Vec<usize> = (0..all_rays.len()).collect();
+    let mut hits: Vec<([f32; 3], Material)> = Vec::new();
+
+    for _ in 0..240 {
+        if active.is_empty() {
+            break;
+        }
+        let points: Vec<_> = active.iter().map(|&k| along(&all_rays[k], t[k])).collect();
+        let out = answers(area, &points, size)?;
+        let mut still = Vec::new();
+        for (j, &k) in active.iter().enumerate() {
+            let a = out[j];
+            if a.distance < close {
+                if t[k] > 0.0 && a.material != Material::Water {
+                    hits.push((along(&all_rays[k], t[k]), a.material));
+                }
+                continue;
+            }
+            let max_t = if k < GRID * GRID { far_grid } else { far_ray };
+            t[k] += a.distance.max(0.02);
+            if t[k] <= max_t {
+                still.push(k);
+            }
+        }
+        active = still;
+    }
+
+    if hits.is_empty() {
+        return Ok(Ok(()));
+    }
+
+    // Batch-estimate outward surface normals at all solid hits via 4 tetrahedral SDF probes.
+    let eps = 0.025f32;
+    let offs = [[1.0f32, -1.0, -1.0], [-1.0, -1.0, 1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, 1.0]];
+    let mut norm_pts = Vec::with_capacity(hits.len() * 4);
+    for &(q, _) in &hits {
+        for o in &offs {
+            norm_pts.push([q[0] + o[0] * eps, q[1] + o[1] * eps, q[2] + o[2] * eps]);
+        }
+    }
+    let norm_out = answers(area, &norm_pts, size)?;
+
+    let mut probes: Vec<(usize, f32, [f32; 3])> = Vec::with_capacity(hits.len() * DEPTHS.len());
+    for (hi, &(q, _)) in hits.iter().enumerate() {
+        let mut g = [0.0f32; 3];
+        for (oi, o) in offs.iter().enumerate() {
+            let d = norm_out[hi * 4 + oi].distance;
+            for a in 0..3 {
+                g[a] += o[a] * d;
+            }
+        }
+        let len = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        let n = if len > 1e-6 { [g[0] / len, g[1] / len, g[2] / len] } else { [0.0, 1.0, 0.0] };
+        for &depth in &DEPTHS {
+            probes.push((hi, depth, [q[0] - n[0] * depth, q[1] - n[1] * depth, q[2] - n[2] * depth]));
+        }
+    }
+
+    let probe_pts: Vec<[f32; 3]> = probes.iter().map(|p| p.2).collect();
+    let probe_out = answers(area, &probe_pts, size)?;
+
+    let mut worst: Option<(f32, String)> = None;
+    let mut bad_hits = std::collections::HashSet::new();
+    for (&(hi, depth, p), ans) in probes.iter().zip(&probe_out) {
+        // Only judge points genuinely deep inside a solid body (not air, water, or thin leaves/pads).
+        if ans.distance > -0.10 || ans.material == Material::Water {
+            continue;
+        }
+        if matches!(ans.material, Material::Grass | Material::Moss | Material::Leaf) {
+            bad_hits.insert(hi);
+            let (surf_p, surf_mat) = hits[hi];
+            let score = depth + (-ans.distance);
+            if worst.as_ref().is_none_or(|(w, _)| score > *w) {
+                worst = Some((
+                    score,
+                    format!(
+                        "at {} ({} inside the {} surface at {}), the material is still {}",
+                        at(p, size),
+                        length(depth),
+                        surf_mat.name(),
+                        at(surf_p, size),
+                        ans.material.name()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(match worst {
+        None => Ok(()),
+        Some((_, why)) => Err(format!(
+            "materials do not go down: {why} ({} of {} solid surfaces failed; seed {seed}). Thin surface coats (grass, moss, leaf) \
+             must give way to subsoil or core material (soil, mud, sand, stone, wood) with depth; layer materials with \
+             `strata(depth, &[(Material::Grass, 0.08), (Material::Soil, 0.7), (Material::Stone, 0.0)])`.",
+            bad_hits.len(),
+            hits.len()
         )),
     })
 }

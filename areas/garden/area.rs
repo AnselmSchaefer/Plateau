@@ -88,7 +88,12 @@ impl Garden {
         let surface = self.height(p.x, p.z) + along_wall * detail(point(p.x, 0.0, p.z), view, 1.5, 0.05, self.seed ^ 0x9e37);
         let r = (p - POND).flat_length();
         let shore = 8.0 + 0.6 * noise(p / 1.5, self.seed ^ 0x3c);
-        let material = if r < shore { Material::Mud } else { Material::Grass };
+        let depth = surface - p.y;
+        let material = if r < shore {
+            strata(depth, &[(Material::Mud, 0.45), (Material::Soil, 0.8), (Material::Stone, 0.0)])
+        } else {
+            strata(depth, &[(Material::Grass, 0.08), (Material::Soil, 0.7), (Material::Stone, 0.0)])
+        };
         // The lumps' octaves add up to slopes of nearly one where they line up: the distance made
         // shorter to stay never too long (the law found it 1.1 times too long at 0.85).
         let ground = Answer::new((p.y - surface) * 0.7, material);
@@ -143,12 +148,13 @@ impl Garden {
         let patch = noise(p / 0.7, self.seed ^ 0x6d) + 1.5 * between(-(p - point(53.7, self.floor, CRACK_Z)).length(), -0.4, -0.15);
         let moss = between(patch, 0.25, 0.45) * between(foot + 0.35 - p.y, 0.0, 0.1);
         if moss > 0.0 {
-            wall.material = Material::Moss;
+            // Moss is a thin skin over the stone wall: 3 cm deep it gives way to the stone core.
+            let mat = strata(-wall.distance, &[(Material::Moss, 0.03), (Material::Stone, 0.0)]);
             // A forest of tufts to the tiny.
             // They rise and fall as steeply as a distance grows: the distance halved where they are.
             let seen = view.sees(0.006) * moss;
             let tufts = seen * 0.004 * (0.6 + 0.4 * noise(p / 0.005, self.seed ^ 0x2b));
-            wall = Answer::new((wall.distance - tufts) * (1.0 - 0.5 * seen), wall.material);
+            wall = Answer::new((wall.distance - tufts) * (1.0 - 0.5 * seen), mat);
         }
         wall
     }

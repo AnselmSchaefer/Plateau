@@ -6,9 +6,9 @@ use super::{World, WorldAction};
 use crate::Material;
 use crate::compose::{PlacementTransform, quat_rotate};
 use crate::graph::Relation;
-use crate::cut::{CarryDecision, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass};
+use crate::cut::{CarryDecision, check_carry_with_load, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass};
 use crate::math;
-use crate::physics::{BuoyancyState, Tool, player_mass_kg, step_floating_move};
+use crate::physics::{BuoyancyState, Tool, WorldMode, player_mass_kg, step_floating_move};
 use crate::rules::Action as Rule;
 
 /// Whether `rot` lies its element on its side (its own up within 60° of level).
@@ -27,6 +27,9 @@ impl World {
     /// check (`falls`): what stood upright is pushed over along `dir` and falls where it falls, onto
     /// whatever is there; each comes to rest on what it touches.
     pub(super) fn cut(&mut self, actor: &mut Actor<'_>, id: u32, hit: [f32; 3], dir: [f32; 3], tool: Tool, material: Option<Material>) -> Outcome {
+        if self.mode == WorldMode::World && tool == Tool::All {
+            return Outcome::Denied("Workshop tool (all) is only available in workshop mode — switch to Saw or Pickaxe".into());
+        }
         let Some(original) = self.find(id).cloned() else { return Outcome::Denied("aim at a placed object within reach to chop (K)".into()) };
         if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: original.pos, owner: self.owner_of(id) }) {
             return Outcome::Denied(denial.reason);
@@ -105,7 +108,8 @@ impl World {
         if self.graph.contains(&Relation::uprooted(id)) {
             phys.rooted = false;
         }
-        match check_carry(&phys, self.is_sdf_element(&pl), actor.body.size) {
+        let extra_kg = self.carried_pack_kg(actor.id);
+        match check_carry_with_load(&phys, self.is_sdf_element(&pl), actor.body.size, extra_kg) {
             CarryDecision::Blocked(reason) => Outcome::Denied(reason),
             CarryDecision::Allowed { .. } => {
                 self.take_held(id);
@@ -178,7 +182,7 @@ impl World {
         if speed.abs() <= 1e-4 && turn_rate.abs() <= 1e-4 {
             return Outcome::Unchanged(String::new());
         }
-        let rider_kg = player_mass_kg(body.size);
+        let rider_kg = player_mass_kg(body.size) + self.carried_pack_kg(actor.id);
         let (new_tf, buoy) = match step_floating_move(&phys, old_tf, speed, turn_rate, dt, &mut self.region, rider_kg, 0.0) {
             Ok(stepped) => stepped,
             Err(e) => return Outcome::Denied(format!("paddling failed: {e}")),

@@ -347,6 +347,7 @@ fn multi_area_scene_world_isolation_and_cross_border_sculpting() {
         blend: 0.2,
         material: None,
         stamp_size: 1.7,
+        tool: plateau_engine::Tool::All,
     })
     .unwrap();
     let mut composed = Composed::new(atlas, Arc::new(ComposedLog::with_edits(Arc::new(log))));

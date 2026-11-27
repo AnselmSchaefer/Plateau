@@ -15,10 +15,11 @@ use crate::compose::PlacedElement;
 use crate::cut::world_edit_to_local;
 use crate::edit::{Edit, Op};
 use crate::graph::{GraphDelta, Opening, Relation};
-use crate::physics::Tool;
+use crate::laws::length;
+use crate::physics::{BrushCheck, Tool, WorldMode, check_carve_brush, estimate_add_mass_kg};
 use crate::rules::Action as Rule;
 use crate::water::WaterLog;
-use crate::{Material, Region};
+use crate::Material;
 
 /// Who acts: their id (for the rule book and authorship) and their body (size, where they stand).
 pub struct Actor<'a> {
@@ -75,6 +76,8 @@ pub enum Action {
     Steer { forward: f32, turn: f32, dt: f32 },
     /// `F` on what is at `at`: allowed or not (what it does is the element's own, not the world's).
     Interact { at: [f32; 3] },
+    /// Switches between `world` mode (tools & material economy) and `workshop` mode (sandbox).
+    SetMode { mode: WorldMode },
     Undo,
     Redo,
 }
@@ -92,6 +95,7 @@ impl Action {
             Action::Pilot { .. } => "pilot",
             Action::Steer { .. } => "steer",
             Action::Interact { .. } => "interact",
+            Action::SetMode { .. } => "set_mode",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -118,6 +122,9 @@ pub struct Summary {
     /// What it did to the world graph.
     #[serde(default, skip_serializing_if = "GraphDelta::is_empty")]
     pub graph: GraphDelta,
+    /// Net material mass deltas `(material, kg)` for the actor (phase H, `world` mode).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory: Vec<(Material, f32)>,
     /// What the player is told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub said: Option<String>,
@@ -168,6 +175,7 @@ impl World {
         let yaw = actor.body.yaw;
         let id = actor.id.to_string();
         self.journal = GraphDelta::default();
+        self.inv_journal.clear();
         self.pending = Default::default();
         let pushed = self.history.pushed;
         let mut outcome = match &action {
@@ -183,11 +191,12 @@ impl World {
             Action::Pilot { id } => self.pilot(*id),
             Action::Steer { forward, turn, dt } => self.steer(&mut actor, *forward, *turn, *dt),
             Action::Interact { at } => self.may_interact(&actor, *at),
+            Action::SetMode { mode } => self.set_mode(*mode),
             Action::Undo => self.undo(actor.body),
             Action::Redo => self.redo(&mut actor),
         };
         // What it shook settles: what came apart, and what fell (undone with it).
-        if outcome.is_done() && !matches!(action, Action::Undo | Action::Redo | Action::Steer { .. }) {
+        if outcome.is_done() && !matches!(action, Action::Undo | Action::Redo | Action::Steer { .. } | Action::SetMode { .. }) {
             let settled = self.settle_support();
             if let Outcome::Done(summary) = &mut outcome
                 && !(settled.added.is_empty() && settled.fell.is_empty())
@@ -216,15 +225,18 @@ impl World {
         self.pending = Default::default();
         let joined = (self.history.pushed - pushed) as usize;
         self.history.join_last(joined);
-        // What it did to the graph goes with its undo, and is said in its outcome.
+        // What it did to the graph and player inventories goes with its undo, and is said in its outcome.
         let delta = self.take_journal();
+        let inv_delta = self.take_inv_journal();
         if self.history.pushed != pushed
             && let Some(done) = self.history.undo.last_mut()
         {
             done.graph = delta.clone();
+            done.inventory = inv_delta.clone();
         }
         if let Outcome::Done(summary) = &mut outcome {
             summary.graph = delta;
+            summary.inventory = inv_delta.iter().filter(|(p, _, _)| p == &id).map(|(_, m, kg)| (*m, *kg)).collect();
         }
         if let Some(log) = &mut self.log {
             let after = self.region.log.revision();
@@ -240,32 +252,127 @@ impl World {
         Summary { edits: self.edits.len(), elements: self.placed.len(), said: Some(said.into()), ..Summary::default() }
     }
 
-    fn sculpt(&mut self, actor: &mut Actor<'_>, edit: Edit, hit: [f32; 3], tool: Tool, target: SculptTarget) -> Outcome {
+    fn set_mode(&mut self, mode: WorldMode) -> Outcome {
+        if self.mode == mode {
+            return Outcome::Unchanged(format!("already in {} mode", mode.name()));
+        }
+        self.mode = mode;
+        self.dirty = true;
+        Outcome::Done(self.summary(format!("mode: {} (tool: {})", mode.name(), mode.default_tool().short_name())))
+    }
+
+    fn is_duplicate_stamp(&self, target: SculptTarget, edit: &Edit) -> bool {
+        match target {
+            SculptTarget::Terrain { .. } => self.edits.edits().last() == Some(edit),
+            SculptTarget::Element(id) => self.find(id).is_some_and(|pl| pl.local_edits.last() == Some(&world_edit_to_local(edit, pl.transform()))),
+        }
+    }
+
+    fn sculpt(&mut self, actor: &mut Actor<'_>, mut edit: Edit, hit: [f32; 3], tool: Tool, target: SculptTarget) -> Outcome {
         if let Err(e) = edit.validate() {
             return Outcome::Denied(format!("sculpt error: {e}"));
         }
-        let size = actor.body.size;
-        // The same stamp as the last changes nothing but the log.
-        let duplicate = match target {
-            SculptTarget::Terrain { .. } => self.edits.edits().last() == Some(&edit),
-            SculptTarget::Element(id) => self.find(id).is_some_and(|pl| pl.local_edits.last() == Some(&world_edit_to_local(&edit, pl.transform()))),
-        };
-        if duplicate {
-            return Outcome::Unchanged(String::new());
-        }
-        // A tool carves only what it is for, by what it meets where it is aimed.
-        if edit.op == Op::Carve {
-            let _span = info_span!("tool").entered();
-            let mut out = Vec::new();
-            let material = self.combined().sample(&[hit], size, &mut out).ok().and_then(|_| out.first().map(|a| a.material));
-            if let Some(reason) = material.and_then(|m| tool.can_carve(m).err()) {
-                return Outcome::Denied(reason);
+        // Mode rules (`WORLD_PLAN.md`, phase H).
+        if self.mode == WorldMode::World {
+            if tool == Tool::All {
+                return Outcome::Denied("Workshop tool (all) is only available in workshop mode — switch to Saw, Pickaxe, or Shovel".into());
+            }
+            if edit.op == Op::Carve && edit.material.is_some() {
+                return Outcome::Denied("carving cannot repaint walls in world mode".into());
             }
         }
-        match target {
+        // Record the tool that made this edit so saves and replays can verify it again.
+        edit.tool = tool;
+        // The same stamp as the last changes nothing but the log.
+        if self.is_duplicate_stamp(target, &edit) {
+            return Outcome::Unchanged(String::new());
+        }
+
+        // Whole-brush tool check and material economy calculation (`WORLD_PLAN.md`, phase H).
+        let target_id = match target {
+            SculptTarget::Element(id) => Some(id),
+            SculptTarget::Terrain { aimed } => aimed,
+        };
+        let unpromoted = self.unpromoted_sdfs_near(&edit, target_id);
+        let mut carve_yield = [0.0f32; 9];
+        let mut add_cost: Option<(Material, f32)> = None;
+        let mut shrink_note: Option<String> = None;
+        match edit.op {
+            Op::Carve => {
+                let _span = info_span!("tool").entered();
+                match check_carve_brush(tool, edit, hit, &mut self.region, &self.scene, &unpromoted) {
+                    Ok(BrushCheck::Ok { yield_kg }) => {
+                        carve_yield = yield_kg;
+                    }
+                    Ok(BrushCheck::Shrunk { edit: shrunk, blocked, yield_kg }) => {
+                        edit = shrunk;
+                        carve_yield = yield_kg;
+                        shrink_note = Some(format!(
+                            "{} stopped at {} — shrunk brush to {}",
+                            tool.short_name(),
+                            blocked.name(),
+                            length(edit.shape.radius())
+                        ));
+                        if self.is_duplicate_stamp(target, &edit) {
+                            return Outcome::Unchanged(String::new());
+                        }
+                    }
+                    Ok(BrushCheck::Refused { reason, .. }) => return Outcome::Denied(reason),
+                    Err(e) => return Outcome::Denied(format!("tool check failed: {e}")),
+                }
+            }
+            Op::Add => {
+                let _span = info_span!("tool").entered();
+                let mat = edit.material.unwrap_or(Material::Soil);
+                if let Err(reason) = tool.can_add(mat) {
+                    return Outcome::Denied(reason);
+                }
+                if self.mode == WorldMode::World {
+                    let need_kg = match estimate_add_mass_kg(&edit, mat, &mut self.region, &self.scene, &unpromoted) {
+                        Ok(kg) => kg,
+                        Err(e) => return Outcome::Denied(format!("material check failed: {e}")),
+                    };
+                    if need_kg > 0.0 {
+                        let mut preview = self.inventory(actor.id);
+                        if let Err(reason) = preview.take(mat, need_kg) {
+                            return Outcome::Denied(reason);
+                        }
+                        add_cost = Some((mat, need_kg));
+                    }
+                }
+            }
+        }
+
+        let mut outcome = match target {
             SculptTarget::Element(id) => self.sculpt_element(actor, id, edit),
             SculptTarget::Terrain { aimed } => self.sculpt_terrain(actor, edit, aimed),
+        };
+        if let Outcome::Done(summary) = &mut outcome {
+            if self.mode == WorldMode::World {
+                match edit.op {
+                    Op::Carve => {
+                        for m in Material::ALL {
+                            let kg = carve_yield[m as usize];
+                            if kg > 0.0 {
+                                self.record_inventory(actor.id, m, kg);
+                            }
+                        }
+                    }
+                    Op::Add => {
+                        if let Some((mat, kg)) = add_cost {
+                            self.record_inventory(actor.id, mat, -kg);
+                        }
+                    }
+                }
+            }
+            if let Some(note) = shrink_note {
+                summary.said = Some(match summary.said.take() {
+                    Some(s) if !s.is_empty() => format!("{note}; {s}"),
+                    _ => note,
+                });
+            }
         }
+        outcome
     }
 
     fn sculpt_element(&mut self, actor: &Actor<'_>, id: u32, edit: Edit) -> Outcome {
@@ -494,6 +601,7 @@ impl World {
             Err(Refused::Denied(why)) => return Outcome::Denied(why),
         };
         self.revert_graph(&done.graph, false);
+        self.revert_inventory(&done.inventory, false);
         self.history.redo.push(done);
         Outcome::Done(self.summary(said))
     }
@@ -578,6 +686,7 @@ impl World {
             Err(Refused::Denied(why)) => return Outcome::Denied(why),
         };
         self.revert_graph(&done.graph, true);
+        self.revert_inventory(&done.inventory, true);
         self.history.undo.push(done);
         Outcome::Done(self.summary(said))
     }

@@ -313,15 +313,32 @@ pub fn format_mass(kg: f32) -> String {
 /// Native SDF landforms (`is_sdf == true`) are part of the terrain; discrete procedural `Scene`
 /// elements (including ones with carved local tunnels) remain portable within weight/rooting limits.
 pub fn check_carry(phys: &ObjectPhysics, is_sdf: bool, player_size: f32) -> CarryDecision {
+    check_carry_with_load(phys, is_sdf, player_size, 0.0)
+}
+
+/// Checks whether a player of height `player_size` who already carries `extra_mass_kg` of bulk
+/// materials in their pack can pick up and carry this element (`WORLD_PLAN.md`, phase H).
+pub fn check_carry_with_load(phys: &ObjectPhysics, is_sdf: bool, player_size: f32, extra_mass_kg: f32) -> CarryDecision {
     if is_sdf {
         return CarryDecision::Blocked("Rooted in terrain — sculpt with B".into());
     }
     let max_mass = max_carry_mass_kg(player_size);
     let max_span = max_carry_span(player_size);
-    if phys.world_mass_kg > max_mass || phys.world_span > max_span {
+    let extra = max_f32(extra_mass_kg, 0.0);
+    let total_mass = phys.world_mass_kg + extra;
+    if total_mass > max_mass || phys.world_span > max_span {
+        if extra > 0.0 && phys.world_mass_kg <= max_mass && phys.world_span <= max_span {
+            return CarryDecision::Blocked(format!(
+                "Too heavy with pack ({} + {} pack = {} > {}) — place material or grow larger",
+                format_mass(phys.world_mass_kg),
+                format_mass(extra),
+                format_mass(total_mass),
+                format_mass(max_mass)
+            ));
+        }
         return CarryDecision::Blocked(format!(
             "Too heavy at this size ({} > {}) — grow larger or chop smaller (K)",
-            format_mass(phys.world_mass_kg),
+            format_mass(total_mass),
             format_mass(max_mass)
         ));
     }
@@ -329,7 +346,7 @@ pub fn check_carry(phys: &ObjectPhysics, is_sdf: bool, player_size: f32) -> Carr
     if phys.rooted && phys.world_mass_kg > uproot {
         return CarryDecision::Blocked("Rooted in the ground — press K to chop free (or grow larger)".into());
     }
-    let load = clamp_f32(phys.world_mass_kg / max_f32(max_mass, 1e-9), 0.0, 1.0);
+    let load = clamp_f32(total_mass / max_f32(max_mass, 1e-9), 0.0, 1.0);
     let speed_factor = 1.0 - 0.36 * load;
     CarryDecision::Allowed { speed_factor }
 }
@@ -390,6 +407,7 @@ pub fn world_edit_to_local(edit: &Edit, tf: PlacementTransform) -> Edit {
         blend: edit.blend * inv,
         material: edit.material,
         stamp_size: edit.stamp_size * inv,
+        tool: edit.tool,
     }
 }
 

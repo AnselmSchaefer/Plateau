@@ -35,12 +35,13 @@ impl Element for MossyHill {
         let rough = detail(p, view, 1.1, 0.055, s32);
         let d = (base + rough) * 0.72;
 
-        // Material stratification: grassy crown, mossy shoulders, rocky flanks.
+        // Material stratification: grassy crown over soil & stone, mossy shoulders over stone, rocky flanks.
         let n = noise(p * 0.9, s32.wrapping_add(7));
+        let depth = -d;
         let mat = if p.y > 0.85 + n * 0.22 {
-            Material::Grass
+            strata(depth, &[(Material::Grass, 0.08), (Material::Soil, 0.35), (Material::Stone, 0.0)])
         } else if p.y > 0.15 + n * 0.28 {
-            Material::Moss
+            strata(depth, &[(Material::Moss, 0.04), (Material::Stone, 0.0)])
         } else {
             Material::Stone
         };

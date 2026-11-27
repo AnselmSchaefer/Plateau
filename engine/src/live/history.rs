@@ -1,6 +1,7 @@
 //! Undo and redo (`WORLD_PLAN.md`, phase E): what each change did, kept so it can be undone, across
 //! sculpting, promotion, placing, chopping and moving.
 
+use crate::Material;
 use crate::compose::{PlacedElement, PlacementTransform};
 use crate::edit::Edit;
 use crate::graph::GraphDelta;
@@ -24,11 +25,13 @@ pub enum WorldAction {
     Many(Vec<WorldAction>),
 }
 
-/// A change kept for undo: what it did to the world, and to the graph.
+/// A change kept for undo: what it did to the world, to the graph, and to player inventories.
 #[derive(Clone, Debug)]
 pub struct Done {
     pub action: WorldAction,
     pub graph: GraphDelta,
+    /// Signed material mass deltas `(player_id, material, delta_kg)` applied by this action.
+    pub inventory: Vec<(String, Material, f32)>,
 }
 
 /// Changes to undo, most recent last, and those undone, to redo.
@@ -42,10 +45,10 @@ pub struct History {
 }
 
 impl History {
-    /// A new change: undoable, and what was undone is no longer redone. Its graph delta is given
-    /// once the action is done (`World::apply`).
+    /// A new change: undoable, and what was undone is no longer redone. Its graph and inventory
+    /// deltas are given once the action is done (`World::apply`).
     pub fn push(&mut self, action: WorldAction) {
-        self.undo.push(Done { action, graph: GraphDelta::default() });
+        self.undo.push(Done { action, graph: GraphDelta::default(), inventory: Vec::new() });
         self.redo.clear();
         self.pushed += 1;
     }
@@ -57,6 +60,10 @@ impl History {
             return;
         }
         let tail = self.undo.split_off(self.undo.len() - n);
-        self.undo.push(Done { action: WorldAction::Many(tail.into_iter().map(|d| d.action).collect()), graph: GraphDelta::default() });
+        self.undo.push(Done {
+            action: WorldAction::Many(tail.into_iter().map(|d| d.action).collect()),
+            graph: GraphDelta::default(),
+            inventory: Vec::new(),
+        });
     }
 }
