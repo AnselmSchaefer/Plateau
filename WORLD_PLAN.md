@@ -394,18 +394,47 @@ When a tree's trunk is removed, the tree falls.
   of falls replays bit for bit. `graph.rs`: a chopped trunk rests on the lawn and its stump's edge;
   a log on a removed bridge falls (no longer "loose until G").
 
-Short of the done-when:
-- **The same results natively and as modules, at `-O` and `-O0`** is not tested. Falls use only
-  IEEE arithmetic and `math`, and replay is bit-exact within one build, but no test compares the
-  hashes of falls across builds or against the areas played natively.
-- A part that no plane parts from the rest (interlocking, a ring cut round) is left joined: the
-  component mask (a piece's own baked `MeshSdf`, or carve edits of the rest) is not built.
-- Strokes smaller than half a cell (a tiny tunnelling into an oak) are not asked about until a
-  larger change to that element: a tiny cannot fell an oak alone.
-- Not asked: whether something set down (`Drop`, `Place`) balances where it is put (only what falls,
-  breaks or is cut is); what rests on something carried (until it is set down, as in F).
-- Falling bodies are their cells (about 13 cm for a person-size oak): a notch finer than a cell is
-  found by the cross-section, but what it then stands on is coarse.
+*Slice 2 done 2026-11-27 (headless tests only; not yet played by hand), and with it phase G:*
+
+- **Component mask for non-planar splits** (`support::mask_boxes`, `live::falls`, `graph`, `cut`):
+  where no single `separating_plane` parts two disconnected components (a ring cut around an island
+  in a bridge deck, an interlocking mortise-and-tenon cut), `mask_boxes` greedily covers the other
+  part's cells (merging empty cells not 26-adjacent to the kept part into large slabs via a 3D
+  prefix sum, capped at `MAX_MASK_BOXES = 128`) as element-local rounded `Op::Carve` boxes (`pad =
+  0.30 * cell`, `round = pad`, `blend = 0`) appended to each piece's `local_edits` (`el-sdf` in
+  `plateau-world 2`). Both pieces are promoted and linked by `rel derived_from <piece> <orig> split`
+  (`graph::Data::Split`); `cuts_are_derived` and `live::near` (`Graph::parent_of`) walk both planar
+  and masked splits; `cut::cull_non_solid_by_mask` (clamped to the solid AABB) keeps handrails,
+  leaves and lights only on the piece they belong to; `World::grab` clears `phys.rooted` on
+  `uprooted` pieces; and `show_falls` skips flashing the uncarved parent mesh for masked splits.
+  Persists cleanly in `plateau-world 2`, round-trips through save/reload, and undoes/redoes
+  bit-exactly via `WorldAction::CutElement`.
+- **Cross-build and native-vs-module determinism** (`engine/tests/support.rs`):
+  `falls_and_hashes_match_natively_as_modules_and_across_o_and_o0` compiles `garden`, `tree`,
+  `bridge` and `pillar` at `-O0` alongside the carried `-O` `.wasm` modules and their native Rust
+  sources (`areas/played` and `elements/*/element.rs`), runs the full Phase G fall suite (carved
+  trunk drop, deep notch break & tip, felled tree on bridge + bridge removal, ring-cut bridge
+  component-mask split), and verifies bit-identical saves, action logs, SDF sample hashes, and
+  chunk hashes across `-O` modules, `-O0` modules, `canonical_nans: true`, native execution, and
+  kept cross-build golden digests (verified with `plateau-engine` itself built in `dev`,
+  `--release` (`-O`), and `-C opt-level=0` (`-O0`)).
+- **Tests**: `engine/tests/support.rs` (12, three new) and `support` unit test (3, one new):
+  `a_ring_cut_island_in_a_bridge_deck_splits_by_component_mask_and_drops_through`,
+  `an_interlocking_mortise_and_tenon_cut_splits_by_mask_and_survives_a_further_cut`, and
+  `falls_and_hashes_match_natively_as_modules_and_across_o_and_o0`.
+
+Deliberately scoped (not blocking G's done-when):
+- Strokes smaller than half a cell (`worth_asking`: `radius < 0.5 * world_span / CELLS`, e.g. a
+  tiny tunnelling into a person-size oak) do not re-voxelise the element on each stroke because a
+  single sub-half-cell gap cannot clear a cell centre in the 48-cell grid; any larger stroke or
+  cross-section cut checks it.
+- Deliberate `Drop` / `Place` where an object touches a support keeps the player's aimed placement
+  without auto-rolling (so laid log bridges stay flat as aimed); loose objects placed or dropped in
+  mid-air (touching nothing) fall and balance automatically via `settle_support`, and anything
+  carried is left until set down (as in F).
+- Falling bodies use their 48-cell surface balls (~13 cm for a person-size oak) while cross-section
+  breaks sample the exact SDF on a 24×24 slice — fast, deterministic, and within G's 32–64 cell
+  spec.
 
 ### H. Materials and tools (one week; the masked carve is finished in J)
 

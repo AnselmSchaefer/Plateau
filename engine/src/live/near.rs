@@ -75,7 +75,7 @@ impl World {
         }
         let mut lineage = Vec::new();
         let mut at = id;
-        while let Some((orig, _)) = self.graph.derived_from(at) {
+        while let Some((orig, _)) = self.graph.parent_of(at) {
             lineage.push(orig);
             if lineage.len() > 16 {
                 break;

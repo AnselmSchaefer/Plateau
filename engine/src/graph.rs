@@ -7,7 +7,7 @@
 //!
 //! | Kind | From → to | Written by | Data |
 //! |---|---|---|---|
-//! | `derived_from` | a piece → the element it was cut from | `Cut`, and the support check (a part come away, a trunk broken at a notch) | the piece's own side of the cut |
+//! | `derived_from` | a piece → the element it was cut from | `Cut`, and the support check (a part come away, a trunk broken at a notch) | the piece's own side of the cut (`clip`), or `split` for a non-planar component mask |
 //! | `rests_on` | an element → what holds it up (terrain or an element) | `Place`, `Drop`, `Cut`, and the support check (where what falls comes to rest, and what the world changed under), from real contacts | — |
 //! | `owned_by` | an element → a player | `Place`; a cut piece inherits its original's owner, not the cutter | — |
 //! | `attached_to` | an element → what it is fixed to (terrain or an element): held up by it | `Place` fitted to an opening | — |
@@ -157,6 +157,8 @@ pub enum Data {
     Cut(ClipPlane),
     /// Where an opening was measured: enough to measure it again (`site::SiteProbe`, unseen).
     Opening(Opening),
+    /// Come apart without a single plane between the pieces (each keeps its own carve mask in `local_edits`).
+    Split,
 }
 
 /// An opening as it was pointed at when an element was fitted to it: a point of its wall, the way
@@ -200,6 +202,10 @@ impl Relation {
         Relation { kind: Kind::DerivedFrom, from: Node::Element(piece), to: Node::Element(original), data: Data::Cut(cut) }
     }
 
+    pub fn derived_from_split(piece: u32, original: u32) -> Relation {
+        Relation { kind: Kind::DerivedFrom, from: Node::Element(piece), to: Node::Element(original), data: Data::Split }
+    }
+
     pub fn rests_on(a: u32, b: Node) -> Relation {
         Relation::new(Kind::RestsOn, Node::Element(a), b)
     }
@@ -238,7 +244,8 @@ impl Relation {
         }
         match (self.kind, self.data) {
             (Kind::DerivedFrom, Data::Cut(c)) => c.validate(),
-            (Kind::DerivedFrom, _) => bail!("a `derived_from` relation needs its cut"),
+            (Kind::DerivedFrom, Data::Split) => Ok(()),
+            (Kind::DerivedFrom, _) => bail!("a `derived_from` relation needs its cut or `split`"),
             (Kind::Fills, Data::Opening(o)) => o.validate(),
             (Kind::Fills, _) => bail!("a `fills` relation needs its opening"),
             (_, Data::None) => Ok(()),
@@ -256,6 +263,7 @@ impl Relation {
                 let [t, n] = [o.target, o.normal];
                 s.push_str(&format!(" opening {} {} {} normal {} {} {} size {}", t[0], t[1], t[2], n[0], n[1], n[2], o.size));
             }
+            Data::Split => s.push_str(" split"),
         }
         s
     }
@@ -275,6 +283,7 @@ impl Relation {
             ["opening", tx, ty, tz, "normal", nx, ny, nz, "size", size] => {
                 Data::Opening(Opening { target: [f(tx)?, f(ty)?, f(tz)?], normal: [f(nx)?, f(ny)?, f(nz)?], size: f(size)? })
             }
+            ["split"] => Data::Split,
             rest => bail!("line {line_no}: unknown relation data `{}`", rest.join(" ")),
         };
         let rel = Relation { kind, from, to, data };
@@ -448,6 +457,15 @@ impl Graph {
         })
     }
 
+    /// The element `piece` came from, whether by a plane (`Data::Cut`) or a component mask (`Data::Split`).
+    pub fn parent_of(&self, piece: u32) -> Option<(u32, Data)> {
+        let from = Node::Element(piece);
+        self.from_node(Kind::DerivedFrom, &from).find_map(|r| match r.to {
+            Node::Element(o) => Some((o, r.data)),
+            _ => None,
+        })
+    }
+
     /// The pieces cut from `original`, in order.
     pub fn pieces_of(&self, original: u32) -> Vec<u32> {
         let to = Node::Element(original);
@@ -552,5 +570,9 @@ mod tests {
         assert!(Relation::parse_record("rel rests_on 3 3", 1).is_err(), "nothing rests on itself");
         assert!(Relation::parse_record("rel owned_by 3 terrain", 1).is_err());
         assert!(Relation::parse_record("rel derived_from 3 1", 1).is_err(), "a piece names its cut");
+        let split = Relation::derived_from_split(5, 3);
+        assert_eq!(Relation::parse_record(&split.to_record(), 1).unwrap(), split);
+        g.add(split, &mut GraphDelta::default());
+        assert_eq!(g.parent_of(5), Some((3, Data::Split)));
     }
 }

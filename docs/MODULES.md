@@ -45,7 +45,7 @@ Made from the code by `engine/tests/docs.rs`, never by hand: each crate's module
 | `scene` | Runtime procedural scene state, multi-layer composable element isolation, dynamic instance collision, and crosshair targeting. | `compose` |
 | `site` | Site & cavity measurement (Phase C; AGENTS.md §1, §2). | `body`, `chunk`, `compose`, `laws` |
 | `sketch` | A sketched map of an area, from above (CONCEPT.md, "The sketch"; POC_PLAN.md, step 6): drawn in any paint program on a white background with the seven pens of `sketches/plateau.gpl`, north at the top (z = 0) and east to the right (x = 64). |  |
-| `support` | What still holds together, and what holds it up (`WORLD_PLAN.md`, phase G): the arithmetic of support, apart from the world that asks it (`live::falls`). | `cut`, `math` |
+| `support` | What still holds together, and what holds it up (`WORLD_PLAN.md`, phase G): the arithmetic of support, apart from the world that asks it (`live::falls`). | `cut`, `edit`, `math` |
 | `wasm` | An area's module in wasmtime, with the limits the engine keeps (POC_PLAN.md, "Running areas"): fuel for each batch, a memory limit, no SIMD and no threads, NaNs left as the machine makes them (the law `laws::nans_unseen` stands in for making them one). | `check` |
 | `water` | Engine-managed hydrostatic water bodies & dynamic pond expansion (Phase A). | `chunk`, `edit` |
 | `world` | A saved world opened without a window (Phase C): its areas, sculpting, water and placed elements, made again from the save as the player has them, for measuring sites in it (`site`), judging what is made for them (`fit`), and picturing both (`picture`). | `atlas`, `compose`, `edit`, `modules`, `scene`, `water` |

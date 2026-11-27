@@ -7,7 +7,9 @@
 //!   lowest cell up, so every machine numbers them alike.
 //! - **A plane between**: a part comes away as a new piece cut along a plane that has it on one side
 //!   and the rest on the other (`separating_plane`), so a piece is still its element with a clip.
-//!   A part no plane can part from the rest (interlocking) is left joined.
+//!   Where no single plane parts them (interlocking, a ring cut round), `mask_boxes` covers the
+//!   other part's cells in a small set of rounded box carves (element-local `Edit`s) kept with the
+//!   piece, leaving its own cells untouched.
 //! - **Footing**: whether a centre of mass stands over the points that hold it (`overhang`), and if
 //!   not, which edge it tips over, asked along sixteen directions. A cross-section holds what is
 //!   above it while the mass overhangs it by at most `SECTION_GRIP` of the section's width that way
@@ -16,11 +18,14 @@
 //! Only IEEE arithmetic (`+ - * /`, `sqrt`) and constants: the same bits on every machine.
 
 use crate::cut::ClipPlane;
+use crate::edit::{Edit, Shape};
 
 /// Cells along an element's longest side.
 pub const CELLS: usize = 48;
 /// Most cells in a grid, whatever its shape.
 pub const MAX_CELLS: usize = 48 * 48 * 48;
+/// Most box carves one non-planar component mask may take (`mask_boxes`).
+pub const MAX_MASK_BOXES: usize = 128;
 /// A cross-section holds what is above it while the mass overhangs it by at most this share of the
 /// section's width in that direction: a notch half through holds, one about three-fifths through
 /// does not.
@@ -205,6 +210,189 @@ pub fn separating_plane(grid: &Grid, labels: &[u32], part: u32, up: [f32; 3]) ->
     best.map(|(_, p)| p)
 }
 
+/// Element-local `Op::Carve` boxes (`Shape::Box`, `blend = 0`) that remove every solid cell matching
+/// `remove` (and any surface skin up to a quarter of a cell outside it) while leaving every other
+/// solid cell untouched: used when no single `separating_plane` parts two components (interlocking
+/// or ring-cut pieces).
+///
+/// Empty cells not 26-adjacent to any kept solid cell are "don't-care" and merged into large slabs,
+/// so a ring cut typically needs only a handful of boxes. Each box is padded by `0.30 * cell` with
+/// matching corner rounding (the exact Minkowski sum of the cell union with a ball of radius
+/// `0.30 * cell`), which clears all skin up to `0.25 * cell` outside removed cells while staying at
+/// least `0.407 * cell` clear of even a diagonally adjacent kept cell's centre. Returns `None` if
+/// either side is empty or the cover would exceed `MAX_MASK_BOXES`.
+pub fn mask_boxes(grid: &Grid, labels: &[u32], remove: impl Fn(u32) -> bool, stamp_size: f32) -> Option<Vec<Edit>> {
+    let [nx, ny, nz] = grid.dims;
+    let total = grid.len();
+    if labels.len() != total || total == 0 {
+        return None;
+    }
+    let mut is_keep = vec![false; total];
+    let mut uncovered = vec![false; total];
+    let (mut any_keep, mut any_remove) = (false, false);
+    for (i, &l) in labels.iter().enumerate() {
+        if l == 0 {
+            continue;
+        }
+        if remove(l) {
+            uncovered[i] = true;
+            any_remove = true;
+        } else {
+            is_keep[i] = true;
+            any_keep = true;
+        }
+    }
+    if !any_keep || !any_remove {
+        return None;
+    }
+
+    // A cell may not enter any carve box if it is a kept solid cell, or an empty cell 26-adjacent
+    // to a kept solid cell (so padding a box by 0.30 * cell never shaves a kept face). Removed
+    // solid cells are never blocked, so every one is guaranteed coverable.
+    let mut blocked = is_keep.clone();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = grid.index([x, y, z]);
+                if !is_keep[i] {
+                    continue;
+                }
+                for dz in -1isize..=1 {
+                    let nz_i = z as isize + dz;
+                    if nz_i < 0 || nz_i as usize >= nz {
+                        continue;
+                    }
+                    for dy in -1isize..=1 {
+                        let ny_i = y as isize + dy;
+                        if ny_i < 0 || ny_i as usize >= ny {
+                            continue;
+                        }
+                        for dx in -1isize..=1 {
+                            let nx_i = x as isize + dx;
+                            if nx_i < 0 || nx_i as usize >= nx {
+                                continue;
+                            }
+                            let j = grid.index([nx_i as usize, ny_i as usize, nz_i as usize]);
+                            if labels[j] == 0 {
+                                blocked[j] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3D prefix sum over `blocked` for O(1) box emptiness checks (`i32` avoids unsigned underflow
+    // during inclusion-exclusion; max sum is MAX_CELLS = 110_592).
+    let (px, py) = (nx + 1, ny + 1);
+    let pidx = |x: usize, y: usize, z: usize| (z * py + y) * px + x;
+    let mut pref = vec![0i32; px * py * (nz + 1)];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let v = blocked[grid.index([x, y, z])] as i32;
+                pref[pidx(x + 1, y + 1, z + 1)] = v
+                    + pref[pidx(x, y + 1, z + 1)]
+                    + pref[pidx(x + 1, y, z + 1)]
+                    + pref[pidx(x + 1, y + 1, z)]
+                    - pref[pidx(x, y, z + 1)]
+                    - pref[pidx(x, y + 1, z)]
+                    - pref[pidx(x + 1, y, z)]
+                    + pref[pidx(x, y, z)];
+            }
+        }
+    }
+    let has_blocked = |lo: [usize; 3], hi: [usize; 3]| -> bool {
+        let s = pref[pidx(hi[0], hi[1], hi[2])]
+            - pref[pidx(lo[0], hi[1], hi[2])]
+            - pref[pidx(hi[0], lo[1], hi[2])]
+            - pref[pidx(hi[0], hi[1], lo[2])]
+            + pref[pidx(lo[0], lo[1], hi[2])]
+            + pref[pidx(lo[0], hi[1], lo[2])]
+            + pref[pidx(hi[0], lo[1], lo[2])]
+            - pref[pidx(lo[0], lo[1], lo[2])];
+        s != 0
+    };
+
+    const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    let pad = 0.30 * grid.cell;
+    let stamp = stamp_size.max(1e-4);
+    let mut boxes = Vec::new();
+    let mut scan = 0usize;
+
+    while scan < total {
+        if !uncovered[scan] {
+            scan += 1;
+            continue;
+        }
+        if boxes.len() >= MAX_MASK_BOXES {
+            return None;
+        }
+        let seed = grid.coords(scan);
+        let mut candidates: Vec<([usize; 3], [usize; 3])> = Vec::with_capacity(6);
+        for order in ORDERS {
+            let mut lo = seed;
+            let mut hi = [seed[0] + 1, seed[1] + 1, seed[2] + 1];
+            for a in order {
+                while lo[a] > 0 {
+                    let mut try_lo = lo;
+                    try_lo[a] -= 1;
+                    if has_blocked(try_lo, hi) {
+                        break;
+                    }
+                    lo = try_lo;
+                }
+                while hi[a] < grid.dims[a] {
+                    let mut try_hi = hi;
+                    try_hi[a] += 1;
+                    if has_blocked(lo, try_hi) {
+                        break;
+                    }
+                    hi = try_hi;
+                }
+            }
+            if !candidates.contains(&(lo, hi)) {
+                candidates.push((lo, hi));
+            }
+        }
+        let (mut best_lo, mut best_hi) = candidates[0];
+        let mut best_score = (0usize, 0usize);
+        for (lo, hi) in candidates {
+            let mut covered = 0usize;
+            for z in lo[2]..hi[2] {
+                for y in lo[1]..hi[1] {
+                    for x in lo[0]..hi[0] {
+                        if uncovered[grid.index([x, y, z])] {
+                            covered += 1;
+                        }
+                    }
+                }
+            }
+            let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
+            if (covered, vol) > best_score {
+                best_score = (covered, vol);
+                best_lo = lo;
+                best_hi = hi;
+            }
+        }
+        for z in best_lo[2]..best_hi[2] {
+            for y in best_lo[1]..best_hi[1] {
+                for x in best_lo[0]..best_hi[0] {
+                    uncovered[grid.index([x, y, z])] = false;
+                }
+            }
+        }
+        let bmin = [0, 1, 2].map(|a| grid.lo[a] + best_lo[a] as f32 * grid.cell);
+        let bmax = [0, 1, 2].map(|a| grid.lo[a] + best_hi[a] as f32 * grid.cell);
+        let center = [0, 1, 2].map(|a| 0.5 * (bmin[a] + bmax[a]));
+        let half = [0, 1, 2].map(|a| 0.5 * (bmax[a] - bmin[a]) + pad);
+        boxes.push(Edit::carve(Shape::Box { half, round: pad }, center, 0.0, None, stamp));
+    }
+
+    Some(boxes)
+}
+
 /// How a mass at `com` stands over the points `points` that hold it, all seen from above as (x, z):
 /// `None` if it stands; else the direction it tips (from the sixteen) and which of `points` it tips
 /// over (the farthest that way). `grip` is how far it may overhang, as a share of the points' width
@@ -282,5 +470,48 @@ mod tests {
         assert!(overhang(&half, [0.05, 0.0], SECTION_GRIP).is_none());
         let third: Vec<[f32; 2]> = disc.iter().copied().filter(|p| p[0] <= -0.5).collect();
         assert!(overhang(&third, [0.0, 0.0], SECTION_GRIP).is_some());
+    }
+
+    #[test]
+    fn a_ring_cut_island_has_no_separating_plane_and_splits_by_mask_boxes() {
+        let mut g = Grid::over([-1.0, 0.0, -1.0], [1.0, 0.5, 1.0], 24).unwrap();
+        // A hollow outer ring surrounding a central island at the same height, with a 1-cell gap.
+        for i in 0..g.len() {
+            let c = g.centre(i);
+            if !(0.05..0.45).contains(&c[1]) {
+                continue;
+            }
+            let r = (c[0] * c[0] + c[2] * c[2]).sqrt();
+            g.solid[i] = r <= 0.28 || (0.62..=0.95).contains(&r);
+        }
+        let (labels, n) = g.parts();
+        assert_eq!(n, 2);
+        let island = labels[(0..g.len()).find(|&i| g.solid[i] && g.centre(i)[0].abs() < 0.1 && g.centre(i)[2].abs() < 0.1).unwrap()];
+        assert!(separating_plane(&g, &labels, island, [0.0, 1.0, 0.0]).is_none(), "surrounded on all sides");
+
+        let for_ring = mask_boxes(&g, &labels, |l| l == island, g.cell).expect("boxes covering the island");
+        let for_island = mask_boxes(&g, &labels, |l| l != island, g.cell).expect("boxes covering the ring");
+        assert!(for_ring.len() <= 8, "compact cover of island: {}", for_ring.len());
+        assert!(for_island.len() <= 24, "compact cover of ring: {}", for_island.len());
+        for boxes in [&for_ring, &for_island] {
+            for e in boxes {
+                e.validate().unwrap();
+            }
+        }
+        // Every removed cell is deeply carved; every kept cell stays untouched.
+        for (i, &l) in labels.iter().enumerate() {
+            if l == 0 {
+                continue;
+            }
+            let p = g.centre(i);
+            let min_d = |boxes: &[Edit]| boxes.iter().map(|e| e.distance(p)).fold(f32::INFINITY, f32::min);
+            if l == island {
+                assert!(min_d(&for_ring) <= -0.5 * g.cell, "island cell carved from ring");
+                assert!(min_d(&for_island) > 0.25 * g.cell, "island cell kept in island");
+            } else {
+                assert!(min_d(&for_ring) > 0.25 * g.cell, "ring cell kept in ring");
+                assert!(min_d(&for_island) <= -0.5 * g.cell, "ring cell carved from island");
+            }
+        }
     }
 }

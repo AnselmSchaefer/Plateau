@@ -65,8 +65,11 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
   it, in rounds. Loose elements the world changed under rest on what they now touch. An element
   carved or cut is made into cells in its own frame (about 48 along its longest side, from the SDF
   the world has of it); a part no longer joined to what holds it up comes away along a plane
-  between them, as two new pieces `derived_from` it; where a carve left a cross-section that cannot
-  hold the mass above it (overhanging it by more than a quarter of its width), it breaks there.
+  between them — or, where no single plane parts them (a ring cut round an island, an interlocking
+  joint), by complementary box-carve masks in each piece's `local_edits` (`support::mask_boxes`,
+  recorded as `derived_from ... split`, with non-solid trim and lights culled to match) — as two
+  new pieces `derived_from` it; where a carve left a cross-section that cannot hold the mass above
+  it (overhanging it by more than a quarter of its width), it breaks there.
   Then every loose element that nothing reaching the ground holds up (`World::grounded`: two pieces
   resting on each other alone are not), and every piece that may not stand, falls: straight down to
   the first thing beneath, then over the edge its centre of mass overhangs, turning until it meets
@@ -122,7 +125,7 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Grounded | Held up by what reaches the ground: ground, rooted, afloat, carried, or resting on or attached to the terrain or something grounded | `World::grounded` |
 | Support check | What runs after an action: rests mended, parts come away, cross-sections break, what is not grounded falls | `live::falls` |
 | Cells | An element's solid sampled on a grid in its own frame, to find its parts, its centre of mass and what it falls with | `support::Grid` |
-| Part, come apart | Cells joined face to face; a part not joined to what holds the element up is split off along a plane between them | `support::separating_plane` |
+| Part, come apart | Cells joined face to face; a part not joined to what holds the element up is split off along a plane between them (`support::separating_plane`), or by complementary box-carve masks (`support::mask_boxes`, `derived_from ... split`) when no plane parts them | `support::separating_plane`, `support::mask_boxes` |
 | Section, grip | A level cross-section a carve reached; it holds the mass above it while that overhangs it by at most a quarter of its width (`SECTION_GRIP`) | `support::overhang` |
 | Fall, tip | Dropping straight down to what is beneath, and turning over the edge a centre of mass overhangs, against everything but itself | `live::falls` |
 | Fall limit | The most falls one action sets off; the rest fall with the next | `World::fall_limit` |

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use wasmtime::{bail, format_err};
 
-use crate::cut::{ClipPlane, ObjectPhysics, clip_scene};
+use crate::cut::{ClipPlane, ObjectPhysics, clip_scene, cull_non_solid_by_mask};
 use crate::edit::{Edit, EditLog, Op};
 use crate::mesh_sdf::MeshSdf;
 use crate::modules::{ModuleCheck, SavedModule, check_bytes};
@@ -868,8 +868,13 @@ impl ElementRuntime {
         placed.validate()?;
         let mut wasm = compiled.compiled.instantiate(placed.seed)?;
         let raw_scene = wasm.scene()?;
-        let local_scene = clip_scene(&raw_scene, &placed.clips);
-        let physics = ObjectPhysics::compute(&local_scene, placed.scale);
+        let clipped = clip_scene(&raw_scene, &placed.clips);
+        let physics = ObjectPhysics::compute(&clipped, placed.scale);
+        let local_scene = if placed.is_promoted() && !placed.local_edits.is_empty() {
+            cull_non_solid_by_mask(&clipped, &placed.local_edits, physics.local_lo, physics.local_hi)
+        } else {
+            clipped
+        };
         let solid_proxy = placed.is_promoted() && viewer_size > placed.scale * PROMOTED_SDF_MAX_SIZE_RATIO;
         let skip_solid = placed.is_promoted() && !solid_proxy;
         let tf = placed.transform();

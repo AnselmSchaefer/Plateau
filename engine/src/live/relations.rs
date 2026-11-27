@@ -311,6 +311,41 @@ impl World {
         }
     }
 
+    /// The placed scene element (unpromoted or promoted, never an SDF landform or carried element)
+    /// whose actual solid surface lies at `p` (within `5 %` of `size`, at least `2 mm`), the
+    /// nearest. Used by aiming so overlapping AABBs of neighbouring pieces (such as a fallen trunk
+    /// lying behind its stump) never hijack strokes aimed at another piece or at the terrain.
+    pub fn scene_element_at(&mut self, p: [f32; 3], size: f32) -> Option<u32> {
+        let tol = (0.05 * size).max(2e-3);
+        let lo = [p[0] - tol, p[1] - tol, p[2] - tol];
+        let hi = [p[0] + tol, p[1] + tol, p[2] + tol];
+        let held = self.held.map(|h| h.id);
+        let mut best: Option<(f32, u32)> = None;
+        let mut consider = |d: f32, id: u32| {
+            if d <= tol && best.is_none_or(|(bd, bi)| d < bd || (d == bd && id < bi)) {
+                best = Some((d, id));
+            }
+        };
+        for id in self.scene.solid_placed_overlapping(lo, hi) {
+            if Some(id) == held || self.find(id).is_none_or(|pl| self.is_sdf_element(pl)) {
+                continue;
+            }
+            if let Some(d) = self.scene.distance_to_solids_of(id, p, tol) {
+                consider(d, id);
+            }
+        }
+        let sample_size = size.clamp(SMALLEST, LARGEST);
+        for entry in self.sdf_entries_near(lo, hi, held) {
+            if !entry.placed.is_promoted() || self.is_sdf_element(&entry.placed) {
+                continue;
+            }
+            if let Some(d) = self.entry_distances(&entry, &[p], sample_size) {
+                consider(d[0].abs(), entry.placed.id);
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// What the opening pointed at by `o` is in: the thing solid just behind its wall (the terrain,
     /// or an SDF element, most deeply), or else the scene element whose solid the wall is.
     pub fn host_at(&mut self, o: Opening) -> Option<Node> {

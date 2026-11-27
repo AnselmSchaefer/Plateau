@@ -9,10 +9,12 @@
 //! - Deterministic physical volume, mass, span, and rooting derived from solid mesh triangles and
 //!   engine material densities, scaled against `player.size` (`tiny`, `person`, `giant`).
 
+use std::collections::BTreeMap;
+
 use wasmtime::bail;
 
 use crate::compose::PlacementTransform;
-use crate::edit::{Edit, Shape};
+use crate::edit::{Edit, Op, Shape};
 use crate::physics::{Tool, material_props};
 use crate::{Instance, Material, MeshData, Result, SIZES, Scene, Vertex};
 
@@ -541,6 +543,63 @@ pub fn clip_scene(scene: &Scene, planes: &[ClipPlane]) -> Scene {
     Scene { meshes: out_meshes, instances: out_instances, lights: out_lights }
 }
 
+/// Removes triangles from non-solid (`solid: false`) decorative meshes (e.g. leaves, bridge rails)
+/// and lights that lie inside any sharp (`blend == 0`) `Op::Carve` box in `edits` (such as a
+/// non-planar component mask). Each query point is clamped into the element's solid AABB
+/// (`solid_lo..solid_hi`) first so decorative parts sitting just above or beside the solid (bridge
+/// handrails above the deck, oak leaves above boughs, moss caps on pillars) follow the solid piece
+/// directly beneath them. Solid meshes are kept untouched so `ObjectPhysics` bounds stay valid even
+/// for completely interior carved plugs.
+pub fn cull_non_solid_by_mask(scene: &Scene, edits: &[Edit], solid_lo: [f32; 3], solid_hi: [f32; 3]) -> Scene {
+    let boxes: Vec<&Edit> = edits
+        .iter()
+        .filter(|e| e.op == Op::Carve && e.blend == 0.0 && matches!(e.shape, Shape::Box { .. }))
+        .collect();
+    if boxes.is_empty() {
+        return scene.clone();
+    }
+    let has_bounds = solid_lo.iter().chain(&solid_hi).all(|c| c.is_finite()) && (0..3).all(|a| solid_lo[a] <= solid_hi[a]);
+    let carved = |p: [f32; 3]| {
+        let q = if has_bounds { [0, 1, 2].map(|a| clamp_f32(p[a], solid_lo[a], solid_hi[a])) } else { p };
+        boxes.iter().any(|e| e.distance(q) < 0.0)
+    };
+    let mut out_meshes = scene.meshes.clone();
+    let mut out_instances = Vec::with_capacity(scene.instances.len());
+    for &inst in &scene.instances {
+        if inst.solid {
+            out_instances.push(inst);
+            continue;
+        }
+        let Some(mesh) = scene.meshes.get(inst.mesh as usize) else { continue };
+        let xform = |p: [f32; 3]| {
+            let r = quat_rotate(inst.rot, [p[0] * inst.scale[0], p[1] * inst.scale[1], p[2] * inst.scale[2]]);
+            [inst.pos[0] + r[0], inst.pos[1] + r[1], inst.pos[2] + r[2]]
+        };
+        let mut kept = Vec::with_capacity(mesh.indices.len());
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let a = xform(mesh.vertices[tri[0] as usize].pos);
+            let b = xform(mesh.vertices[tri[1] as usize].pos);
+            let c = xform(mesh.vertices[tri[2] as usize].pos);
+            let mid = [(a[0] + b[0] + c[0]) * (1.0 / 3.0), (a[1] + b[1] + c[1]) * (1.0 / 3.0), (a[2] + b[2] + c[2]) * (1.0 / 3.0)];
+            if !carved(mid) {
+                kept.extend_from_slice(tri);
+            }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        if kept.len() == mesh.indices.len() {
+            out_instances.push(inst);
+        } else {
+            let idx = out_meshes.len() as u32;
+            out_meshes.push(MeshData { vertices: mesh.vertices.clone(), indices: kept });
+            out_instances.push(Instance { mesh: idx, ..inst });
+        }
+    }
+    let out_lights = scene.lights.iter().copied().filter(|l| !carved(l.pos)).collect();
+    Scene { meshes: out_meshes, instances: out_instances, lights: out_lights }
+}
+
 /// Transforms a `ClipPlane` from element-local space into an instance's mesh-local space.
 fn plane_to_instance_local(plane: ClipPlane, inst: &Instance) -> ClipPlane {
     // Point `p` in mesh-local maps to element-local `w = inst.pos + R * (S * p)`.
@@ -572,10 +631,93 @@ fn clip_mesh_planes(mesh: &MeshData, planes: &[ClipPlane], cap: bool) -> MeshDat
 /// Clips a triangle mesh against one plane `dot(n, p) >= offset` using deterministic
 /// Sutherland–Hodgman clipping, and when `cap` is true triangulates closed cut cross-sections
 /// with outward normal `-plane.normal`.
+///
+/// When `cap` is true, triangles are first partitioned into vertex-connected closed components
+/// (matching `MeshSdf::from_solid_scene`) so overlapping sub-meshes (such as tree boughs and
+/// trunk, or bridge planks) cap independently without tangling loops across components.
 fn clip_mesh_one_plane(mesh: &MeshData, plane: ClipPlane, cap: bool) -> MeshData {
-    let mut out_verts: Vec<Vertex> = Vec::new();
-    let mut out_indices: Vec<u32> = Vec::new();
+    if !cap {
+        let mut out_verts = Vec::new();
+        let mut out_indices = Vec::new();
+        let tris: Vec<[u32; 3]> = mesh.indices.as_chunks::<3>().0.to_vec();
+        clip_component_one_plane(&mesh.vertices, &tris, plane, false, &mut out_verts, &mut out_indices);
+        return MeshData { vertices: out_verts, indices: out_indices };
+    }
+    let groups = split_mesh_components(mesh);
+    let mut out_verts = Vec::new();
+    let mut out_indices = Vec::new();
+    for tris in groups {
+        clip_component_one_plane(&mesh.vertices, &tris, plane, true, &mut out_verts, &mut out_indices);
+    }
+    MeshData { vertices: out_verts, indices: out_indices }
+}
+
+/// Partitions triangle index triples into vertex-connected components (welding vertices within
+/// 0.1 mm, deterministic order of first appearance).
+fn split_mesh_components(mesh: &MeshData) -> Vec<Vec<[u32; 3]>> {
+    let tris = mesh.indices.as_chunks::<3>().0;
+    let n = tris.len();
+    if n <= 1 {
+        return if n == 0 { Vec::new() } else { vec![tris.to_vec()] };
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    let find = |parent: &mut [usize], mut x: usize| -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    };
+    let quant = |p: [f32; 3]| -> [i64; 3] {
+        [
+            (p[0] as f64 * 10_000.0).round() as i64,
+            (p[1] as f64 * 10_000.0).round() as i64,
+            (p[2] as f64 * 10_000.0).round() as i64,
+        ]
+    };
+    let mut owner: BTreeMap<[i64; 3], usize> = BTreeMap::new();
+    for (ti, tri) in tris.iter().enumerate() {
+        for &vi in tri {
+            let key = quant(mesh.vertices[vi as usize].pos);
+            if let Some(&first) = owner.get(&key) {
+                let ra = find(&mut parent, first);
+                let rb = find(&mut parent, ti);
+                if ra != rb {
+                    parent[rb] = ra;
+                }
+            } else {
+                owner.insert(key, ti);
+            }
+        }
+    }
+    let mut root_to_group: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut groups: Vec<Vec<[u32; 3]>> = Vec::new();
+    for (ti, &tri) in tris.iter().enumerate() {
+        let root = find(&mut parent, ti);
+        let gi = match root_to_group.get(&root) {
+            Some(&idx) => idx,
+            None => {
+                let idx = groups.len();
+                root_to_group.insert(root, idx);
+                groups.push(Vec::new());
+                idx
+            }
+        };
+        groups[gi].push(tri);
+    }
+    groups
+}
+
+fn clip_component_one_plane(
+    vertices: &[Vertex],
+    tris: &[[u32; 3]],
+    plane: ClipPlane,
+    cap: bool,
+    out_verts: &mut Vec<Vertex>,
+    out_indices: &mut Vec<u32>,
+) {
     let mut cut_edges: Vec<([f32; 3], [f32; 3], Material)> = Vec::new();
+    let mut has_strict_inside = false;
 
     let push_tri = |verts: &mut Vec<Vertex>, indices: &mut Vec<u32>, a: Vertex, b: Vertex, c: Vertex| {
         let g = cross3(sub3(b.pos, a.pos), sub3(c.pos, a.pos));
@@ -589,13 +731,21 @@ fn clip_mesh_one_plane(mesh: &MeshData, plane: ClipPlane, cap: bool) -> MeshData
         indices.extend_from_slice(&[base, base + 1, base + 2]);
     };
 
-    for tri in mesh.indices.as_chunks::<3>().0 {
-        let v0 = mesh.vertices[tri[0] as usize];
-        let v1 = mesh.vertices[tri[1] as usize];
-        let v2 = mesh.vertices[tri[2] as usize];
-        let d0 = dot3(plane.normal, v0.pos) - plane.offset;
-        let d1 = dot3(plane.normal, v1.pos) - plane.offset;
-        let d2 = dot3(plane.normal, v2.pos) - plane.offset;
+    let signed_d = |p: [f32; 3]| -> f32 {
+        let d = dot3(plane.normal, p) - plane.offset;
+        if abs_f32(d) <= 1e-6 { 0.0 } else { d }
+    };
+
+    for &tri in tris {
+        let v0 = vertices[tri[0] as usize];
+        let v1 = vertices[tri[1] as usize];
+        let v2 = vertices[tri[2] as usize];
+        let d0 = signed_d(v0.pos);
+        let d1 = signed_d(v1.pos);
+        let d2 = signed_d(v2.pos);
+        if d0 > 0.0 || d1 > 0.0 || d2 > 0.0 {
+            has_strict_inside = true;
+        }
 
         let in0 = d0 >= 0.0;
         let in1 = d1 >= 0.0;
@@ -604,7 +754,7 @@ fn clip_mesh_one_plane(mesh: &MeshData, plane: ClipPlane, cap: bool) -> MeshData
 
         match count {
             0 => continue,
-            3 => push_tri(&mut out_verts, &mut out_indices, v0, v1, v2),
+            3 => push_tri(out_verts, out_indices, v0, v1, v2),
             1 => {
                 // Rotate so `a` is inside and `b, c` are outside (preserving winding!).
                 let (a, da, b, db, c, dc) = if in0 {
@@ -614,10 +764,10 @@ fn clip_mesh_one_plane(mesh: &MeshData, plane: ClipPlane, cap: bool) -> MeshData
                 } else {
                     (v2, d2, v0, d0, v1, d1)
                 };
-                let ab = lerp_vertex(a, b, da / (da - db));
-                let ac = lerp_vertex(a, c, da / (da - dc));
-                push_tri(&mut out_verts, &mut out_indices, a, ab, ac);
-                if cap && len3(sub3(ab.pos, ac.pos)) > 1e-6 {
+                let ab = clip_edge(a, da, b, db);
+                let ac = clip_edge(a, da, c, dc);
+                push_tri(out_verts, out_indices, a, ab, ac);
+                if cap && len3(sub3(ab.pos, ac.pos)) > 1e-9 {
                     let g = cross3(sub3(b.pos, a.pos), sub3(c.pos, a.pos));
                     let vn = [
                         a.normal[0] + b.normal[0] + c.normal[0],
@@ -640,11 +790,11 @@ fn clip_mesh_one_plane(mesh: &MeshData, plane: ClipPlane, cap: bool) -> MeshData
                 } else {
                     (v2, d2, v0, d0, v1, d1)
                 };
-                let ab = lerp_vertex(a, b, (-da) / (db - da));
-                let ac = lerp_vertex(a, c, (-da) / (dc - da));
-                push_tri(&mut out_verts, &mut out_indices, b, c, ac);
-                push_tri(&mut out_verts, &mut out_indices, b, ac, ab);
-                if cap && len3(sub3(ab.pos, ac.pos)) > 1e-6 {
+                let ab = clip_edge(a, da, b, db);
+                let ac = clip_edge(a, da, c, dc);
+                push_tri(out_verts, out_indices, b, c, ac);
+                push_tri(out_verts, out_indices, b, ac, ab);
+                if cap && len3(sub3(ab.pos, ac.pos)) > 1e-9 {
                     let g = cross3(sub3(b.pos, a.pos), sub3(c.pos, a.pos));
                     let vn = [
                         a.normal[0] + b.normal[0] + c.normal[0],
@@ -662,11 +812,32 @@ fn clip_mesh_one_plane(mesh: &MeshData, plane: ClipPlane, cap: bool) -> MeshData
         }
     }
 
-    if cap && cut_edges.len() >= 3 {
-        append_cap_polygons(&cut_edges, plane, &mut out_verts, &mut out_indices);
+    if cap && has_strict_inside && cut_edges.len() >= 3 {
+        append_cap_polygons(&cut_edges, plane, out_verts, out_indices);
     }
+}
 
-    MeshData { vertices: out_verts, indices: out_indices }
+/// Canonical edge-plane intersection so adjacent triangles sharing an edge in opposite winding
+/// order always produce bit-identical intersection positions.
+fn clip_edge(a: Vertex, da: f32, b: Vertex, db: f32) -> Vertex {
+    if da == 0.0 {
+        return a;
+    }
+    if db == 0.0 {
+        return b;
+    }
+    let key = |p: [f32; 3]| -> [u32; 3] {
+        [
+            if p[0] == 0.0 { 0 } else { p[0].to_bits() },
+            if p[1] == 0.0 { 0 } else { p[1].to_bits() },
+            if p[2] == 0.0 { 0 } else { p[2].to_bits() },
+        ]
+    };
+    if key(a.pos) <= key(b.pos) {
+        lerp_vertex(a, b, da / (da - db))
+    } else {
+        lerp_vertex(b, a, db / (db - da))
+    }
 }
 
 fn lerp_vertex(a: Vertex, b: Vertex, t: f32) -> Vertex {
@@ -696,8 +867,23 @@ fn append_cap_polygons(
     let cap_n = [-plane.normal[0], -plane.normal[1], -plane.normal[2]];
     let (u, v) = plane_basis(cap_n); // u x v == cap_n
 
+    // Cancel any exact opposing duplicate segments (e.g. from touching faces on the cut plane).
+    const TIGHT_D2: f32 = 1e-10; // 0.01 mm exact match (canonical clip_edge is usually 0.0)
+    const LOOSE_D2: f32 = 1e-8; // 0.1 mm fallback match (same weld grid as MeshSdf)
     let mut used = vec![false; edges.len()];
-    const SNAP_D2: f32 = 1e-5; // ~3 mm endpoint weld tolerance for robust loop closure
+    for i in 0..edges.len() {
+        if used[i] {
+            continue;
+        }
+        let (a, b, _) = edges[i];
+        for j in (i + 1)..edges.len() {
+            if !used[j] && dist2(a, edges[j].1) <= TIGHT_D2 && dist2(b, edges[j].0) <= TIGHT_D2 {
+                used[i] = true;
+                used[j] = true;
+                break;
+            }
+        }
+    }
 
     for start_idx in 0..edges.len() {
         if used[start_idx] {
@@ -706,51 +892,76 @@ fn append_cap_polygons(
         used[start_idx] = true;
         let (p0, p1, mat) = edges[start_idx];
         let mut ring: Vec<[f32; 3]> = vec![p0, p1];
+        let mut edges_used = 1usize;
+        let mut closed = false;
 
         loop {
             let cur = *ring.last().unwrap();
-            // Check if loop closed back to ring[0] (once we have >= 3 vertices).
-            if ring.len() >= 3 && dist2(cur, ring[0]) <= SNAP_D2 {
+            // Loop is closed once at least 3 segments have been chained back to `ring[0]`.
+            if edges_used >= 3 && dist2(cur, ring[0]) <= TIGHT_D2 {
                 ring.pop();
+                closed = true;
                 break;
             }
-            // Find closest unused segment whose start matches `cur`.
-            let mut best: Option<(usize, f32, bool)> = None;
+            // Prefer exact forward match, then loose forward match, then loose reverse match.
+            let mut best: Option<(usize, u8, f32, bool)> = None;
             for (i, &(a, b, _)) in edges.iter().enumerate() {
                 if used[i] {
                     continue;
                 }
                 let d_fwd = dist2(cur, a);
-                if d_fwd <= SNAP_D2 && best.is_none_or(|(_, bd, _)| d_fwd < bd) {
-                    best = Some((i, d_fwd, false));
+                if d_fwd <= TIGHT_D2 {
+                    let cand = (i, 0u8, d_fwd, false);
+                    if best.is_none_or(|b| (cand.1, cand.2) < (b.1, b.2)) {
+                        best = Some(cand);
+                    }
+                } else if d_fwd <= LOOSE_D2 {
+                    let cand = (i, 1u8, d_fwd, false);
+                    if best.is_none_or(|b| (cand.1, cand.2) < (b.1, b.2)) {
+                        best = Some(cand);
+                    }
                 }
                 let d_rev = dist2(cur, b);
-                if d_rev <= SNAP_D2 && best.is_none_or(|(_, bd, _)| d_rev < bd) {
-                    best = Some((i, d_rev, true));
+                if d_rev <= LOOSE_D2 {
+                    let cand = (i, 2u8, d_rev, true);
+                    if best.is_none_or(|b| (cand.1, cand.2) < (b.1, b.2)) {
+                        best = Some(cand);
+                    }
                 }
             }
             match best {
-                Some((idx, _, rev)) => {
+                Some((idx, _, _, rev)) => {
                     used[idx] = true;
+                    edges_used += 1;
                     let next_p = if rev { edges[idx].0 } else { edges[idx].1 };
-                    if dist2(next_p, cur) > 1e-10 {
+                    if dist2(next_p, cur) > 1e-18 {
                         ring.push(next_p);
                     }
-                    if ring.len() > edges.len() + 2 {
+                    if edges_used >= edges.len() {
+                        if dist2(next_p, ring[0]) <= LOOSE_D2 {
+                            ring.pop();
+                            closed = true;
+                        }
                         break;
                     }
                 }
-                None => break,
+                None => {
+                    if edges_used >= 3 && dist2(cur, ring[0]) <= LOOSE_D2 {
+                        ring.pop();
+                        closed = true;
+                    }
+                    break;
+                }
             }
         }
 
         if ring.len() < 3 {
             continue;
         }
-        // Only cap genuinely closed (or nearly closed) contours so open decorative ribbons don't get spurious fans.
-        let gap2 = dist2(*ring.last().unwrap(), ring[0]);
-        let seg_scale2 = dist2(ring[0], ring[1]).max(1e-4);
-        if gap2 > max_f32(SNAP_D2 * 16.0, seg_scale2 * 4.0) {
+        // Only cap genuinely closed (or nearly closed within 1 mm) contours so open decorative
+        // ribbons don't get spurious fans. Note: when `closed` is true, `ring.pop()` already
+        // removed the duplicate closing vertex, so `ring.last() -> ring[0]` is a real edge!
+        if !closed && dist2(*ring.last().unwrap(), ring[0]) > 1e-6 {
             continue;
         }
 
@@ -803,7 +1014,8 @@ fn append_cap_polygons(
     }
 }
 
-/// Deterministic ear-clipping triangulation for a CCW simple 2D polygon.
+/// Deterministic ear-clipping triangulation for a CCW simple 2D polygon (including polygons with
+/// collinear edge midpoints from clipped quads).
 fn ear_clip_2d(pts: &[[f32; 2]]) -> Vec<[usize; 3]> {
     let n = pts.len();
     if n < 3 {
@@ -812,6 +1024,8 @@ fn ear_clip_2d(pts: &[[f32; 2]]) -> Vec<[usize; 3]> {
     if n == 3 {
         return vec![[0, 1, 2]];
     }
+    let area = abs_f32(signed_area_2d(pts));
+    let min_cross = max_f32(area * 1e-8, 1e-12);
     let mut idx: Vec<usize> = (0..n).collect();
     let mut out = Vec::with_capacity(n - 2);
     let mut guard = n * n + 4;
@@ -825,15 +1039,21 @@ fn ear_clip_2d(pts: &[[f32; 2]]) -> Vec<[usize; 3]> {
             let i1 = idx[k];
             let i2 = idx[(k + 1) % m];
             let (a, b, c) = (pts[i0], pts[i1], pts[i2]);
-            if cross2(a, b, c) <= 1e-10 {
+            let cr = cross2(a, b, c);
+            if cr <= min_cross {
                 continue; // reflex or collinear
             }
+            let tol = cr * 1e-6;
             let mut any_inside = false;
             for &other in &idx {
                 if other == i0 || other == i1 || other == i2 {
                     continue;
                 }
-                if point_in_tri_2d(pts[other], a, b, c) {
+                let p = pts[other];
+                if dist2_2d(p, a) <= 1e-12 || dist2_2d(p, b) <= 1e-12 || dist2_2d(p, c) <= 1e-12 {
+                    continue;
+                }
+                if cross2(a, b, p) >= -tol && cross2(b, c, p) >= -tol && cross2(c, a, p) >= -tol {
                     any_inside = true;
                     break;
                 }
@@ -855,6 +1075,13 @@ fn ear_clip_2d(pts: &[[f32; 2]]) -> Vec<[usize; 3]> {
     out
 }
 
+#[inline]
+fn dist2_2d(a: [f32; 2], b: [f32; 2]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    dx * dx + dy * dy
+}
+
 fn signed_area_2d(pts: &[[f32; 2]]) -> f32 {
     let mut a = 0.0f32;
     let n = pts.len();
@@ -869,10 +1096,6 @@ fn signed_area_2d(pts: &[[f32; 2]]) -> f32 {
 #[inline]
 fn cross2(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-}
-
-fn point_in_tri_2d(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
-    cross2(a, b, p) >= -1e-7 && cross2(b, c, p) >= -1e-7 && cross2(c, a, p) >= -1e-7
 }
 
 /// Builds an orthonormal right-handed basis `(u, v)` perpendicular to unit `n` with `u × v = n`.

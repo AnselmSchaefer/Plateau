@@ -672,9 +672,21 @@ impl World {
             candidates.push(owner);
         }
         let (mut promoted, mut bounds_list, mut names) = (Vec::new(), Vec::new(), Vec::new());
+        // Conservative bounding-sphere radius of `edit` around `edit.center`: an element with no
+        // solid triangle within this reach only overlapped by AABB (e.g. a fallen tree's boughs
+        // behind a stump) and is not touched by the carve.
+        let reach = match edit.shape {
+            crate::edit::Shape::Sphere { radius } => radius,
+            crate::edit::Shape::Box { half, .. } => (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt(),
+            crate::edit::Shape::Cylinder { radius, half_height, .. } => (radius * radius + half_height * half_height).sqrt(),
+        } + edit.blend
+            + 1e-3;
         for id in candidates {
             // A floating boat is not turned to voxels by sculpting beside it.
             if self.floating.contains_key(&id) && aimed != Some(id) {
+                continue;
+            }
+            if aimed != Some(id) && self.scene.distance_to_solids_of(id, edit.center, reach).is_none() {
                 continue;
             }
             let Some(pos) = self.index_of(id) else { continue };

@@ -1292,20 +1292,29 @@ pub fn none_unsupported(world: &crate::live::World) -> Verdict {
 }
 
 /// Every piece made by a cut (an element carrying clips) is `derived_from` the element it was cut
-/// from, along its last clip, and every `derived_from` joins a piece in the world to an element
-/// that was.
+/// from, along its last clip (or by a non-planar component mask `split` if it was split that way
+/// afterwards), and every `derived_from` joins a piece in the world to an element that was.
 pub fn cuts_are_derived(world: &crate::live::World) -> Verdict {
+    use crate::graph::{Data, Kind};
     for pl in &world.placed {
         let Some(&last) = pl.clips.last() else { continue };
-        match world.graph.derived_from(pl.id) {
-            Some((_, cut)) if cut == last => {}
-            Some((orig, cut)) => return Err(format!("#{} was cut from #{orig} along {cut:?}, but carries {last:?} last", pl.id)),
+        match world.graph.parent_of(pl.id) {
+            Some((_, Data::Cut(cut))) if cut == last => {}
+            Some((_, Data::Split)) if pl.is_promoted() && !pl.local_edits.is_empty() => {}
+            Some((orig, Data::Cut(cut))) => return Err(format!("#{} was cut from #{orig} along {cut:?}, but carries {last:?} last", pl.id)),
+            Some((orig, _)) => return Err(format!("#{} was split from #{orig}, but carries no mask edits", pl.id)),
             None => return Err(format!("#{} ({}) was cut, but is derived from nothing", pl.id, world.element_name(pl.id))),
         }
     }
-    for r in world.graph.relations().filter(|r| r.kind == crate::graph::Kind::DerivedFrom) {
-        if r.from.clone().element().is_none_or(|p| world.find(p).is_none()) {
+    for r in world.graph.relations().filter(|r| r.kind == Kind::DerivedFrom) {
+        let Some(p) = r.from.clone().element() else {
+            return Err(format!("`{}`: the piece is not an element", r.to_record()));
+        };
+        let Some(pl) = world.find(p) else {
             return Err(format!("`{}`: the piece is not in the world", r.to_record()));
+        };
+        if r.data == Data::Split && (!pl.is_promoted() || pl.local_edits.is_empty()) {
+            return Err(format!("`{}`: split piece #{p} is not promoted with mask edits", r.to_record()));
         }
     }
     Ok(())

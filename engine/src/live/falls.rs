@@ -11,8 +11,10 @@
 //! 2. **Come apart**: an element carved or cut is made into cells in its own frame
 //!    (`support::Grid`, from the SDF the world has of it: its meshes, its own carving, the terrain's
 //!    carves since it was promoted). A part not joined to what holds it up (its roots in the ground,
-//!    what it rests on or hangs from) comes away along a plane between them: the original is
-//!    retired, the two pieces `derived_from` it, as a cut makes them. Where it still holds together,
+//!    what it rests on or hangs from) comes away along a plane between them — or, where no single
+//!    plane parts them (interlocking, a ring cut round), by complementary box-carve masks in
+//!    `local_edits` (`support::mask_boxes`): the original is retired, the two pieces `derived_from`
+//!    it, as a cut makes them. Where it still holds together,
 //!    each height a carve reached is asked whether its cross-section holds what is above it (the
 //!    mass not overhanging it by more than `support::SECTION_GRIP` of its width): a notch half
 //!    through holds, a deeper one breaks there.
@@ -88,6 +90,13 @@ pub(super) struct Settled {
     pub added: Vec<u32>,
     pub removed: Vec<u32>,
     pub fell: Vec<u32>,
+}
+
+/// How a disconnected part comes away from the rest of an element: along a single plane where one
+/// parts them, or else by complementary element-local carve masks (`support::mask_boxes`).
+enum Parting {
+    Plane(ClipPlane),
+    Mask { for_rest: Vec<Edit>, for_part: Vec<Edit> },
 }
 
 /// A fall, as it is shown.
@@ -231,13 +240,29 @@ impl World {
         }
     }
 
-    /// Notes that what rests on, hangs from or fills the element `id` may have lost it.
+    /// Notes that what rests on, hangs from, fills, or leans against the element `id` may have lost it.
     pub(super) fn shaken(&mut self, id: u32) {
         let node = Node::Element(id);
         let deps: Vec<u32> = self.graph.relations().filter(|r| r.to == node && Graph::rests_on_host(r.kind)).filter_map(|r| r.from.element()).collect();
         for d in deps {
             self.pending.mend.insert(d);
             self.pending.unsteady.insert(d);
+        }
+        // Loose neighbours touching or propped against `id` (e.g. a sibling cut piece blocked from
+        // the side during tipping) also need re-checking once `id` moves away.
+        if let Some((lo, hi)) = self.world_box(id) {
+            let ids: Vec<u32> = self.placed.iter().map(|p| p.id).filter(|&other| other != id).collect();
+            for other in ids {
+                if self.footing(other) != Some(Footing::Loose) {
+                    continue;
+                }
+                let Some((olo, ohi)) = self.world_box(other) else { continue };
+                let margin = self.physics_of(other).map_or(0.0, |p| 0.05 * p.world_span);
+                if (0..3).all(|a| ohi[a] + margin >= lo[a] && olo[a] - margin <= hi[a]) {
+                    self.pending.mend.insert(other);
+                    self.pending.unsteady.insert(other);
+                }
+            }
         }
     }
 
@@ -459,9 +484,10 @@ impl World {
         self.node_distances(&Node::Terrain, &world, size, 4.0 * cell_w).iter().any(|&d| d <= cell_w)
     }
 
-    /// A plane, in the element `id`'s frame, along which a part of it no longer joined to what holds
-    /// it up comes away (the part on its kept side); `None` if it holds together.
-    fn parting(&mut self, id: u32) -> Option<ClipPlane> {
+    /// How a part of the element `id` no longer joined to what holds it up comes away: along a
+    /// separating plane if one parts it from the rest, else by complementary element-local carve
+    /// boxes (`support::mask_boxes`). `None` if it holds together.
+    fn parting(&mut self, id: u32) -> Option<Parting> {
         if !matches!(self.footing(id), Some(Footing::Rooted | Footing::Loose)) {
             return None;
         }
@@ -487,7 +513,17 @@ impl World {
         // Crumbs (a few cells) stay with it.
         let dust = (cells.solid.len() / 100).max(3);
         let up = tf.world_to_local_dir([0.0, 1.0, 0.0]);
-        (1..=n).filter(|&l| !stays(l) && sizes[l as usize] >= dust).find_map(|l| support::separating_plane(&cells.grid, &labels, l, up))
+        let loose: Vec<u32> = (1..=n).filter(|&l| !stays(l) && sizes[l as usize] >= dust).collect();
+        if let Some(plane) = loose.iter().find_map(|&l| support::separating_plane(&cells.grid, &labels, l, up)) {
+            return Some(Parting::Plane(plane));
+        }
+        // No single plane separates them (interlocking or ring-cut): fall back to a box-carve mask.
+        let stamp = cells.grid.cell.max(1e-4);
+        loose.into_iter().find_map(|l| {
+            let for_rest = support::mask_boxes(&cells.grid, &labels, |x| x == l, stamp)?;
+            let for_part = support::mask_boxes(&cells.grid, &labels, |x| x != l, stamp)?;
+            Some(Parting::Mask { for_rest, for_part })
+        })
     }
 
     /// A plane, in the element `id`'s frame, level in the world, along which it breaks because the
@@ -592,18 +628,41 @@ impl World {
         Some((ClipPlane::new(n, n[0] * p[0] + n[1] * p[1] + n[2] * p[2]), u, edge))
     }
 
-    /// Breaks the element `id` along `plane` (its frame) into the rest (the side away from the plane's
-    /// normal) and the part (its kept side), as a cut does: both `derived_from` it and owned by its
-    /// owner; the rest keeps what it hung from; what rested on, hung from or filled it is found again.
-    fn split(&mut self, id: u32, plane: ClipPlane, settled: &mut Settled) -> Option<(u32, u32)> {
+    /// Breaks the element `id` according to `parting` (a plane or complementary carve masks) into
+    /// the rest and the part, as a cut does: both `derived_from` it and owned by its owner; the
+    /// rest keeps what it hung from; what rested on, hung from or filled it is found again.
+    fn split(&mut self, id: u32, parting: Parting, settled: &mut Settled) -> Option<(u32, u32)> {
         let original = self.find(id)?.clone();
-        if original.clips.len() >= MAX_CLIPS {
-            return None;
-        }
-        let scene = self.runtime.local_scene_of(id)?.clone();
-        if clip_scene(&scene, &[plane]).instances.is_empty() || clip_scene(&scene, &[plane.flipped()]).instances.is_empty() {
-            return None;
-        }
+        let (rest_rel, part_rel, mut rest, mut part, masked) = match parting {
+            Parting::Plane(plane) => {
+                if original.clips.len() >= MAX_CLIPS {
+                    return None;
+                }
+                let scene = self.runtime.local_scene_of(id)?.clone();
+                if clip_scene(&scene, &[plane]).instances.is_empty() || clip_scene(&scene, &[plane.flipped()]).instances.is_empty() {
+                    return None;
+                }
+                let mut rest = original.clone();
+                rest.clips.push(plane.flipped());
+                let mut part = original.clone();
+                part.clips.push(plane);
+                (Data::Cut(plane.flipped()), Data::Cut(plane), rest, part, false)
+            }
+            Parting::Mask { for_rest, for_part } => {
+                if for_rest.is_empty() || for_part.is_empty() {
+                    return None;
+                }
+                self.catalog.get_or_build_mesh_sdf(&original.module, original.seed, &original.clips).ok().flatten()?;
+                let promoted_at = original.promoted.unwrap_or(self.edits.len());
+                let mut rest = original.clone();
+                rest.promoted = Some(promoted_at);
+                rest.local_edits.extend(for_rest);
+                let mut part = original.clone();
+                part.promoted = Some(promoted_at);
+                part.local_edits.extend(for_part);
+                (Data::Split, Data::Split, rest, part, true)
+            }
+        };
         let owner = self.owner_of(id).map(str::to_string);
         let uprooted = self.graph.contains(&Relation::uprooted(id));
         let node = Node::Element(id);
@@ -611,12 +670,8 @@ impl World {
         let deps: Vec<Relation> = self.graph.relations().filter(|r| r.to == node && Graph::rests_on_host(r.kind)).collect();
         let rest_id = self.alloc_id();
         let part_id = self.alloc_id();
-        let mut rest = original.clone();
         rest.id = rest_id;
-        rest.clips.push(plane.flipped());
-        let mut part = original.clone();
         part.id = part_id;
-        part.clips.push(plane);
         self.unrelate_leaving(id);
         self.remove_placed(id);
         if self.spawn_placed(rest.clone(), None).and_then(|_| self.spawn_placed(part.clone(), None)).is_err() {
@@ -625,8 +680,12 @@ impl World {
             let _ = self.spawn_placed(original, None);
             return None;
         }
-        for (piece, clip) in [(rest_id, plane.flipped()), (part_id, plane)] {
-            self.relate(Relation::derived_from(piece, id, clip));
+        for (piece, data) in [(rest_id, rest_rel), (part_id, part_rel)] {
+            let rel = match data {
+                Data::Cut(clip) => Relation::derived_from(piece, id, clip),
+                _ => Relation::derived_from_split(piece, id),
+            };
+            self.relate(rel);
             if let Some(owner) = &owner {
                 self.relate(Relation::owned_by(piece, owner));
             }
@@ -637,6 +696,16 @@ impl World {
         }
         for r in hung {
             self.relate(Relation { from: Node::Element(rest_id), ..r });
+        }
+        // A masked split keeps the parent's mesh bounds (so `phys.rooted` may still be true): check
+        // right away whether each piece's own cells still touch terrain, so detached parts fall in
+        // this round.
+        if masked {
+            for piece in [rest_id, part_id] {
+                if self.footing(piece) == Some(Footing::Rooted) && !self.roots_hold(piece) {
+                    self.relate(Relation::uprooted(piece));
+                }
+            }
         }
         self.settle_relations(rest_id);
         self.settle_relations(part_id);
@@ -927,15 +996,15 @@ impl World {
                 if splits >= MAX_SPLITS || self.find(id).is_none() {
                     continue;
                 }
-                let (plane, broke) = match self.parting(id) {
+                let (parting, broke) = match self.parting(id) {
                     Some(p) => (Some(p), None),
                     None => match self.breaking(id) {
-                        Some((p, u, edge)) => (Some(p), Some((u, Some(edge)))),
+                        Some((p, u, edge)) => (Some(Parting::Plane(p)), Some((u, Some(edge)))),
                         None => (None, None),
                     },
                 };
-                let Some(plane) = plane else { continue };
-                if let Some((rest, part)) = self.split(id, plane, &mut settled) {
+                let Some(parting) = parting else { continue };
+                if let Some((rest, part)) = self.split(id, parting, &mut settled) {
                     splits += 1;
                     changed = true;
                     self.pending.roots.extend([rest, part]);
@@ -999,6 +1068,12 @@ impl World {
         }
         let mut stale = Vec::new();
         for s in merged {
+            // A piece split by a component mask has its geometry in the SDF (not its unmasked
+            // parent mesh), so leave it committed at its resting place rather than flashing the
+            // parent's uncarved mesh during easing.
+            if self.graph.parent_of(s.id).is_some_and(|(_, d)| d == Data::Split) {
+                continue;
+            }
             let drop = (s.from.pos[1] - s.to.pos[1]).abs();
             let duration = 0.25 + (2.0 * drop / 9.81).sqrt() + if s.pivot.is_some() { 0.35 } else { 0.0 };
             self.falling.push(FallingElement {

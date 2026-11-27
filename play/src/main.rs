@@ -283,7 +283,7 @@ fn setup(
     let mut visuals = scene::spawn_areas(&mut commands, &mut meshes, surface.opaque.clone(), &area_scenes, &world.scene);
     // The elements the save placed; the chunks are made from the SDF as it now is.
     let changes = world.take_changes();
-    show_layers(&mut commands, &mut meshes, &mut visuals, &world.scene, changes.layers);
+    show_layers(&mut commands, &mut meshes, &mut visuals, None, &world.scene, changes.layers);
     commands.insert_resource(visuals);
     let composed = world.composed();
     let surface_opaque = surface.opaque.clone();
@@ -391,13 +391,50 @@ impl EditCtx<'_> {
 }
 
 /// Shows a placed element's scene layer changes (`World::take_changes`).
-fn show_layers(commands: &mut Commands, meshes: &mut Assets<Mesh>, visuals: &mut SceneVisuals, world: &SceneWorld, layers: Vec<LayerChange>) {
+/// Newly promoted solid layers (`skip_solid: true`) are deferred until the rebuilt SDF chunks
+/// carrying their `MeshSdf` are committed, so sculpted objects never flash invisible.
+fn show_layers(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    visuals: &mut SceneVisuals,
+    mut chunks: Option<&mut Chunks>,
+    world: &SceneWorld,
+    layers: Vec<LayerChange>,
+) {
     for change in layers {
         match change {
-            LayerChange::Spawn { owner, scene, skip_solid } => scene::spawn_layer_filtered(commands, meshes, visuals, owner, &scene, world, skip_solid),
-            LayerChange::Despawn { owner } => scene::despawn_layer(commands, visuals, owner),
-            LayerChange::DespawnAllPlaced => scene::despawn_placed_layers(commands, visuals),
-            LayerChange::Moved { owner, from, to } => visuals.set_layer_reloc(owner, from, to),
+            LayerChange::Spawn { owner, scene, skip_solid: true }
+                if chunks.as_deref().is_some_and(|c| c.has_wanted_stale_for(c.composed_revision())) =>
+            {
+                if let Some(c) = chunks.as_deref_mut() {
+                    let rev = c.composed_revision();
+                    c.defer_hide_solid(owner, rev, scene);
+                }
+            }
+            LayerChange::Spawn { owner, scene, skip_solid } => {
+                if let Some(c) = chunks.as_deref_mut() {
+                    c.cancel_deferred_hide(owner);
+                }
+                scene::spawn_layer_filtered(commands, meshes, visuals, owner, &scene, world, skip_solid);
+            }
+            LayerChange::Despawn { owner } => {
+                if let Some(c) = chunks.as_deref_mut() {
+                    c.cancel_deferred_hide(owner);
+                }
+                scene::despawn_layer(commands, visuals, owner);
+            }
+            LayerChange::DespawnAllPlaced => {
+                if let Some(c) = chunks.as_deref_mut() {
+                    c.clear_deferred_hides();
+                }
+                scene::despawn_placed_layers(commands, visuals);
+            }
+            LayerChange::Moved { owner, from, to } => {
+                if let Some(c) = chunks.as_deref_mut() {
+                    c.cancel_deferred_hide(owner);
+                }
+                visuals.set_layer_reloc(owner, from, to);
+            }
         }
     }
 }
@@ -420,7 +457,7 @@ fn show_world_changes(
     for (composed, inv) in changes.composed {
         chunks.set_composed(composed, &inv);
     }
-    show_layers(&mut commands, &mut meshes, &mut visuals, &world.scene, changes.layers);
+    show_layers(&mut commands, &mut meshes, &mut visuals, Some(&mut chunks), &world.scene, changes.layers);
     for said in changes.said {
         player.say(said);
     }
@@ -585,31 +622,20 @@ fn sculpt_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
                 if spacing_ok {
                     // Sculpting straight onto a placed scene element (promoted or not) keeps the
                     // stroke in its own frame, so a carved tunnel travels with it when it is
-                    // chopped or carried; anything else goes on the terrain.
-                    let world = &ctx.world.0;
-                    let hit_dist = ((h[0] - pivot[0]).powi(2) + (h[1] - pivot[1]).powi(2) + (h[2] - pivot[2]).powi(2)).sqrt() as f32;
-                    let tol = ctx.sculpt.radius(psize) * 2.0 + psize * 0.5;
-                    let aimed_unpromoted = world
-                        .scene
-                        .raycast_solid_placed(pivot.map(|c| c as f32), dir, reach)
-                        .and_then(|(owner, t)| if (t - hit_dist).abs() <= tol { Some(owner) } else { None });
+                    // chopped or carried; anything else goes on the terrain. Ask the exact surface
+                    // at `h` so a nearby piece's wider AABB (e.g. a fallen trunk behind a stump)
+                    // never hijacks a stroke aimed at the stump or the grass beside it.
                     let h32 = [h[0] as f32, h[1] as f32, h[2] as f32];
-                    let aimed_promoted_scene = world.raycast_placed_sdf(pivot.map(|c| c as f32), dir, reach).and_then(|(owner, _)| {
-                        let pl = world.find(owner)?;
-                        if !pl.is_promoted() || world.is_sdf_element(pl) {
-                            return None;
-                        }
-                        let (lo, hi) = pl.transform().world_bounds(world.sdf_bounds_of(pl)?);
-                        let pad = ctx.sculpt.radius(psize) * 1.2 + psize * 0.25;
-                        (0..3).all(|a| h32[a] >= lo[a] - pad && h32[a] <= hi[a] + pad).then_some(owner)
-                    });
-                    let element = aimed_unpromoted
-                        .or(aimed_promoted_scene)
-                        .filter(|&owner| world.find(owner).is_some_and(|pl| !world.is_sdf_element(pl)));
-                    let target = match element {
+                    let target = match ctx.world.0.scene_element_at(h32, psize) {
                         Some(id) => SculptTarget::Element(id),
-                        None => SculptTarget::Terrain { aimed: aimed_unpromoted },
+                        None => SculptTarget::Terrain { aimed: None },
                     };
+                    // Keep object carves crisp so `smooth_cut` matches the visible brush ghost
+                    // instead of melting a large fillet across a small trunk or stump.
+                    let mut edit = edit;
+                    if matches!(target, SculptTarget::Element(_)) && op == Op::Carve {
+                        edit.blend = edit.blend.min(ctx.sculpt.radius(psize) * 0.06);
+                    }
                     let tool = ctx.sculpt.tool;
                     match ctx.apply(player, live::Action::Sculpt { edit, hit: h32, tool, target }) {
                         Outcome::Done(_) => {
@@ -1302,6 +1328,9 @@ fn draw(
     let scale = (DRAWN_AS / size) as f64;
     chunks.materials.sync_eye(&mut surface_materials, eye, scale);
     chunks.update(eye, look_dir, size, scale, here, &ahead, time.delta_secs(), &mut commands, &mut meshes);
+    for (owner, scene) in chunks.take_ready_deferred_hides() {
+        scene::spawn_layer_filtered(&mut commands, &mut meshes, &mut visuals, owner, &scene, &world.scene, true);
+    }
     chunks.place(eye, scale, &mut transforms);
     scene::sync(&mut commands, &mut visuals, &world.scene, eye, scale, &mut static_q, &mut dynamic_q, &mut light_q);
     chunks.counts.longest = chunks.counts.longest.max(started.elapsed());
