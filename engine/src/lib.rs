@@ -33,6 +33,7 @@ pub mod rules;
 pub mod scene;
 pub mod site;
 pub mod sketch;
+pub mod support;
 pub mod wasm;
 pub mod water;
 pub mod world;

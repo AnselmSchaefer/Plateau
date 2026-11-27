@@ -122,10 +122,12 @@ fn chopping_gives_two_pieces_linked_to_the_original() {
     assert_eq!(world.find(trunk).unwrap().clips.last(), Some(&cut_b));
     assert_eq!(world.graph.pieces_of(tree), vec![stump, trunk]);
 
-    // The stump keeps its roots; the trunk lies on the lawn where its fall ends.
+    // The stump keeps its roots; the trunk, pushed over, lies where its fall ends: its boughs on the
+    // lawn, its butt on the stump's edge.
     assert_eq!(world.footing(stump), Some(Footing::Rooted));
     assert_eq!(world.footing(trunk), Some(Footing::Loose));
-    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain]);
+    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain, Node::Element(stump)]);
+    assert_eq!(cut.fell, vec![trunk]);
     graph_holds(&mut world);
 
     // The cut's outcome says what it did to the graph, and undoing it takes it all back.
@@ -153,8 +155,8 @@ fn a_log_laid_on_a_bridge_rests_on_it() {
     let bridge = place(&mut world, "local", &mut body, BRIDGE, SPAN);
     assert_eq!(world.footing(bridge), Some(Footing::Rooted), "its abutments are set into the ground");
     let tree = place(&mut world, "local", &mut body, TREE, LAWN);
-    let (_, trunk) = chop(&mut world, "local", &mut body, tree);
-    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain]);
+    let (stump, trunk) = chop(&mut world, "local", &mut body, tree);
+    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain, Node::Element(stump)]);
 
     lay_on_bridge(&mut world, "local", &mut body, trunk);
     assert_eq!(world.graph.supports_of(trunk), vec![Node::Element(bridge)], "on the bridge, not the lawn");
@@ -163,7 +165,7 @@ fn a_log_laid_on_a_bridge_rests_on_it() {
 
     // Undoing the move puts it back on the lawn, in the graph too; redoing it, on the bridge.
     done(act_as(&mut world, "local", &mut body, Action::Undo));
-    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain]);
+    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain, Node::Element(stump)]);
     graph_holds(&mut world);
     done(act_as(&mut world, "local", &mut body, Action::Redo));
     assert_eq!(world.graph.supports_of(trunk), vec![Node::Element(bridge)]);
@@ -178,13 +180,15 @@ fn a_log_laid_on_a_bridge_rests_on_it() {
     world.relocate_placed(trunk, laid, None);
     graph_holds(&mut world);
 
-    // Taking the bridge away takes what rests on it with it, and the law says the log is loose
-    // (it falls in phase G).
-    done(act_as(&mut world, "local", &mut body, Action::Remove { id: bridge }));
-    assert!(world.graph.supports_of(trunk).is_empty());
-    let loose = laws::none_unsupported(&world);
-    assert!(loose.as_ref().is_err_and(|e| e.contains("rests on nothing")), "{loose:?}");
+    // Taking the bridge away, the log falls to the ground under it (phase G); undone, both are back.
+    let on_bridge = world.find(trunk).unwrap().clone();
+    let removed = done(act_as(&mut world, "local", &mut body, Action::Remove { id: bridge }));
+    assert_eq!(removed.fell, vec![trunk]);
+    assert_eq!(world.graph.supports_of(trunk), vec![Node::Terrain]);
+    assert!(world.find(trunk).unwrap().pos[1] < on_bridge.pos[1], "it fell");
+    graph_holds(&mut world);
     done(act_as(&mut world, "local", &mut body, Action::Undo));
+    assert_eq!(world.find(trunk).unwrap(), &on_bridge);
     assert_eq!(world.graph.supports_of(trunk), vec![Node::Element(bridge)]);
     graph_holds(&mut world);
 }

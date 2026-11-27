@@ -320,6 +320,93 @@ When a tree's trunk is removed, the tree falls.
 - a cascade stops at its limit;
 - the same results and hashes natively and as modules, and at `-O` and `-O0`.
 
+*Slice 1 done 2026-11-27 (headless tests only; not yet played by hand):*
+
+- **`engine/src/support.rs`**, the arithmetic alone: a grid of cells over an element's own box
+  (48 along its longest side, at most 48³), its parts joined face to face, numbered in order; a
+  plane between a part and the rest (the world's up first, then the element's axes and the twelve
+  between them, half way across the widest gap); and `overhang`, whether a centre of mass stands
+  over the points that hold it, asked along sixteen directions, with a grip (a share of the
+  section's width it may overhang by: `SECTION_GRIP` 0.25 for a cross-section, none for a body on
+  its contacts).
+- **`engine/src/live/falls.rs`**, after every action but undo, redo and paddling
+  (`World::settle_support`), in at most `MAX_ROUNDS` rounds:
+  - **mended**: each loose element the action may have shaken (the terrain carved or raised round
+    it, what it rested on moved, cut or taken away) rests on what it now touches;
+  - **come apart**: an element carved (a terrain stroke at least half a cell, or a stroke into the
+    element) or cut is made into cells from the SDF the world has of it (its meshes clipped, its
+    own carving, the terrain's carves since it was promoted, sampled in blocks of four so clear
+    space is not asked); a part not joined to what holds it up (its roots in the ground, what it
+    rests on or hangs from) comes away along a plane between them, as a cut makes pieces: the
+    original retired, two new pieces `derived_from` it, owned by its owner, the rest keeping what it
+    hung from, what rested on, hung from or filled it found again;
+  - **broken**: where it still holds together, at up to twelve heights each carve reached, the
+    cross-section there is sampled 24 by 24 and asked whether it holds the cells above it; a notch
+    half through holds, about three-fifths and deeper breaks there along a level plane, the part
+    above tipping first over the hinge the section left;
+  - **fallen**: every loose element nothing reaching the ground holds up (`World::grounded`: resting
+    on or attached to the terrain or to something grounded; two pieces resting only on each other
+    are not), its rests found again first, and every piece unsteady or pushed, lowest first: it drops
+    straight down until a point meets something, then tips over the edge its centre of mass
+    overhangs (or the way a chop pushed it), turning about that edge with steps no larger than the
+    nearest thing allows, until something going down meets it, up to a quarter turn at a time, up
+    to eight times; then water settles it. It meets the terrain without water and every other
+    element (scene solids by their meshes, SDF ones by their fields). A falling body is its surface
+    cells, each a ball as deep as it lies inside; a carved field, which says less than the distance
+    near the carve's lip, is only met where a point moved on a little is in it. A promoted piece
+    that falls takes the terrain's carves into it along as its own. What rested on it is asked
+    next round.
+  - At most `World::fall_limit` falls an action (`FALL_LIMIT` = 24); what is left falls with the
+    next action. Each split and fall is in the action's undo (`WorldAction::Fell`, and
+    `WorldAction::Many` for the several changes one action makes) and its outcome
+    (`Summary::fell`, "…; Oak Tree fell").
+- **A chop is a cut plus the support check**: both pieces stay where the tree stood; the top is
+  pushed over the way the player faces and falls as anything falls (onto the lawn, the stump's edge,
+  a bridge), not through other things; the scripted 90° topple and its ground probe are gone (the
+  free `cut::toppled_transform` is kept for its own test). A lying log's pieces are still nudged
+  apart.
+- **A fall is shown, not kept**: the element is where it comes to rest at once (as saves and later
+  actions see it); `FallingElement` (with the edge it tipped over, if it did) eases it from where
+  it was, and `tick_falling` and `finish_all_falls` move only what is shown.
+- **Fixed on the way** (phase F): an element asked alone (contacts, hosts, carves) is asked with the
+  terrain's carves made since it entered the SDF, so a stump carved through is carved; a field is
+  touched from above where a point let down by the tolerance is in it; a carved element's contacts
+  come from its cells, not its meshes (which do not know its carving); placed elements are kept in
+  order of id, so undoing a removal saves as before.
+- **Uprooted** (played by hand the same day: bowls dug round an oak's foot carved its base and roots
+  away, as a terrain carve cuts what it reaches, yet it stood on, rooted by its meshes, and nothing
+  carved into it after could fell it): an element rooted by its shape whose cells no longer touch
+  the terrain (checked when it is carved or cut, or the terrain near it is carved) is
+  `uprooted` (a relation to the terrain, saved and undone like any other), so it is loose and
+  falls; pieces cut or broken from it are uprooted too. A part held up stays with the element
+  however many parts are held (a root the cells see apart from its trunk no longer comes away as a
+  second stump), and a part comes away along a level plane whenever one parts it, so leaves go
+  with the top. `a_tree_whose_foot_is_dug_away_falls_and_stays_uprooted`, from the session's bowls.
+- Laws: `none_unsupported` now asks `grounded` (and says when something rests only on what does not
+  reach the ground); `rests_are_contacts` ends a fall still shown first.
+- Tests: `engine/tests/support.rs` (9, the ninth from the hand-played session above): a ball carved through a trunk drops the canopy 0.76 m onto
+  its carved stump, undone and redone to the same save; a notch half through stands, four-fifths
+  breaks and the top falls east, towards the notch, onto the lawn; a chopped tree lands on a bridge
+  beside it, held up by the deck; a bridge removed drops the log lying on it, undone and redone to
+  the same save; a pit dug under a log lets it fall to the pit's floor; a lying log cut in two lies on
+  the lawn, and written as two pieces resting on each other alone, the law says so and the next
+  action mends it; three pillars on a bridge with a limit of two fall two, then one; and a session
+  of falls replays bit for bit. `graph.rs`: a chopped trunk rests on the lawn and its stump's edge;
+  a log on a removed bridge falls (no longer "loose until G").
+
+Short of the done-when:
+- **The same results natively and as modules, at `-O` and `-O0`** is not tested. Falls use only
+  IEEE arithmetic and `math`, and replay is bit-exact within one build, but no test compares the
+  hashes of falls across builds or against the areas played natively.
+- A part that no plane parts from the rest (interlocking, a ring cut round) is left joined: the
+  component mask (a piece's own baked `MeshSdf`, or carve edits of the rest) is not built.
+- Strokes smaller than half a cell (a tiny tunnelling into an oak) are not asked about until a
+  larger change to that element: a tiny cannot fell an oak alone.
+- Not asked: whether something set down (`Drop`, `Place`) balances where it is put (only what falls,
+  breaks or is cut is); what rests on something carried (until it is set down, as in F).
+- Falling bodies are their cells (about 13 cm for a person-size oak): a notch finer than a cell is
+  found by the cross-section, but what it then stands on is coarse.
+
 ### H. Materials and tools (one week; the masked carve is finished in J)
 
 A shovel stops at the rock.

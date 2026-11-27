@@ -1249,9 +1249,11 @@ pub fn relations_are_whole(world: &crate::live::World) -> Verdict {
 }
 
 /// Every `rests_on` is a real contact where both ends now are (`live::World::contacts_at`).
-/// Carried elements, and what rests on them, are left until they are set down.
+/// Carried elements, and what rests on them, are left until they are set down. (A fall still
+/// shown is ended first: the element is already where it came to rest.)
 pub fn rests_are_contacts(world: &mut crate::live::World) -> Verdict {
     use crate::graph::Kind;
+    world.finish_all_falls(None);
     let held = world.held.map(|h| h.id);
     let rests: Vec<_> = world.graph.relations().filter(|r| r.kind == Kind::RestsOn).collect();
     for r in rests {
@@ -1271,12 +1273,19 @@ pub fn rests_are_contacts(world: &mut crate::live::World) -> Verdict {
 }
 
 /// No element is unsupported: each is ground (an SDF landform), rooted, afloat, carried, or rests
-/// on or is attached to something.
+/// on or is attached to something that is, or to the terrain, however many steps away
+/// (`live::World::grounded`): two pieces resting only on each other are not held up.
 pub fn none_unsupported(world: &crate::live::World) -> Verdict {
     use crate::live::Footing;
+    let grounded = world.grounded();
     for pl in &world.placed {
-        if world.footing(pl.id) == Some(Footing::Loose) && !world.is_held_up(pl.id) {
-            return Err(format!("{} (#{}) at {} is loose and rests on nothing", world.element_name(pl.id), pl.id, at(pl.pos, 1.7)));
+        if world.footing(pl.id) == Some(Footing::Loose) && !grounded.contains(&pl.id) {
+            let on: Vec<String> = world.graph.supports_of(pl.id).iter().map(|n| n.to_string()).collect();
+            return Err(if on.is_empty() {
+                format!("{} (#{}) at {} is loose and rests on nothing", world.element_name(pl.id), pl.id, at(pl.pos, 1.7))
+            } else {
+                format!("{} (#{}) at {} rests on {}, but nothing it rests on reaches the ground", world.element_name(pl.id), pl.id, at(pl.pos, 1.7), on.join(", "))
+            });
         }
     }
     Ok(())

@@ -12,16 +12,21 @@
 //! again, move, or take away, and what to tell the player. The engine knows nothing of Bevy.
 //!
 //! **What is logical and what is only shown.** Everything a save keeps changes only by an action:
-//! a fall is decided when the cut is made, and ends (`finish_all_falls`) before the next action
-//! whether or not it was seen to; an element settles on water at rest, unloaded. What only the
-//! player sees and stands on (the topple under way, bobbing, a rider's weight pressing a boat down)
-//! is `animate`d between actions and moves no saved transform, so a log replays without it.
+//! a fall is decided by the action that set it off (`falls`), and the element is where it comes to
+//! rest at once; an element settles on water at rest, unloaded. What only the player sees and
+//! stands on (a fall under way, `tick_falling`; bobbing; a rider's weight pressing a boat down) is
+//! shown between actions and moves no saved transform, so a log replays without it.
+//!
+//! **Support** (`falls`, phase G): after an action, what it carved or cut and no longer holds
+//! together comes apart, and what nothing reaching the ground holds up falls, onto whatever is
+//! beneath it; undone with the action.
 //!
 //! **The graph** (`graph`, phase F): what each element was cut from, rests on and is owned by,
 //! written by the actions that make it so (`relations`), reported in their `Summary`, undone with
 //! them, and saved.
 
 pub mod action;
+mod falls;
 pub mod history;
 pub mod log;
 mod near;
@@ -36,6 +41,7 @@ use tracing::info_span;
 use wasmtime::bail;
 
 use crate::atlas::{Atlas, CompiledAtlas, TileSpec};
+use crate::compose;
 use crate::body::Body;
 use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, quat_normalize};
 use crate::cut::ObjectPhysics;
@@ -51,7 +57,11 @@ use crate::{Compiled, ElementBounds, Limits, PlayerState, Result, Scene, Wasm, c
 pub use action::{Action, Actor, Outcome, SculptTarget, Summary};
 pub use history::{History, WorldAction};
 pub use log::{ActionLog, LOG_VERSION, Logged, replay};
+pub use falls::{FALL_LIMIT, MAX_ROUNDS};
 pub use relations::Footing;
+
+/// Elements a carve promoted (id, edit index), their bounds, and their names.
+type Promoted = (Vec<(u32, usize)>, Vec<(PlacementTransform, ElementBounds)>, Vec<String>);
 
 /// Which chunks a change makes stale.
 #[derive(Clone, Debug, PartialEq)]
@@ -117,7 +127,8 @@ impl Changes {
     }
 }
 
-/// A chopped piece toppling, eased as if by gravity.
+/// An element falling, as it is shown (it is already where it comes to rest): eased as if by
+/// gravity, swung about `pivot` if it tipped over one.
 #[derive(Clone, Copy, Debug)]
 pub struct FallingElement {
     pub id: u32,
@@ -128,6 +139,7 @@ pub struct FallingElement {
     pub scale: f32,
     pub elapsed: f32,
     pub duration: f32,
+    pub pivot: Option<[f32; 3]>,
 }
 
 impl FallingElement {
@@ -135,8 +147,19 @@ impl FallingElement {
         let u = (self.elapsed / self.duration.max(1e-3)).clamp(0.0, 1.0);
         // Quadratic ease-in: tipping over, faster and faster.
         let t = u * u;
-        let pos = [0, 1, 2].map(|a| self.from_pos[a] + (self.to_pos[a] - self.from_pos[a]) * t);
-        PlacementTransform::with_rot(pos, nlerp_quat(self.from_rot, self.to_rot, t), self.scale)
+        let rot = nlerp_quat(self.from_rot, self.to_rot, t);
+        let pos = match self.pivot {
+            // Swung about the edge it tipped over, and moved the rest of the way as it goes.
+            Some(pv) => {
+                let turn = compose::quat_mul(self.to_rot, compose::quat_conj(self.from_rot));
+                let arm = [0, 1, 2].map(|a| self.from_pos[a] - pv[a]);
+                let swung = compose::quat_rotate(nlerp_quat([0.0, 0.0, 0.0, 1.0], turn, t), arm);
+                let ends = compose::quat_rotate(turn, arm);
+                [0, 1, 2].map(|a| pv[a] + swung[a] + (self.to_pos[a] - (pv[a] + ends[a])) * t)
+            }
+            None => [0, 1, 2].map(|a| self.from_pos[a] + (self.to_pos[a] - self.from_pos[a]) * t),
+        };
+        PlacementTransform::with_rot(pos, rot, self.scale)
     }
 
     pub fn end(&self) -> PlacementTransform {
@@ -209,6 +232,14 @@ pub struct World {
     log: Option<ActionLog>,
     /// The graph's changes during the action being applied.
     journal: GraphDelta,
+    /// The most falls one action may set off (`FALL_LIMIT`); what is still loose falls with the next.
+    pub fall_limit: usize,
+    /// What the action being applied may have shaken (`falls`).
+    pending: falls::Pending,
+    /// Elements made into cells, by id, with the edits' revision and the element as they were.
+    cells: BTreeMap<u32, (u64, PlacedElement, falls::Cells)>,
+    /// SDF elements asked alone (`entry_distances`), by id, with the edits' revision and the element.
+    alone: BTreeMap<u32, (u64, PlacedElement, Arc<ComposedLog>)>,
 }
 
 impl World {
@@ -280,6 +311,10 @@ impl World {
             changes: Changes::default(),
             log: None,
             journal: GraphDelta::default(),
+            fall_limit: FALL_LIMIT,
+            pending: falls::Pending::default(),
+            cells: BTreeMap::new(),
+            alone: BTreeMap::new(),
         };
         // Pieces cut from elements no longer in the world keep their ids, so none is used again.
         world.next_id = world.next_id.max(world.graph.relations().filter_map(|r| r.to.element()).max().map_or(0, |m| m + 1));
@@ -492,7 +527,8 @@ impl World {
         }
     }
 
-    /// Spawns `pl`'s runtime and scene layer, adds it to the placed elements (no SDF commit).
+    /// Spawns `pl`'s runtime and scene layer, adds it to the placed elements in order of id (no SDF
+    /// commit).
     fn spawn_layer_for(&mut self, pl: PlacedElement) -> Result<Arc<crate::compose::CompiledElement>> {
         let compiled = self.catalog.get_or_load(&pl.module)?;
         let scene = self.runtime.spawn_for_size(pl.clone(), &compiled, &mut self.scene, self.viewer_size)?;
@@ -501,7 +537,9 @@ impl World {
         if pl.is_promoted() {
             self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)?;
         }
-        self.placed.push(pl);
+        // In order of id, so a world undone to where it was saves as it did.
+        let at = self.placed.partition_point(|e| e.id < pl.id);
+        self.placed.insert(at, pl);
         Ok(compiled)
     }
 
@@ -624,7 +662,7 @@ impl World {
         edit: &Edit,
         aimed: Option<u32>,
         edit_idx: usize,
-    ) -> (Vec<(u32, usize)>, Vec<(PlacementTransform, ElementBounds)>, Vec<String>) {
+    ) -> Promoted {
         let _span = info_span!("promote").entered();
         let (elo, ehi) = edit.influence_bounds();
         let mut candidates = self.scene.solid_placed_overlapping(elo, ehi);
@@ -711,12 +749,11 @@ impl World {
         }
     }
 
-    /// Snaps every topple under way to where it ends.
+    /// Shows every fall under way where it ends (where the element already is).
     pub fn finish_all_falls(&mut self, body: Option<&mut Body>) {
         let pending = std::mem::take(&mut self.falling);
         for fall in pending {
-            self.relocate_placed(fall.id, fall.end(), None);
-            let _ = self.settle_buoyancy_for(fall.id, 0.0);
+            self.finish_fall(fall.id);
         }
         if let Some(body) = body {
             let max_lift = body.size as f64 * 3.0;
@@ -724,7 +761,19 @@ impl World {
         }
     }
 
-    /// Carries the topples under way on by `dt`.
+    /// The element `id`, no longer shown falling, shown (and in the SDF) where it is.
+    fn finish_fall(&mut self, id: u32) {
+        if let Some(tf) = self.find(id).map(|pl| pl.transform()) {
+            let pl = self.find(id).cloned();
+            self.relocate_placed(id, tf, None);
+            // `relocate_placed` writes the transform back; keep the record exactly as it was.
+            if let (Some(pl), Some(i)) = (pl, self.index_of(id)) {
+                self.placed[i] = pl;
+            }
+        }
+    }
+
+    /// Carries the falls under way on by `dt` (shown only: nothing kept moves).
     pub fn tick_falling(&mut self, dt: f32, body: &mut Body) {
         if self.falling.is_empty() {
             return;
@@ -732,15 +781,18 @@ impl World {
         let mut updates = Vec::new();
         for fall in &mut self.falling {
             fall.elapsed += dt;
-            updates.push((fall.id, fall.sample(), fall.elapsed >= fall.duration));
+            let from = PlacementTransform::with_rot(fall.from_pos, fall.from_rot, fall.scale);
+            updates.push((fall.id, from, fall.sample(), fall.elapsed >= fall.duration));
         }
         self.falling.retain(|f| f.elapsed < f.duration);
-        for (id, tf, finished) in updates {
+        for (id, from, tf, finished) in updates {
             if finished {
-                self.relocate_placed(id, tf, Some(&mut *body));
-                let _ = self.settle_buoyancy_for(id, 0.0);
-            } else {
-                self.relocate_placed_fast(id, tf);
+                self.finish_fall(id);
+                let max_lift = body.size as f64 * 3.0;
+                let _ = body.surface_from_solid(&mut self.combined(), max_lift);
+            } else if self.runtime.relocate_fast(id, tf, &mut self.scene) {
+                // Its layer was made where the fall began.
+                self.changes.layers.push(LayerChange::Moved { owner: id, from, to: tf });
             }
         }
     }

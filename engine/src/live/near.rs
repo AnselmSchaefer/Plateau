@@ -31,7 +31,7 @@ fn list(ids: &[u32], word: &str) -> String {
 
 impl World {
     /// Where the element `id` is in the world: the box round its solid (or its SDF), if it has one.
-    fn world_box(&self, id: u32) -> Option<([f32; 3], [f32; 3])> {
+    pub(super) fn world_box(&self, id: u32) -> Option<([f32; 3], [f32; 3])> {
         let pl = self.find(id)?;
         if let Some(b) = self.sdf_bounds_of(pl) {
             return Some(pl.transform().world_bounds(b));

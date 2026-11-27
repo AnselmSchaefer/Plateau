@@ -7,13 +7,14 @@
 //!
 //! | Kind | From → to | Written by | Data |
 //! |---|---|---|---|
-//! | `derived_from` | a piece → the element it was cut from | `Cut` | the piece's own side of the cut |
-//! | `rests_on` | an element → what holds it up (terrain or an element) | `Place`, `Drop`, `Cut` (where a piece comes to rest), from real contacts | — |
+//! | `derived_from` | a piece → the element it was cut from | `Cut`, and the support check (a part come away, a trunk broken at a notch) | the piece's own side of the cut |
+//! | `rests_on` | an element → what holds it up (terrain or an element) | `Place`, `Drop`, `Cut`, and the support check (where what falls comes to rest, and what the world changed under), from real contacts | — |
 //! | `owned_by` | an element → a player | `Place`; a cut piece inherits its original's owner, not the cutter | — |
 //! | `attached_to` | an element → what it is fixed to (terrain or an element): held up by it | `Place` fitted to an opening | — |
 //! | `fills` | an element → what the opening it fills is in | `Place` fitted to an opening | where the opening was measured |
 //! | `carved_into` | a terrain edit → what it carved (the terrain, elements it cut) | `Sculpt` (a carve) | — |
 //! | `flooded_by` | a water body → the carve that let it in | `Sculpt` (a carve that floods) | — |
+//! | `uprooted` | an element rooted by its shape → the terrain its roots no longer hold in | the support check, when nothing of its roots touches the terrain (dug round, or carved away) | — |
 //!
 //! The graph changes only by `World::apply`: each change is a `GraphDelta` (relations added and
 //! removed), reported in the action's `Summary` and kept with its undo, which reverts it. Saved as
@@ -104,10 +105,11 @@ pub enum Kind {
     Fills,
     CarvedInto,
     FloodedBy,
+    Uprooted,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 7] = [Kind::DerivedFrom, Kind::RestsOn, Kind::OwnedBy, Kind::AttachedTo, Kind::Fills, Kind::CarvedInto, Kind::FloodedBy];
+    pub const ALL: [Kind; 8] = [Kind::DerivedFrom, Kind::RestsOn, Kind::OwnedBy, Kind::AttachedTo, Kind::Fills, Kind::CarvedInto, Kind::FloodedBy, Kind::Uprooted];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -118,6 +120,7 @@ impl Kind {
             Kind::Fills => "fills",
             Kind::CarvedInto => "carved_into",
             Kind::FloodedBy => "flooded_by",
+            Kind::Uprooted => "uprooted",
         }
     }
 
@@ -140,6 +143,7 @@ impl Kind {
             Kind::OwnedBy => matches!((from, to), (Node::Element(_), Node::Player(_))),
             Kind::CarvedInto => matches!((from, to), (Node::Edit(_), Node::Terrain | Node::Element(_))),
             Kind::FloodedBy => matches!((from, to), (Node::Water(_), Node::Edit(_))),
+            Kind::Uprooted => matches!((from, to), (Node::Element(_), Node::Terrain)),
         }
     }
 }
@@ -220,6 +224,10 @@ impl Relation {
         Relation::new(Kind::FloodedBy, Node::Water(water), Node::Edit(edit))
     }
 
+    pub fn uprooted(id: u32) -> Relation {
+        Relation::new(Kind::Uprooted, Node::Element(id), Node::Terrain)
+    }
+
     fn key(&self) -> (Kind, Node, Node) {
         (self.kind, self.from.clone(), self.to.clone())
     }
@@ -285,6 +293,7 @@ impl std::fmt::Display for Relation {
             Kind::Fills => "fills an opening in",
             Kind::CarvedInto => "carved into",
             Kind::FloodedBy => "came in through",
+            Kind::Uprooted => "no longer has its roots in",
         };
         write!(f, "{} {verb} {}", self.from, self.to)
     }

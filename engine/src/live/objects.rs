@@ -2,19 +2,14 @@
 //! piloting what floats.
 
 use super::action::{Actor, Outcome, Summary};
-use super::{FallingElement, World, WorldAction};
+use super::{World, WorldAction};
 use crate::Material;
-use crate::body;
 use crate::compose::{PlacementTransform, quat_rotate};
 use crate::graph::Relation;
-use crate::cut::{CarryDecision, ObjectPhysics, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass, toppled_transform};
+use crate::cut::{CarryDecision, check_carry, check_cut_with_tool, choose_cut_plane, clip_scene, format_mass};
 use crate::math;
-use crate::physics::{BuoyancyState, Tool, compute_buoyancy, player_mass_kg, step_floating_move};
+use crate::physics::{BuoyancyState, Tool, player_mass_kg, step_floating_move};
 use crate::rules::Action as Rule;
-
-/// How long a chopped piece takes to topple, in seconds (shown only: it has fallen by the next
-/// action).
-const TOPPLE_SECONDS: f32 = 0.48;
 
 /// Whether `rot` lies its element on its side (its own up within 60° of level).
 pub fn is_rot_horizontal(rot: [f32; 4]) -> bool {
@@ -27,9 +22,10 @@ impl World {
     }
 
     /// Chops the element `id` where `hit` is, with `tool`, across its longest axis, into two new
-    /// elements: the lower piece stays where it stood, the upper topples away along `dir` if it
-    /// stood upright. Each is `derived_from` the original and owned by its owner (not the cutter),
-    /// and rests on what it touches where it comes to rest.
+    /// elements, each `derived_from` the original and owned by its owner (not the cutter), both
+    /// where it stood (a lying one's upper piece nudged apart along the cut). Then the support
+    /// check (`falls`): what stood upright is pushed over along `dir` and falls where it falls, onto
+    /// whatever is there; each comes to rest on what it touches.
     pub(super) fn cut(&mut self, actor: &mut Actor<'_>, id: u32, hit: [f32; 3], dir: [f32; 3], tool: Tool, material: Option<Material>) -> Outcome {
         let Some(original) = self.find(id).cloned() else { return Outcome::Denied("aim at a placed object within reach to chop (K)".into()) };
         if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: original.pos, owner: self.owner_of(id) }) {
@@ -43,8 +39,7 @@ impl World {
         let orig_tf = original.transform();
         let Some(plane) = choose_cut_plane(&phys, orig_tf.world_to_local_point(hit)) else { return Outcome::Denied("too small to cut cleanly".into()) };
         let Some(scene) = self.runtime.local_scene_of(id).cloned() else { return Outcome::Denied(format!("{name} cannot be cut")) };
-        let upper_scene = clip_scene(&scene, &[plane]);
-        if clip_scene(&scene, &[plane.flipped()]).instances.is_empty() || upper_scene.instances.is_empty() {
+        if clip_scene(&scene, &[plane.flipped()]).instances.is_empty() || clip_scene(&scene, &[plane]).instances.is_empty() {
             return Outcome::Denied("cut plane missed solid geometry — aim nearer the middle".into());
         }
         let lower_id = self.alloc_id();
@@ -55,61 +50,20 @@ impl World {
         let mut upper = original.clone();
         upper.id = upper_id;
         upper.clips.push(plane);
-        let upper_phys = ObjectPhysics::compute(&upper_scene, upper.scale);
         let upright = !is_rot_horizontal(orig_tf.rot);
-
-        // Where the upper piece comes to rest: toppled onto the terrain (asked of the SDF alone, so
-        // it never lands on the uncut tree's own crown) or nudged apart along the cut, then on water.
-        let mut rest = if upright {
-            let flen = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt();
-            let (fx, fz) = if flen > 1e-3 { (dir[0] / flen, dir[2] / flen) } else { (-math::sin(actor.body.yaw), -math::cos(actor.body.yaw)) };
-            let probe = [
-                orig_tf.pos[0] as f64 + (fx * upper_phys.world_span * 0.45) as f64,
-                orig_tf.pos[1] as f64 + upper_phys.world_span as f64 + 1.0,
-                orig_tf.pos[2] as f64 + (fz * upper_phys.world_span * 0.45) as f64,
-            ];
-            let ground = body::look(&mut self.region, probe, [0.0, -1.0, 0.0], actor.body.size, upper_phys.world_span * 2.0 + 10.0);
-            let ground_y = ground.ok().flatten().map_or(orig_tf.pos[1], |h| h[1] as f32);
-            toppled_transform(orig_tf, &upper_phys, [fx, fz], ground_y)
-        } else {
+        if !upright {
+            // Lying, the pieces are nudged apart along the cut, so it is seen.
             let wn = orig_tf.local_to_world_dir(plane.normal);
             let gap = (0.14 * upper.scale).max(0.01);
-            PlacementTransform::with_rot([0, 1, 2].map(|a| orig_tf.pos[a] + wn[a] * gap), orig_tf.rot, orig_tf.scale)
-        };
-        let mut upper_floats = false;
-        if let Ok(buoy) = compute_buoyancy(&upper_phys, rest, &mut self.region, 0.0) {
-            upper_floats = buoy.is_floating();
-            match buoy {
-                BuoyancyState::Floating { target_y, .. } | BuoyancyState::Sinking { target_y, .. } => rest.pos[1] = target_y,
-                BuoyancyState::Dry { floor_y } => {
-                    let (min_y, _) = upper_phys.rotated_y_extents(rest.rot, rest.scale);
-                    rest.pos[1] = floor_y - min_y - 0.02 * rest.scale;
-                }
-            }
-        }
-        let mut upper_settled = upper.clone();
-        upper_settled.set_transform(rest);
-
-        if upright {
-            self.falling.push(FallingElement {
-                id: upper_id,
-                from_pos: orig_tf.pos,
-                from_rot: orig_tf.rot,
-                to_pos: rest.pos,
-                to_rot: rest.rot,
-                scale: orig_tf.scale,
-                elapsed: 0.0,
-                duration: TOPPLE_SECONDS,
-            });
+            upper.set_transform(PlacementTransform::with_rot([0, 1, 2].map(|a| orig_tf.pos[a] + wn[a] * gap), orig_tf.rot, orig_tf.scale));
         }
         let owner = self.owner_of(id).map(str::to_string);
+        let uprooted = self.graph.contains(&Relation::uprooted(id));
+        self.shaken(id);
         self.unrelate_leaving(id);
         self.remove_placed(id);
-        let spawned = self
-            .spawn_placed(lower.clone(), Some(&mut *actor.body))
-            .and_then(|_| self.spawn_placed(if upright { upper.clone() } else { upper_settled.clone() }, Some(&mut *actor.body)));
+        let spawned = self.spawn_placed(lower.clone(), Some(&mut *actor.body)).and_then(|_| self.spawn_placed(upper.clone(), Some(&mut *actor.body)));
         if let Err(e) = spawned {
-            self.falling.retain(|f| f.id != upper_id);
             return Outcome::Denied(format!("chop failed: {e}"));
         }
         for (piece, clip) in [(lower_id, plane.flipped()), (upper_id, plane)] {
@@ -117,16 +71,21 @@ impl World {
             if let Some(owner) = &owner {
                 self.relate(Relation::owned_by(piece, owner));
             }
+            // Pieces of what was uprooted have no roots either.
+            if uprooted {
+                self.relate(Relation::uprooted(piece));
+            }
+            self.settle_relations(piece);
+            self.pending.reshaped.insert(piece);
+            self.pending.unsteady.insert(piece);
         }
-        self.settle_relations(lower_id);
-        // The upper piece rests where its fall ends, not where it is still shown.
-        let upper_rests = if upper_floats || upper_phys.rooted { Vec::new() } else { self.contacts_at(upper_id, rest) };
-        self.rest_on(upper_id, &upper_rests);
-        if upright && upper.is_promoted() {
-            // A carved trunk falls as its crisp meshes; its SDF, tunnel and all, is back where it lands.
-            self.show_solid_at(upper_id, orig_tf);
+        if upright {
+            let flen = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt();
+            let (fx, fz) = if flen > 1e-3 { (dir[0] / flen, dir[2] / flen) } else { (-math::sin(actor.body.yaw), -math::cos(actor.body.yaw)) };
+            self.pending.pushed.insert(upper_id, ([fx, fz], None));
         }
-        self.history.push(WorldAction::CutElement { original, lower, upper: upper_settled });
+        let upper = self.find(upper_id).cloned().unwrap_or(upper);
+        self.history.push(WorldAction::CutElement { original, lower, upper });
         let mut summary = self.said(format!("chopped {name} — press G to carry"));
         summary.added = vec![lower_id, upper_id];
         summary.removed = vec![id];
@@ -166,6 +125,7 @@ impl World {
         }
         let scale = self.find(held.id).map_or(held.from.scale, |pl| pl.scale);
         self.release_held(PlacementTransform::with_rot(pos, rot, scale), true, Some(&mut *actor.body));
+        self.shaken(held.id);
         self.unrelate_moved(held.id);
         self.settle_relations(held.id);
         let name = self.element_name(held.id);

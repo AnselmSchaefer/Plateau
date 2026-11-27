@@ -388,10 +388,9 @@ pub fn sync(
 
     // Spawn newly added lights.
     for (&(owner, id), l) in &world.lights {
-        if !visuals.light_entities.contains_key(&(owner, id)) {
+        visuals.light_entities.entry((owner, id)).or_insert_with(|| {
             let (pl, tf) = light_components(l, eye, scale);
-            let entity = commands.spawn((pl, tf, SceneNode, SceneLight { owner, id })).id();
-            visuals.light_entities.insert((owner, id), entity);
-        }
+            commands.spawn((pl, tf, SceneNode, SceneLight { owner, id })).id()
+        });
     }
 }

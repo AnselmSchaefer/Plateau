@@ -17,6 +17,11 @@ pub enum WorldAction {
     /// An element chopped into a lower and an upper piece.
     CutElement { original: PlacedElement, lower: PlacedElement, upper: PlacedElement },
     RelocateElement { id: u32, before: PlacementTransform, after: PlacementTransform },
+    /// An element fallen (phase G): as it was, and as it came to rest (with the terrain's carves
+    /// into it its own, if it was promoted).
+    Fell { before: PlacedElement, after: PlacedElement },
+    /// Several changes one action made (a cut, then what came apart and fell), in order.
+    Many(Vec<WorldAction>),
 }
 
 /// A change kept for undo: what it did to the world, and to the graph.
@@ -43,5 +48,15 @@ impl History {
         self.undo.push(Done { action, graph: GraphDelta::default() });
         self.redo.clear();
         self.pushed += 1;
+    }
+
+    /// The last `n` changes pushed made one, undone and redone together.
+    pub fn join_last(&mut self, n: usize) {
+        let n = n.min(self.undo.len());
+        if n < 2 {
+            return;
+        }
+        let tail = self.undo.split_off(self.undo.len() - n);
+        self.undo.push(Done { action: WorldAction::Many(tail.into_iter().map(|d| d.action).collect()), graph: GraphDelta::default() });
     }
 }

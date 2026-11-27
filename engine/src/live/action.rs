@@ -112,12 +112,22 @@ pub struct Summary {
     pub promoted: Vec<u32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub water: bool,
+    /// Elements that fell because of it (phase G), in the order they fell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fell: Vec<u32>,
     /// What it did to the world graph.
     #[serde(default, skip_serializing_if = "GraphDelta::is_empty")]
     pub graph: GraphDelta,
     /// What the player is told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub said: Option<String>,
+}
+
+/// Why a change could not be undone or redone.
+enum Refused {
+    /// There was nothing to undo or redo.
+    Unchanged(String),
+    Denied(String),
 }
 
 /// What came of an action.
@@ -158,6 +168,7 @@ impl World {
         let yaw = actor.body.yaw;
         let id = actor.id.to_string();
         self.journal = GraphDelta::default();
+        self.pending = Default::default();
         let pushed = self.history.pushed;
         let mut outcome = match &action {
             Action::Sculpt { edit, hit, tool, target } => self.sculpt(&mut actor, *edit, *hit, *tool, *target),
@@ -175,6 +186,36 @@ impl World {
             Action::Undo => self.undo(actor.body),
             Action::Redo => self.redo(&mut actor),
         };
+        // What it shook settles: what came apart, and what fell (undone with it).
+        if outcome.is_done() && !matches!(action, Action::Undo | Action::Redo | Action::Steer { .. }) {
+            let settled = self.settle_support();
+            if let Outcome::Done(summary) = &mut outcome
+                && !(settled.added.is_empty() && settled.fell.is_empty())
+            {
+                summary.added.extend(settled.added);
+                summary.removed.extend(settled.removed);
+                summary.edits = self.edits.len();
+                summary.elements = self.placed.len();
+                let mut names: Vec<String> = Vec::new();
+                for &id in &settled.fell {
+                    let name = self.element_name(id);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                if !names.is_empty() {
+                    let fell = format!("{} fell", names.join(", "));
+                    summary.said = Some(match summary.said.take() {
+                        Some(s) if !s.is_empty() => format!("{s}; {fell}"),
+                        _ => fell,
+                    });
+                }
+                summary.fell = settled.fell;
+            }
+        }
+        self.pending = Default::default();
+        let joined = (self.history.pushed - pushed) as usize;
+        self.history.join_last(joined);
         // What it did to the graph goes with its undo, and is said in its outcome.
         let delta = self.take_journal();
         if self.history.pushed != pushed
@@ -259,6 +300,10 @@ impl World {
             self.commit(Invalidation::edit(edit));
         }
         self.history.push(WorldAction::ElementSdfEdit { id, edit: local_edit, newly_promoted });
+        if edit.op == Op::Carve && self.worth_asking(id, edit.shape.radius()) {
+            self.pending.reshaped.insert(id);
+            self.shaken(id);
+        }
         let name = self.element_name(id);
         let mut summary = self.summary(if newly_promoted.is_some() {
             format!("{name} sculpted (still choppable & carriable)")
@@ -307,9 +352,10 @@ impl World {
         self.edit_authors.push(Some(actor.id.to_string()));
         self.dirty = true;
         self.history.push(WorldAction::SdfEdit { edit, promoted_ids: promoted_ids.clone() });
-        for what in carved {
+        for what in carved.iter().cloned() {
             self.relate(Relation::carved_into(edit_idx as u32, what));
         }
+        self.shaken_by_edit(&edit, &carved);
         if water_bounds.is_some() {
             for (body, idx) in self.newly_flooded(&water_before) {
                 self.relate(Relation::flooded_by(body, idx));
@@ -408,6 +454,7 @@ impl World {
         if let Err(denial) = self.rules.check(actor.id, &Rule::RemoveElement { at: pl.pos, owner: self.owner_of(id) }) {
             return Outcome::Denied(denial.reason);
         }
+        self.shaken(id);
         self.unrelate_leaving(id);
         match self.remove_placed(id) {
             Some(removed) => {
@@ -438,12 +485,26 @@ impl World {
     fn undo(&mut self, body: &mut Body) -> Outcome {
         self.finish_all_falls(Some(&mut *body));
         let Some(done) = self.history.undo.pop() else { return Outcome::Unchanged("nothing to undo".into()) };
-        let said = match done.action.clone() {
+        let said = match self.undo_one(done.action.clone(), body) {
+            Ok(said) => said,
+            Err(Refused::Unchanged(why)) => {
+                self.history.undo.push(done);
+                return Outcome::Unchanged(why);
+            }
+            Err(Refused::Denied(why)) => return Outcome::Denied(why),
+        };
+        self.revert_graph(&done.graph, false);
+        self.history.redo.push(done);
+        Outcome::Done(self.summary(said))
+    }
+
+    /// Undoes one change (its graph is reverted by `undo`): what to say, or why it could not be.
+    fn undo_one(&mut self, action: WorldAction, body: &mut Body) -> std::result::Result<String, Refused> {
+        Ok(match action {
             WorldAction::SdfEdit { edit, promoted_ids } => {
                 let mut next = (*self.edits).clone();
                 if next.pop().is_none() {
-                    self.history.undo.push(done);
-                    return Outcome::Unchanged("nothing to undo".into());
+                    return Err(Refused::Unchanged("nothing to undo".into()));
                 }
                 self.edits = Arc::new(next);
                 self.edit_authors.pop();
@@ -456,7 +517,7 @@ impl World {
             }
             WorldAction::ElementSdfEdit { id, newly_promoted, .. } => {
                 let Some(pos) = self.placed.iter().position(|e| e.id == id) else {
-                    return Outcome::Unchanged("nothing to undo".into());
+                    return Err(Refused::Unchanged("nothing to undo".into()));
                 };
                 let old_bounds = self.sdf_bounds_of(&self.placed[pos]);
                 let tf = self.placed[pos].transform();
@@ -474,7 +535,7 @@ impl World {
             }
             WorldAction::RemoveElement(pl) => {
                 if let Err(e) = self.spawn_placed(pl, Some(&mut *body)) {
-                    return Outcome::Denied(format!("undo failed: {e}"));
+                    return Err(Refused::Denied(format!("undo failed: {e}")));
                 }
                 format!("restored element ({} elements)", self.placed.len())
             }
@@ -482,7 +543,7 @@ impl World {
                 self.remove_placed(upper.id);
                 self.remove_placed(lower.id);
                 if let Err(e) = self.spawn_placed(original, Some(&mut *body)) {
-                    return Outcome::Denied(format!("undo failed: {e}"));
+                    return Err(Refused::Denied(format!("undo failed: {e}")));
                 }
                 "undo chop".into()
             }
@@ -490,10 +551,20 @@ impl World {
                 self.relocate_placed(id, before, Some(&mut *body));
                 "undo move".into()
             }
-        };
-        self.revert_graph(&done.graph, false);
-        self.history.redo.push(done);
-        Outcome::Done(self.summary(said))
+            WorldAction::Fell { before, .. } => {
+                let id = before.id;
+                self.restore_placed(before);
+                self.floating.remove(&id);
+                "undo fall".into()
+            }
+            WorldAction::Many(actions) => {
+                let mut said = String::new();
+                for a in actions.into_iter().rev() {
+                    said = self.undo_one(a, body)?;
+                }
+                said
+            }
+        })
     }
 
     fn redo(&mut self, actor: &mut Actor<'_>) -> Outcome {
@@ -501,16 +572,28 @@ impl World {
         let body = &mut *actor.body;
         self.finish_all_falls(Some(&mut *body));
         let Some(done) = self.history.redo.pop() else { return Outcome::Unchanged("nothing to redo".into()) };
-        let said = match done.action.clone() {
+        let said = match self.redo_one(done.action.clone(), &author, body) {
+            Ok(said) => said,
+            Err(Refused::Unchanged(why)) => return Outcome::Unchanged(why),
+            Err(Refused::Denied(why)) => return Outcome::Denied(why),
+        };
+        self.revert_graph(&done.graph, true);
+        self.history.undo.push(done);
+        Outcome::Done(self.summary(said))
+    }
+
+    /// Redoes one change (its graph is redone by `redo`): what to say, or why it could not be.
+    fn redo_one(&mut self, action: WorldAction, author: &str, body: &mut Body) -> std::result::Result<String, Refused> {
+        Ok(match action {
             WorldAction::SdfEdit { edit, promoted_ids } => {
                 let repromote: Vec<_> = promoted_ids.iter().map(|&(id, idx)| (id, Some(idx))).collect();
                 let bounds = self.set_elements_promoted(&repromote);
                 let mut next = (*self.edits).clone();
                 if let Err(e) = next.push(edit) {
-                    return Outcome::Denied(format!("redo failed: {e}"));
+                    return Err(Refused::Denied(format!("redo failed: {e}")));
                 }
                 self.edits = Arc::new(next);
-                self.edit_authors.push(Some(author));
+                self.edit_authors.push(Some(author.to_string()));
                 self.dirty = true;
                 let water = if edit.op == Op::Carve { self.rebuild_water() } else { None };
                 self.commit(Invalidation::Some { edits: vec![edit], bounds, water });
@@ -523,7 +606,7 @@ impl World {
             }
             WorldAction::ElementSdfEdit { id, edit, newly_promoted } => {
                 let Some(pos) = self.placed.iter().position(|e| e.id == id) else {
-                    return Outcome::Unchanged("nothing to redo".into());
+                    return Err(Refused::Unchanged("nothing to redo".into()));
                 };
                 let pl = self.placed[pos].clone();
                 let _ = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips);
@@ -539,7 +622,7 @@ impl World {
             }
             WorldAction::PlaceElement(pl) => {
                 if let Err(e) = self.spawn_placed(pl, Some(&mut *body)) {
-                    return Outcome::Denied(format!("redo failed: {e}"));
+                    return Err(Refused::Denied(format!("redo failed: {e}")));
                 }
                 format!("redo place ({} elements)", self.placed.len())
             }
@@ -550,7 +633,7 @@ impl World {
             WorldAction::CutElement { original, lower, upper } => {
                 self.remove_placed(original.id);
                 if let Err(e) = self.spawn_placed(lower, Some(&mut *body)).and_then(|_| self.spawn_placed(upper, Some(&mut *body))) {
-                    return Outcome::Denied(format!("redo failed: {e}"));
+                    return Err(Refused::Denied(format!("redo failed: {e}")));
                 }
                 "redo chop".into()
             }
@@ -558,9 +641,22 @@ impl World {
                 self.relocate_placed(id, after, Some(&mut *body));
                 "redo move".into()
             }
-        };
-        self.revert_graph(&done.graph, true);
-        self.history.undo.push(done);
-        Outcome::Done(self.summary(said))
+            WorldAction::Fell { after, .. } => {
+                let id = after.id;
+                self.restore_placed(after);
+                let _ = self.settle_buoyancy_for(id, 0.0);
+                "redo fall".into()
+            }
+            WorldAction::Many(actions) => {
+                let mut said = String::new();
+                for (i, a) in actions.into_iter().enumerate() {
+                    let s = self.redo_one(a, author, body)?;
+                    if i == 0 {
+                        said = s;
+                    }
+                }
+                said
+            }
+        })
     }
 }

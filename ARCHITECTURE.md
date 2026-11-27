@@ -37,15 +37,18 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
                             ├─ tool (physics::Tool)        ─▶ Denied           │  Invalidation ─▶ chunks
                             ├─ the change (edit, place, cut, carry, steer)     ├─ LayerChange ─▶ scene meshes
                             ├─ what follows (promotion, water, buoyancy)       └─ words ─▶ HUD
-                            ├─ the graph (derived_from, rests_on, owned_by, attached_to, fills, carved_into, flooded_by)
+                            ├─ support (live::falls): mended, come apart, fallen
+                            ├─ the graph (derived_from, rests_on, owned_by, attached_to, fills, carved_into, flooded_by, uprooted)
                             ├─ commit: a new ComposedLog snapshot
                             ├─ history (undo/redo, with the graph's delta)
                             └─ action log line (--log) ─▶ Outcome
 ```
 
 - Everything a save keeps changes only through `World::apply`; `play` asks and shows. What is only
-  seen (a topple under way, bobbing, a rider pressing a boat down) is `World::animate`d between
-  actions and moves nothing saved, so a log replays (`live::replay`) onto the save it began from.
+  seen (a fall under way, bobbing, a rider pressing a boat down) is shown between actions
+  (`World::tick_falling`, `World::animate`) and moves nothing saved, so a log replays
+  (`live::replay`) onto the save it began from. One action's changes (a cut, then what came apart
+  and fell) are undone and redone together (`WorldAction::Many`).
 - **The world graph** (`graph::Graph`, kept by `live::relations`): typed relations between
   elements, the terrain and players, in an ordered map. A cut makes two new pieces, each
   `derived_from` the original along its side of the cut and `owned_by` the original's owner (not
@@ -57,6 +60,20 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
   `flooded_by` the carves it came in through. Each action's `GraphDelta` is in its `Summary` and
   kept with its undo. The rule book asks the graph who owns what. Its laws (`laws::world_graph`)
   are kept by every test world.
+- **Support and falling** (`live::falls`, with the arithmetic in `support`): an action notes what
+  it shook (carved, cut, moved or took away from under something), and `settle_support` runs after
+  it, in rounds. Loose elements the world changed under rest on what they now touch. An element
+  carved or cut is made into cells in its own frame (about 48 along its longest side, from the SDF
+  the world has of it); a part no longer joined to what holds it up comes away along a plane
+  between them, as two new pieces `derived_from` it; where a carve left a cross-section that cannot
+  hold the mass above it (overhanging it by more than a quarter of its width), it breaks there.
+  Then every loose element that nothing reaching the ground holds up (`World::grounded`: two pieces
+  resting on each other alone are not), and every piece that may not stand, falls: straight down to
+  the first thing beneath, then over the edge its centre of mass overhangs, turning until it meets
+  something, against the terrain and every other element, then onto water. What rested on it is
+  asked next. At most `World::fall_limit` falls an action (`FALL_LIMIT`, 24); what is left falls
+  with the next action. A chop (`K`) is a cut and a push the way the player faces: no scripted
+  topple.
 - **A site's neighbourhood** (`World::neighbourhood`, `live::near`): what a measured site is in and
   who owns it, what that was cut from, carves and water there, what already fills it, and the
   elements near by, in words, saved in the `.site` file (`near` lines) and given to Claude in
@@ -96,11 +113,19 @@ key, ray, brush  ──Action──▶ apply ─▶ fall under way finished     
 | Fit | Whether an element meets its site (rim fit, ground fit), and where it goes to | `engine::fit` |
 | Law | A property every area must keep, searched for, never assumed (sizes agree, gates are real, …) | `engine::laws` |
 | World save | `plateau-world 2`: tiles, module hashes, rules, water, edits, elements, relations (`rel`) | `edit::WorldSave`, `modules` |
-| World graph, relation | What each element was cut from (`derived_from`), rests on (`rests_on`), is owned by (`owned_by`), is attached to (`attached_to`) and fills (`fills`); what each carve cut (`carved_into`) and let water into (`flooded_by`) | `engine::graph` |
+| World graph, relation | What each element was cut from (`derived_from`), rests on (`rests_on`), is owned by (`owned_by`), is attached to (`attached_to`) and fills (`fills`); what each carve cut (`carved_into`) and let water into (`flooded_by`); which elements lost their roots (`uprooted`) | `engine::graph` |
 | Host | What an opening is in: the terrain or an element, solid just behind its wall | `World::host_at` |
 | Neighbourhood | A site's surroundings in the world, in words, for Claude | `live::near`, `SiteContext::near` |
 | Footing | How an element is held up: ground (an SDF landform), rooted, afloat, carried, or loose (resting on something) | `live::relations::Footing` |
-| Contact | An element's solid touching something from above, within 5 % of the smaller one's size: what `rests_on` is made of | `World::contacts_at` |
+| Contact | An element's solid touching something from above, within 5 % of the smaller one's size (a field only where the point, let down that far, is in it): what `rests_on` is made of. A carved element touches with its cells, not its meshes | `World::contacts_at` |
+| Uprooted | Rooted by its shape, but no cell of it touches the terrain any more (dug round, carved away): loose, and its pieces too | `graph::Kind::Uprooted` |
+| Grounded | Held up by what reaches the ground: ground, rooted, afloat, carried, or resting on or attached to the terrain or something grounded | `World::grounded` |
+| Support check | What runs after an action: rests mended, parts come away, cross-sections break, what is not grounded falls | `live::falls` |
+| Cells | An element's solid sampled on a grid in its own frame, to find its parts, its centre of mass and what it falls with | `support::Grid` |
+| Part, come apart | Cells joined face to face; a part not joined to what holds the element up is split off along a plane between them | `support::separating_plane` |
+| Section, grip | A level cross-section a carve reached; it holds the mass above it while that overhangs it by at most a quarter of its width (`SECTION_GRIP`) | `support::overhang` |
+| Fall, tip | Dropping straight down to what is beneath, and turning over the edge a centre of mass overhangs, against everything but itself | `live::falls` |
+| Fall limit | The most falls one action sets off; the rest fall with the next | `World::fall_limit` |
 | Piece, original | The two elements a cut makes, and the element they were cut from (gone, its id kept) | `live::objects`, `graph` |
 | Action, outcome | A change asked of the live world, and what came of it | `live::action` |
 | Action log | `plateau-log 1`: one JSON line an action | `live::log` |

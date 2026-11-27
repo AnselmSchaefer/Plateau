@@ -38,7 +38,7 @@ pub enum Footing {
 }
 
 /// A region with nothing in it, for asking one SDF element alone.
-struct Nothing;
+pub(super) struct Nothing;
 
 impl Region for Nothing {
     fn sample(&mut self, points: &[[f32; 3]], _size: f32, out: &mut Vec<Answer>) -> Result<()> {
@@ -54,7 +54,7 @@ impl Region for Nothing {
 
 /// Points of `scene`'s solid meshes (all its meshes if none is solid) at `tf`, in world space, at
 /// most `CONTACT_POINTS`, taken evenly.
-fn solid_points(scene: &Scene, tf: PlacementTransform) -> Vec<[f32; 3]> {
+pub(super) fn solid_points(scene: &Scene, tf: PlacementTransform) -> Vec<[f32; 3]> {
     let has_solid = scene.instances.iter().any(|i| i.solid);
     let mut pts = Vec::new();
     for inst in &scene.instances {
@@ -75,28 +75,46 @@ fn solid_points(scene: &Scene, tf: PlacementTransform) -> Vec<[f32; 3]> {
     pts
 }
 
-/// Whether distances `d` at the points, and `up` at the points raised by `tol`, show something
-/// beneath one of them within `tol` (touching, or pressed into, and below rather than beside).
-fn touches_from_above(d: &[f32], up: &[f32], tol: f32, depth: f32) -> bool {
-    d.iter().zip(up).any(|(&d, &u)| d <= tol && d >= -depth && u - d >= 0.5 * tol)
+/// Which points distances `d` at them, and `up` at them raised by `tol`, show something beneath
+/// within `tol` (touching, or pressed into, and below rather than beside).
+fn touching_from_above(d: &[f32], up: &[f32], tol: f32, depth: f32) -> Vec<bool> {
+    d.iter().zip(up).map(|(&d, &u)| d <= tol && d >= -depth && u - d >= 0.5 * tol).collect()
 }
 
-/// Distances from `pts` to the SDF element `entry` alone, at `size`.
-fn entry_distances(entry: &SdfElementEntry, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
-    let log = ComposedLog::new_with_water(Arc::new(EditLog::default()), vec![entry.clone()], Arc::new(WaterLog::new()), 0);
-    let mut out = Vec::new();
-    Composed::new(Nothing, log).sample(pts, size, &mut out).ok()?;
-    Some(out.iter().map(|a| a.distance).collect())
-}
 
 fn overlaps(lo: [f32; 3], hi: [f32; 3], blo: [f32; 3], bhi: [f32; 3]) -> bool {
     (0..3).all(|a| hi[a] >= blo[a] && lo[a] <= bhi[a])
 }
 
 impl World {
+    /// Distances from `pts` to the SDF element `entry` alone, at `size`, as the world has it: its own
+    /// field with the terrain's carves made since it entered the SDF (a stump the terrain was carved
+    /// through is carved). Kept while the edits and the element are as they were.
+    pub(super) fn entry_distances(&mut self, entry: &SdfElementEntry, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
+        let rev = self.edits.revision();
+        let log = match self.alone.get(&entry.placed.id) {
+            Some((r, pl, log)) if *r == rev && *pl == entry.placed => log.clone(),
+            _ => {
+                let from = entry.placed.sdf_after_edits().min(self.edits.len());
+                let carves: Vec<Edit> = self.edits.edits()[from..].iter().filter(|e| e.op == Op::Carve).copied().collect();
+                let mut first = entry.clone();
+                first.placed.after_edits = 0;
+                if first.placed.promoted.is_some() {
+                    first.placed.promoted = Some(0);
+                }
+                let log = Arc::new(ComposedLog::new_with_water(Arc::new(EditLog::from_edits(carves).ok()?), vec![first], Arc::new(WaterLog::new()), 0));
+                self.alone.insert(entry.placed.id, (rev, entry.placed.clone(), log.clone()));
+                log
+            }
+        };
+        let mut out = Vec::new();
+        Composed::new(Nothing, log).sample(pts, size, &mut out).ok()?;
+        Some(out.iter().map(|a| a.distance).collect())
+    }
+
     /// Distances from `pts` to the terrain alone (the areas with `edits`, no water, no elements), at
     /// `size`.
-    fn terrain_distances(&mut self, edits: Arc<EditLog>, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
+    pub(super) fn terrain_distances(&mut self, edits: Arc<EditLog>, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
         let log = ComposedLog::new_with_water(edits, Vec::new(), Arc::new(WaterLog::new()), 0);
         let mut out = Vec::new();
         Composed::new(&mut self.region.region, log).sample(pts, size, &mut out).ok()?;
@@ -104,7 +122,7 @@ impl World {
     }
 
     /// The SDF elements (landforms and promoted ones) whose bounds come within `lo..hi`, but `except`.
-    fn sdf_entries_near(&self, lo: [f32; 3], hi: [f32; 3], except: Option<u32>) -> Vec<SdfElementEntry> {
+    pub(super) fn sdf_entries_near(&self, lo: [f32; 3], hi: [f32; 3], except: Option<u32>) -> Vec<SdfElementEntry> {
         self.region.log.sdf_elements.iter().filter(|e| Some(e.placed.id) != except && overlaps(e.world_lo, e.world_hi, lo, hi)).cloned().collect()
     }
 
@@ -149,7 +167,8 @@ impl World {
             return Some(Footing::Ground);
         }
         let Some(phys) = self.physics_of(id) else { return Some(Footing::Ground) };
-        Some(if phys.rooted {
+        // Rooted by its shape, unless its roots were found to hold in nothing (`uprooted`).
+        Some(if phys.rooted && !self.graph.contains(&Relation::uprooted(id)) {
             Footing::Rooted
         } else if self.floating.contains_key(&id) {
             Footing::Floating
@@ -163,15 +182,26 @@ impl World {
     /// Asked of the terrain without water (a floating thing rests on nothing) and of each other
     /// element alone, at the element's own size; in order.
     pub fn contacts_at(&mut self, id: u32, tf: PlacementTransform) -> Vec<Node> {
+        if let Some((pts, radii)) = self.carved_body(id, tf) {
+            return self.touching(id, &pts, Some(&radii), CONTACT_TOLERANCE, 1e-4).0;
+        }
         let Some(scene) = self.runtime.local_scene_of(id).cloned() else { return Vec::new() };
-        let Some(phys) = self.physics_of(id) else { return Vec::new() };
         let pts = solid_points(&scene, tf);
+        self.touching(id, &pts, None, CONTACT_TOLERANCE, 1e-4).0
+    }
+
+    /// What the points `pts` of the element `id` (each a ball of its `radii`, if given) touch from
+    /// above, within `share` of the smaller one's size (and at least `least`), and which of them
+    /// touch anything.
+    pub(super) fn touching(&mut self, id: u32, pts: &[[f32; 3]], radii: Option<&[f32]>, share: f32, least: f32) -> (Vec<Node>, Vec<bool>) {
+        let mut touched = vec![false; pts.len()];
+        let Some(phys) = self.physics_of(id) else { return (Vec::new(), touched) };
         if pts.is_empty() {
-            return Vec::new();
+            return (Vec::new(), touched);
         }
         let span = phys.world_span.max(1e-4);
         let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-        for p in &pts {
+        for p in pts {
             for a in 0..3 {
                 lo[a] = lo[a].min(p[a]);
                 hi[a] = hi[a].max(p[a]);
@@ -180,20 +210,40 @@ impl World {
         let depth = (hi[1] - lo[1]).max(1e-4);
         let size = span.clamp(SMALLEST, LARGEST);
         let raise = |tol: f32| pts.iter().map(|p| [p[0], p[1] + tol, p[2]]).collect::<Vec<_>>();
+        // A field (signed) is touched from above where a point within reach of it is in it once let
+        // down by that reach (its ball and the tolerance): beside a wall it is not, and a carved
+        // field, which says less than the distance near the carve's lip, is not taken at its word.
+        let lower = |tol: f32| pts.iter().enumerate().map(|(i, p)| [p[0], p[1] - tol - radii.map_or(0.0, |r| r[i]), p[2]]).collect::<Vec<_>>();
+        let on_field = |d: Vec<f32>, low: Vec<f32>, tol: f32| -> Vec<bool> { d.into_iter().zip(low).map(|(d, l)| d <= tol && d >= -depth && l <= 0.0).collect() };
         let mut found = BTreeSet::new();
+        let less = |d: Vec<f32>| match radii {
+            Some(r) => d.into_iter().zip(r).map(|(d, r)| d - r).collect(),
+            None => d,
+        };
+        let mut note = |node: Node, mask: Vec<bool>, touched: &mut Vec<bool>| {
+            if mask.iter().any(|&m| m) {
+                found.insert(node);
+                for (t, m) in touched.iter_mut().zip(mask) {
+                    *t |= m;
+                }
+            }
+        };
 
         // The terrain: the areas and the sculpting, without water or placed elements.
-        let tol = (CONTACT_TOLERANCE * span).max(1e-4);
+        let tol = (share * span).max(least);
         let edits = self.edits.clone();
-        if let (Some(d), Some(u)) = (self.terrain_distances(edits.clone(), &pts, size), self.terrain_distances(edits, &raise(tol), size))
-            && touches_from_above(&d, &u, tol, depth)
-        {
-            found.insert(Node::Terrain);
+        if let Some(d) = self.terrain_distances(edits.clone(), pts, size) {
+            let d = less(d);
+            if d.iter().any(|&d| d <= tol)
+                && let Some(low) = self.terrain_distances(edits, &lower(tol), size)
+            {
+                note(Node::Terrain, on_field(d, low, tol), &mut touched);
+            }
         }
 
         // Every other element near enough: scene elements by their solid meshes, SDF ones (native
         // or promoted) by their own field.
-        let reach = tol;
+        let reach = (CONTACT_TOLERANCE * span).max(1e-4).max(tol);
         let (qlo, qhi) = ([lo[0] - reach, lo[1] - reach, lo[2] - reach], [hi[0] + reach, hi[1] + reach, hi[2] + reach]);
         let carried = self.held.map(|h| h.id);
         for other in self.scene.solid_placed_overlapping(qlo, qhi) {
@@ -201,25 +251,29 @@ impl World {
                 continue;
             }
             let other_span = self.physics_of(other).map_or(span, |p| p.world_span);
-            let tol = (CONTACT_TOLERANCE * span.min(other_span)).max(1e-4);
+            let tol = (share * span.min(other_span)).max(least);
             let far = 4.0 * tol + depth;
             let dist = |p: [f32; 3]| self.scene.distance_to_solids_of(other, p, far).unwrap_or(far);
             let d: Vec<f32> = pts.iter().map(|&p| dist(p)).collect();
             let u: Vec<f32> = raise(tol).into_iter().map(dist).collect();
-            if touches_from_above(&d, &u, tol, depth) {
-                found.insert(Node::Element(other));
-            }
+            note(Node::Element(other), touching_from_above(&less(d), &less(u), tol, depth), &mut touched);
         }
         for entry in self.sdf_entries_near(qlo, qhi, Some(id)) {
+            if Some(entry.placed.id) == carried {
+                continue;
+            }
             let ext = (0..3).map(|a| entry.world_hi[a] - entry.world_lo[a]).fold(0.0f32, f32::max);
-            let tol = (CONTACT_TOLERANCE * span.min(ext)).max(1e-4);
-            if let (Some(d), Some(u)) = (entry_distances(&entry, &pts, size), entry_distances(&entry, &raise(tol), size))
-                && touches_from_above(&d, &u, tol, depth)
-            {
-                found.insert(Node::Element(entry.placed.id));
+            let tol = (share * span.min(ext)).max(least);
+            if let Some(d) = self.entry_distances(&entry, pts, size) {
+                let d = less(d);
+                if d.iter().any(|&d| d <= tol)
+                    && let Some(low) = self.entry_distances(&entry, &lower(tol), size)
+                {
+                    note(Node::Element(entry.placed.id), on_field(d, low, tol), &mut touched);
+                }
             }
         }
-        found.into_iter().collect()
+        (found.into_iter().collect(), touched)
     }
 
     /// Writes what the element `id` rests on where it now is: its real contacts if it is loose,
@@ -275,7 +329,7 @@ impl World {
             consider(d[0], Node::Terrain);
         }
         for entry in self.sdf_entries_near(p, p, None) {
-            if let Some(d) = entry_distances(&entry, &[p], size) {
+            if let Some(d) = self.entry_distances(&entry, &[p], size) {
                 consider(d[0], Node::Element(entry.placed.id));
             }
         }
@@ -311,7 +365,7 @@ impl World {
         }
         let (lo, hi) = edit.influence_bounds();
         for entry in self.sdf_entries_near(lo, hi, None) {
-            if entry_distances(&entry, &[edit.center], size).is_some_and(|d| d[0] < reach) {
+            if self.entry_distances(&entry, &[edit.center], size).is_some_and(|d| d[0] < reach) {
                 found.insert(Node::Element(entry.placed.id));
             }
         }

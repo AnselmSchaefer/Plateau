@@ -179,7 +179,7 @@ fn a_log_replayed_onto_the_save_it_began_from_gives_the_same_world() {
     let mut elsewhere = open(garden_save());
     let mut wrong = log.clone();
     wrong.remove(0);
-    let e = replay(&mut elsewhere, &wrong).err().expect("a sculpt on a tree that is not there");
+    let e = replay(&mut elsewhere, &wrong).expect_err("a sculpt on a tree that is not there");
     assert!(format!("{e:#}").contains("replaying action"), "{e:#}");
 }
 
