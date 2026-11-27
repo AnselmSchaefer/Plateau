@@ -932,3 +932,52 @@ fn clipped_element_meshes_stay_watertight_across_single_and_chained_cuts() {
         assert_eq!(count_boundary(&b), (0, 0), "bridge -half must stay watertight");
     }
 }
+
+/// Played by hand (2026-11-27): chopping an oak left the fallen trunk resting on top of the stump;
+/// digging a pit through the stump's lower trunk split the upper stump loose, yet `meets()` used
+/// unsigned mesh proximity without checking motion direction, so the trunk resting *above* the
+/// severed stump froze it floating in mid-air with no support. Stepping along the fall direction
+/// lets the severed stump drop into the pit and the trunk follow it.
+#[test]
+fn a_severed_stump_under_a_fallen_trunk_drops_into_the_pit_instead_of_floating() {
+    let mut world = open(garden_save());
+    let mut body = person(&mut world);
+    let site = [31.919285, 0.018911324, 45.120136];
+    let tree = place(&mut world, &mut body, TREE, site, 0.0);
+    let s = done(act(&mut world, &mut body, Action::Cut {
+        id: tree,
+        hit: [31.896683, 1.7236083, 45.340374],
+        dir: [0.406281, -0.30029318, -0.86299455],
+        tool: Tool::All,
+        material: Some(Material::Wood),
+    }));
+    let (stump, trunk) = (s.added[0], s.added[1]);
+    assert!(world.graph.supports_of(trunk).contains(&Node::Element(stump)), "trunk rests on stump");
+    laws_hold(&mut world);
+
+    // Dig a pit through the stump's lower trunk — splits off the upper stump right under `trunk`.
+    let pit1 = Edit::carve(Shape::Sphere { radius: 1.2750001 }, [31.55847, -0.06082036, 45.93107], 0.44625002, None, PERSON);
+    let s1 = done(act(&mut world, &mut body, Action::Sculpt {
+        edit: pit1,
+        hit: [31.55847, -0.06082036, 45.93107],
+        tool: Tool::All,
+        target: SculptTarget::Terrain { aimed: None },
+    }));
+    assert!(!s1.fell.is_empty(), "severed upper stump and trunk must fall");
+    laws_hold(&mut world);
+
+    // Dig out the remaining root beneath — everything loose must rest on solid support, nothing floating.
+    let pit2 = Edit::carve(Shape::Sphere { radius: 1.2750001 }, [31.753262, -0.6693301, 44.828728], 0.44625002, None, PERSON);
+    let _s2 = done(act(&mut world, &mut body, Action::Sculpt {
+        edit: pit2,
+        hit: [31.753262, -0.6693301, 44.828728],
+        tool: Tool::All,
+        target: SculptTarget::Terrain { aimed: None },
+    }));
+    for pl in &world.placed {
+        if world.footing(pl.id) == Some(plateau_engine::live::Footing::Loose) {
+            assert!(!world.graph.supports_of(pl.id).is_empty(), "loose #{} must not float unsupported", pl.id);
+        }
+    }
+    laws_hold(&mut world);
+}

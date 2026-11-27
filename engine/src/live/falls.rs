@@ -456,20 +456,82 @@ impl World {
         (field, meshes)
     }
 
+    /// Whether each point `pts[i]` moving along unit direction `ways[i]` is entering (not exiting
+    /// or grazing away from) any other solid scene element (`!= id`, not carried), using its cached
+    /// exact `MeshSdf` signed distance and Signorini's directional condition (`d(p + eps*way) < d(p)`).
+    fn entering_other_mesh(&mut self, id: u32, pts: &[[f32; 3]], ways: &[[f32; 3]], eps: f32) -> Vec<bool> {
+        let mut hit = vec![false; pts.len()];
+        if pts.is_empty() {
+            return hit;
+        }
+        let (lo, hi) = bounds(pts);
+        let pad = eps.max(1e-3);
+        let qlo = lo.map(|v| v - pad);
+        let qhi = hi.map(|v| v + pad);
+        let carried = self.held.map(|h| h.id);
+        for other in self.scene.solid_placed_overlapping(qlo, qhi) {
+            if other == id || Some(other) == carried {
+                continue;
+            }
+            let Some(pl) = self.find(other).cloned() else { continue };
+            let Ok(Some(msdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) else {
+                for (i, &p) in pts.iter().enumerate() {
+                    if !hit[i] && self.scene.distance_to_solids_of(other, p, 1e-3).is_some() {
+                        hit[i] = true;
+                    }
+                }
+                continue;
+            };
+            let tf = pl.transform();
+            let eps_local = pad / tf.scale.max(1e-4);
+            for (i, (&p, &w)) in pts.iter().zip(ways).enumerate() {
+                if hit[i] {
+                    continue;
+                }
+                let lp = tf.world_to_local_point(p);
+                let Some(a0) = msdf.sample(lp, 1e-3) else { continue };
+                if a0.distance > 0.0 {
+                    continue;
+                }
+                let lw = tf.world_to_local_dir(w);
+                let lp1 = [lp[0] + lw[0] * eps_local, lp[1] + lw[1] * eps_local, lp[2] + lw[2] * eps_local];
+                let d1 = msdf.sample(lp1, f32::INFINITY).map_or(f32::INFINITY, |a| a.distance);
+                // Only block when moving along `way` goes deeper into `other` (not exiting a piece
+                // resting on top of `id`, nor sliding along a vertical wall).
+                if d1 < a0.distance - 0.1 * eps_local {
+                    hit[i] = true;
+                }
+            }
+        }
+        hit
+    }
+
     /// Of the points `pts` (balls of `radii`) whose distances say they are within `stop` of
-    /// something, those that are: a mesh within `stop`, or a field entered when moved on by `stop`
-    /// along `ways` (each its own way of going).
+    /// something, those that actually enter a solid (scene mesh or field) when moved on by `stop`
+    /// along `ways` (each its own way of going). Checking that signed distance decreases along
+    /// `ways` keeps a piece resting on top of `id` from blocking `id` from dropping away beneath it.
     #[allow(clippy::too_many_arguments)]
     fn meets(&mut self, id: u32, pts: &[[f32; 3]], radii: &[f32], ways: &[[f32; 3]], field: &[f32], meshes: &[f32], stop: f32, size: f32) -> Vec<bool> {
-        let mut met: Vec<bool> = meshes.iter().zip(radii).map(|(d, r)| d - r <= stop).collect();
-        let ask: Vec<usize> = (0..pts.len()).filter(|&i| !met[i] && field[i] - radii[i] <= stop).collect();
-        if ask.is_empty() {
-            return met;
+        let mut met = vec![false; pts.len()];
+        let ask_mesh: Vec<usize> = (0..pts.len()).filter(|&i| meshes[i] - radii[i] <= stop).collect();
+        if !ask_mesh.is_empty() {
+            let eps = (0.25 * stop).max(1e-3);
+            let mways: Vec<[f32; 3]> = ask_mesh.iter().map(|&i| ways[i]).collect();
+            let on: Vec<[f32; 3]> = ask_mesh.iter().map(|&i| [0, 1, 2].map(|a| pts[i][a] + ways[i][a] * (radii[i] + stop))).collect();
+            let mid: Vec<[f32; 3]> = ask_mesh.iter().map(|&i| [0, 1, 2].map(|a| pts[i][a] + ways[i][a] * (radii[i] + 0.25 * stop))).collect();
+            let hit_on = self.entering_other_mesh(id, &on, &mways, eps);
+            let hit_mid = self.entering_other_mesh(id, &mid, &mways, eps);
+            for (k, &i) in ask_mesh.iter().enumerate() {
+                met[i] = hit_on[k] || hit_mid[k];
+            }
         }
-        let on: Vec<[f32; 3]> = ask.iter().map(|&i| [0, 1, 2].map(|a| pts[i][a] + ways[i][a] * (radii[i] + stop))).collect();
-        let (further, _) = self.obstacle_distances(id, &on, size, 4.0 * stop);
-        for (&i, d) in ask.iter().zip(further) {
-            met[i] = d <= 0.0;
+        let ask_field: Vec<usize> = (0..pts.len()).filter(|&i| !met[i] && field[i] - radii[i] <= stop).collect();
+        if !ask_field.is_empty() {
+            let on: Vec<[f32; 3]> = ask_field.iter().map(|&i| [0, 1, 2].map(|a| pts[i][a] + ways[i][a] * (radii[i] + stop))).collect();
+            let (further, _) = self.obstacle_distances(id, &on, size, 4.0 * stop);
+            for (&i, d) in ask_field.iter().zip(further) {
+                met[i] = d <= 0.0;
+            }
         }
         met
     }
@@ -777,6 +839,111 @@ impl World {
         self.commit(Invalidation::Some { edits: Vec::new(), bounds: old.into_iter().chain(new).collect(), water: None });
     }
 
+    /// Signed distance from each point in `pts` to the nearest obstacle other than `id` (and not
+    /// carried), combining terrain/SDF fields with cached exact `MeshSdf`s for scene elements.
+    fn signed_obstacle_distances(&mut self, id: u32, pts: &[[f32; 3]], size: f32, far: f32) -> Vec<f32> {
+        let (mut best, _) = self.obstacle_distances(id, pts, size, far);
+        if pts.is_empty() {
+            return best;
+        }
+        let (lo, hi) = bounds(pts);
+        let qlo = lo.map(|v| v - far);
+        let qhi = hi.map(|v| v + far);
+        let carried = self.held.map(|h| h.id);
+        for other in self.scene.solid_placed_overlapping(qlo, qhi) {
+            if other == id || Some(other) == carried {
+                continue;
+            }
+            let Some(pl) = self.find(other).cloned() else { continue };
+            let Ok(Some(msdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) else { continue };
+            let tf = pl.transform();
+            let inv_scale = 1.0 / tf.scale.max(1e-4);
+            for (i, &p) in pts.iter().enumerate() {
+                let lp = tf.world_to_local_point(p);
+                let limit = if best[i] > 0.0 { best[i] * inv_scale } else { f32::INFINITY };
+                if let Some(a) = msdf.sample(lp, limit) {
+                    best[i] = best[i].min(a.distance * tf.scale);
+                }
+            }
+        }
+        best
+    }
+
+    /// When a loose body has nothing it can stand on (`stand.is_empty()`) yet cannot drop straight
+    /// down (`drop_distance == 0`) because a point is snagged on a steep slanted face (e.g. a
+    /// fallen trunk's cut lip overhanging a severed stump's rim), slides the body the minimum
+    /// distance down and away along the slope's tangent until it clears the snag without entering
+    /// any obstacle. Returns the world-space displacement, or `None` if it cannot move safely.
+    fn slide_off_snag(&mut self, id: u32, pts: &[[f32; 3]], radii: &[f32], span: f32, size: f32) -> Option<[f32; 3]> {
+        let stop = (STOP * span).max(1e-4);
+        let far = 4.0 * span + 8.0;
+        let down = vec![[0.0, -1.0, 0.0]; pts.len()];
+        let (field, meshes) = self.obstacle_distances(id, pts, size, far);
+        let met = self.meets(id, pts, radii, &down, &field, &meshes, stop, size);
+        let snags: Vec<[f32; 3]> = met
+            .iter()
+            .enumerate()
+            .filter(|&(_, &m)| m)
+            .map(|(i, _)| [pts[i][0], pts[i][1] - radii[i] - 0.5 * stop, pts[i][2]])
+            .collect();
+        if snags.is_empty() {
+            return None;
+        }
+        let eps = (0.5 * stop).max(2e-3);
+        let mut probes = Vec::with_capacity(snags.len() * 6);
+        for p in &snags {
+            probes.push([p[0] + eps, p[1], p[2]]);
+            probes.push([p[0] - eps, p[1], p[2]]);
+            probes.push([p[0], p[1] + eps, p[2]]);
+            probes.push([p[0], p[1] - eps, p[2]]);
+            probes.push([p[0], p[1], p[2] + eps]);
+            probes.push([p[0], p[1], p[2] - eps]);
+        }
+        let d = self.signed_obstacle_distances(id, &probes, size, 4.0 * eps + stop);
+        let mut n = [0.0f32; 3];
+        for k in 0..snags.len() {
+            let b = k * 6;
+            n[0] += d[b] - d[b + 1];
+            n[1] += d[b + 2] - d[b + 3];
+            n[2] += d[b + 4] - d[b + 5];
+        }
+        let nl = len(n);
+        if nl <= 1e-6 {
+            return None;
+        }
+        let n = n.map(|c| c / nl);
+        // Only slide off a steep side/slanted face, not a flat horizontal floor.
+        if n[0] * n[0] + n[2] * n[2] <= 1e-4 {
+            return None;
+        }
+        // Downward tangent to `n` plus a small outward clearance so it separates cleanly from the snag.
+        let raw = [n[1] * n[0] + 0.2 * n[0], n[1] * n[1] - 1.0 + 0.2 * n[1], n[1] * n[2] + 0.2 * n[2]];
+        let rl = len(raw);
+        if rl <= 1e-6 {
+            return None;
+        }
+        let dir = raw.map(|c| c / rl);
+        let step = (2.0 * stop).max(5e-3);
+        let max_dist = (0.35 * span).max(4.0 * step);
+        let steps = ((max_dist / step).ceil() as usize).clamp(1, 32);
+        let ways_dir = vec![dir; pts.len()];
+        let mut moved = 0.0f32;
+        for _ in 0..steps {
+            let cur: Vec<[f32; 3]> = pts.iter().map(|p| [0, 1, 2].map(|a| p[a] + dir[a] * moved)).collect();
+            let (cf, cm) = self.obstacle_distances(id, &cur, size, far);
+            if self.meets(id, &cur, radii, &ways_dir, &cf, &cm, stop, size).iter().any(|&m| m) {
+                break;
+            }
+            moved += step;
+            let next: Vec<[f32; 3]> = pts.iter().map(|p| [0, 1, 2].map(|a| p[a] + dir[a] * moved)).collect();
+            let (nf, nm) = self.obstacle_distances(id, &next, size, far);
+            if !self.meets(id, &next, radii, &down, &nf, &nm, stop, size).iter().any(|&m| m) {
+                break;
+            }
+        }
+        (moved > 1e-5).then(|| dir.map(|c| c * moved))
+    }
+
     /// How far the points `pts` of the element `id` can drop straight down before one meets
     /// something from above; nought if nothing is beneath them.
     fn drop_distance(&mut self, id: u32, pts: &[[f32; 3]], radii: &[f32], span: f32, size: f32) -> f32 {
@@ -926,6 +1093,10 @@ impl World {
             if stand.is_empty() {
                 let dy = self.drop_distance(id, &pts, &radii, span, size);
                 if dy <= 1e-5 {
+                    if let Some(delta) = self.slide_off_snag(id, &pts, &radii, span, size) {
+                        tf.pos = [tf.pos[0] + delta[0], tf.pos[1] + delta[1], tf.pos[2] + delta[2]];
+                        continue;
+                    }
                     break;
                 }
                 tf.pos[1] -= dy;
