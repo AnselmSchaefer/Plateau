@@ -481,7 +481,50 @@ fn probe_carve_volume(tool: Tool, edit: &Edit, target: &mut BrushTarget<'_>) -> 
             yield_kg[m as usize] += per_cell_vol * material_props(m).density_kg_m3;
         }
     }
+    if blocked.is_none() && tool != Tool::All {
+        blocked = match target {
+            BrushTarget::World { unpromoted, .. } => unpromoted.iter().find_map(|(tf, msdf)| {
+                thin_blocked(tool, edit, |p| msdf.sample(tf.world_to_local_point(p), f32::INFINITY).map(|a| Answer { distance: a.distance * tf.scale, ..a }))
+            }),
+            // Sculpting one element: its solid as carved so far (its edits keep it a distance bound).
+            BrushTarget::Element { sdf, edits, .. } => thin_blocked(tool, edit, |p| {
+                sdf.sample(p, f32::INFINITY).map(|a| edits.iter().fold(a, |a, e| e.apply(p, a)))
+            }),
+        };
+    }
     Ok((blocked, solid_count, yield_kg))
+}
+
+/// The cells a side of the grid `thin_blocked` asks over a brush's bounds.
+const THIN_GRID: usize = 9;
+
+/// The first material `tool` may not carve of a solid that `edit` (with its blend) reaches, however
+/// thin: a plank or a rail slips between `brush_cells`' points (a terrain carve would then promote
+/// the element and cut it; a stroke on a bridge's stone footing would slice the planks beside it).
+/// `solid` answers, in `edit`'s frame, a distance that grows no faster than the point moves (exact
+/// for an unpromoted element; bounded so once carved), and the brush's is a distance too, so where
+/// both are within half a cell's diagonal of a grid point they may meet: a solid within the brush is
+/// never missed, one beside it is counted at most that far off.
+fn thin_blocked(tool: Tool, edit: &Edit, mut solid: impl FnMut([f32; 3]) -> Option<Answer>) -> Option<Material> {
+    let half = edit.shape.half_extents().map(|h| h + edit.blend);
+    let cell = half.map(|h| 2.0 * h / THIN_GRID as f32);
+    let slack = 0.5 * (cell[0] * cell[0] + cell[1] * cell[1] + cell[2] * cell[2]).sqrt();
+    for iz in 0..THIN_GRID {
+        for iy in 0..THIN_GRID {
+            for ix in 0..THIN_GRID {
+                let u = [ix, iy, iz].map(|i| -1.0 + (2.0 * i as f32 + 1.0) / THIN_GRID as f32);
+                let p = [0, 1, 2].map(|a| edit.center[a] + u[a] * half[a]);
+                if edit.distance(p) - edit.blend > slack {
+                    continue;
+                }
+                let Some(ans) = solid(p) else { continue };
+                if ans.distance <= slack && ans.material != Material::Water && tool.can_carve(ans.material).is_err() {
+                    return Some(ans.material);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// What a carve of `edit` yields from `target` (kg per material), without any tool check.

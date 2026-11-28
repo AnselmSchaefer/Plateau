@@ -29,9 +29,11 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// The garden, with the material economy on: these tests are of it.
 fn garden_save(mode: WorldMode) -> WorldSave {
     let mut save = WorldSave::new("The walled garden", 7, Vec::new());
     save.mode = mode;
+    save.rules.economy = true;
     save.tiles = vec![SavedTile { at: [0, 0], module: "areas/modules/garden.wasm".into(), seed: 7 }];
     save
 }
@@ -204,6 +206,44 @@ fn shovel_aimed_at_moss_over_stone_core_is_refused_or_shrunk_naming_stone() {
         }
         other => panic!("unexpected result on mossy hill: {other:?}"),
     }
+}
+
+/// Played by hand (2026-11-28): a person's shovel dug the bank under a timber bridge, and its deck,
+/// thinner than the whole-brush grid's spacing, slipped between the grid's points; the stroke
+/// promoted the bridge and cut it. The bridge and the stroke are the ones that were played.
+#[test]
+fn a_shovel_never_cuts_a_thin_wooden_deck_it_reaches() {
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    let bridge = match act(&mut world, &mut body, Action::Place {
+        module: "elements/modules/bridge.wasm".into(),
+        pos: [27.657639, -0.29470804, 38.493504],
+        yaw: 0.0,
+        rot: None,
+        scale: 1.0,
+        fitted: false,
+        opening: None,
+        seed: None,
+        params: Vec::new(),
+    }) {
+        Outcome::Done(s) => s.added[0],
+        other => panic!("the bridge is placed: {other:?}"),
+    };
+    let dig = Edit::carve(Shape::Sphere { radius: 0.55863076 }, [27.974802, -0.15934998, 40.907825], 0.19552076, None, PERSON);
+    let res = act(&mut world, &mut body, Action::Sculpt { edit: dig, hit: dig.center, tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } });
+    if let Outcome::Denied(why) = &res {
+        assert!(why.contains("wood"), "a refusal names the wood: {why}");
+    }
+    assert!(!world.find(bridge).unwrap().is_promoted(), "the shovel did not turn the bridge into carvable solid: {res:?}");
+    assert!(
+        world.graph.relations().all(|r| r.to != plateau_engine::graph::Node::Element(bridge)
+            || r.kind != plateau_engine::graph::Kind::CarvedInto),
+        "nothing carved into the bridge"
+    );
+
+    // A saw at the same place may cut it.
+    let saw = act(&mut world, &mut body, Action::Sculpt { edit: Edit { tool: Tool::Saw, ..dig }, hit: dig.center, tool: Tool::Saw, target: SculptTarget::Terrain { aimed: None } });
+    assert!(!matches!(&saw, Outcome::Denied(why) if why.contains("wood")), "a saw is not stopped by wood: {saw:?}");
 }
 
 #[test]
@@ -721,4 +761,44 @@ fn an_uprooted_tree_once_grabbed_stays_held() {
     let grabbed = act(&mut world, &mut body, Action::Grab { id: tree });
     assert!(grabbed.is_done(), "{grabbed:?}");
     assert!(world.can_still_hold("local", size), "what grabbing allowed, holding allows");
+}
+
+/// Unless a world switches the economy on (`economy on`), material is not counted, even in `world`
+/// mode: digging removes it, building makes it out of nothing, nothing weighs in a pack; the tools'
+/// rules still hold (played by hand, 2026-11-28: a person dug 47 t and could barely walk).
+#[test]
+fn without_the_economy_material_is_not_counted_but_tools_still_are() {
+    let mut save = garden_save(WorldMode::World);
+    save.rules.economy = false;
+    let mut world = open(save.clone());
+    let mut body = person(&mut world);
+    assert!(!world.counts_material());
+
+    for k in 0..6 {
+        let dig = Edit::carve(Shape::Sphere { radius: 0.5 }, [LAWN[0] + k as f32 * 0.6, 0.0, LAWN[2]], 0.1, None, PERSON);
+        let res = act(&mut world, &mut body, Action::Sculpt { edit: dig, hit: dig.center, tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } });
+        match res {
+            Outcome::Done(s) => assert!(s.inventory.is_empty(), "nothing is carried away: {:?}", s.inventory),
+            Outcome::Denied(why) => assert!(why.contains("stone"), "only the tools refuse: {why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(world.inventory_mass_kg("local"), 0.0);
+    assert_eq!(world.carry_speed_factor("local", PERSON), 1.0);
+
+    // Built with nothing carried.
+    let mound = Edit::add(Shape::Sphere { radius: 0.6 }, [LAWN[0] - 4.0, 0.0, LAWN[2]], 0.1, Material::Soil, PERSON);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: mound, hit: mound.center, tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } }).is_done());
+
+    // The tools' rules still hold: a saw raises no stone, a shovel digs no stone.
+    let stone = Edit::add(Shape::Sphere { radius: 0.4 }, [LAWN[0] - 7.0, 0.0, LAWN[2]], 0.1, Material::Stone, PERSON);
+    assert!(matches!(act(&mut world, &mut body, Action::Sculpt { edit: stone, hit: stone.center, tool: Tool::Saw, target: SculptTarget::Terrain { aimed: None } }), Outcome::Denied(_)));
+
+    // The rule is saved, and a save without it has none.
+    assert!(!world.to_save().to_text().contains("economy"));
+    let mut on = save;
+    on.rules.economy = true;
+    let text = on.to_text();
+    assert!(text.contains("economy on\n"));
+    assert!(WorldSave::from_text(&text).unwrap().rules.economy);
 }

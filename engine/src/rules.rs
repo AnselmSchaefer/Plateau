@@ -340,6 +340,11 @@ impl std::fmt::Display for Denial {
 pub struct RuleBook {
     pub areas: Vec<AreaPolicy>,
     pub plots: Vec<Plot>,
+    /// Whether material is counted in `world` mode (`WORLD_PLAN.md`, phase H): what is dug is
+    /// carried (and weighs), and what is built is paid from it. Off unless a world switches it on
+    /// (saved as `economy on`): digging then removes material, building makes it, nothing is
+    /// counted, while the tools' rules still hold.
+    pub economy: bool,
 }
 
 impl RuleBook {
@@ -348,7 +353,7 @@ impl RuleBook {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.areas.is_empty() && self.plots.is_empty()
+        self.areas.is_empty() && self.plots.is_empty() && !self.economy
     }
 
     /// Inserts or replaces the `AreaPolicy` for `policy.tile`.
@@ -506,6 +511,9 @@ impl RuleBook {
 
     /// Serializes all `policy` and `plot` records for `WorldSave`.
     pub fn write_records(&self, out: &mut String) {
+        if self.economy {
+            out.push_str("economy on\n");
+        }
         for a in &self.areas {
             let owners = if a.owners.is_empty() { "-".into() } else { a.owners.join(",") };
             let builders = if a.builders.is_empty() { "-".into() } else { a.builders.join(",") };

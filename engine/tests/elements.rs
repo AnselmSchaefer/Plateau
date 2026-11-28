@@ -258,6 +258,46 @@ fn multiple_lantern_placements_isolate_state_transforms_and_scale_lights() {
     assert!(world.dynamic.contains_key(&(2, 1)));
 }
 
+/// Played by hand (2026-11-28): `F` at a door with the crosshair on something else beside it asked
+/// only that; the door beside the player was never asked. What the crosshair is on is asked first,
+/// and if it does nothing with it (a bridge has no `interact`), what is near.
+#[test]
+fn f_on_an_element_that_does_nothing_asks_what_is_near() {
+    let lantern = load_element("lantern");
+    let bridge = load_element("bridge");
+    let mut world = SceneWorld::default();
+    let mut runtime = ElementRuntime::new();
+    let at = |id: u32, module: &str, seed: u64, pos: [f32; 3]| PlacedElement {
+        id,
+        module: module.into(),
+        seed,
+        pos,
+        yaw: 0.0,
+        rot: None,
+        scale: 1.0,
+        stamp_size: SIZES[1].1,
+        after_edits: 0,
+        promoted: None,
+        clips: Vec::new(),
+        local_edits: Vec::new(),
+        author: None,
+        params: Vec::new(),
+    };
+    runtime.spawn(at(1, &bridge.module, 7, [40.0, 0.0, 40.0]), &bridge, &mut world).unwrap();
+    runtime.spawn(at(2, &lantern.module, 202, [41.0, 0.0, 40.0]), &lantern, &mut world).unwrap();
+    let ps = PlayerState { feet: [40.5, 0.0, 41.0], eye: [40.5, 1.5, 41.0], size: 1.7, ..PlayerState::default() };
+
+    // The crosshair on the bridge (which has nothing to do on `F`): the lantern beside is asked.
+    let effects = runtime.interact(&ps, 1, 1, &mut world);
+    assert_eq!(effects.iter().filter_map(|e| e.said.as_deref()).collect::<Vec<_>>(), vec!["Lantern extinguished."]);
+    assert!(!world.lights.contains_key(&(2, 1)));
+
+    // The crosshair on the lantern: it alone is asked.
+    let effects = runtime.interact(&ps, 2, 1, &mut world);
+    assert_eq!(effects.len(), 1);
+    assert!(world.lights.contains_key(&(2, 1)), "lit again");
+}
+
 #[test]
 fn world_save_round_trip_is_bit_exact_and_backward_compatible() {
     let hill = load_element("hill");

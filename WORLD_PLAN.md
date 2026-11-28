@@ -610,6 +610,47 @@ covers param ranges.
 - Play's placement ghost still shows the element as it is given no params.
 - No browser host is in this repo; when one exists it must give `params` as `wasm.rs` does.
 
+*Played by hand 2026-11-28 (phases D–I; the session's log replayed headless to find causes):*
+
+- **Fixed: far lawns showed soil, walls blotches of stone** (since H's strata). A chunk vertex took
+  the material of the solid corner nearest it, up to a voxel deep, under coats thinner than a
+  coarse voxel (grass 8 cm, moss 3 cm). `chunk::surface_materials` asks the material just beneath
+  the surface where the vertex lies; flat lawn now shows no soil at any level to 50 cm voxels
+  (23–59% before).
+- **Fixed: a shovel cut a timber bridge**: the whole-brush grid (5³, 22 cm apart for a person)
+  missed its deck, and the stroke promoted and cut it. `physics::thin_blocked` asks each unpromoted
+  element's exact distance on a 9³ grid with half a cell's slack. Test:
+  `a_shovel_never_cuts_a_thin_wooden_deck_it_reaches`, with the played bridge and stroke.
+- **Fixed: `F` at a fitted door worked only sometimes**: what `F` targets was cast from the body's
+  eyes, not the crosshair's ray from behind (`Player::pivot` now serves both); a scene object
+  behind the SDF layer (an oak's uncarved triangles) is not targeted; and if what is targeted does
+  nothing with `F`, what is near is asked (`ElementRuntime::interact`).
+- **Fixed: what was set down was never asked how it stands**, and what had roots by its shape stayed
+  rooted wherever it was carried (a half stump stood tilted on a root). `Drop` now uproots what it
+  carried and puts it in `pending.unsteady`; a trunk laid with a bough down now tips onto its end.
+  Test: `what_is_set_down_tilted_with_roots_is_uprooted_and_tips_over`.
+- **Fixed: the graphics card ran out of memory** after a carved bridge was cut a dozen times
+  (4.3 M triangles, 3.8 M of them elements). `carved::keep_outside` divided every original
+  triangle near a stroke down to a cell (1 mm on a small piece), so 216 plank triangles became
+  538 k, and cut pieces up to 1.2 M. It now divides only triangles the kept part's edge may cross
+  (a distance bound at the middle, and the reach's ball about the triangle). The played session
+  replays to 358 k in all (from 4.5 M). Test: `a_bridge_carved_many_times_stays_light` (500 k
+  before, 117 k now; the rest is the remade surface's 1.6 cm grid, for J).
+- **Fixed: a pickaxe on a bridge's stone footing sliced the planks beside it**: the same thin-solid
+  check now also asks the element being sculpted (its solid as carved so far).
+- **Explained, open**: a felled top rose 1.36 m when the bridge it rested on was removed: buoyancy
+  (it lay half under water, held only by resting on the bridge). It looked wrong because the
+  canopy is not solid: it weighs nothing and touches nothing, so crowns hang in the air and pass
+  through stumps. Whether the canopy counts for mass and resting (staying walk-through) is to decide.
+- **Decided: the economy is off unless a world switches it on** (`economy on` in the save's rule
+  book, `RuleBook::economy`, `World::counts_material`). Without it, `world` mode keeps the tools'
+  rules, but digging removes material and building makes it; nothing is carried or weighs. Test:
+  `without_the_economy_material_is_not_counted_but_tools_still_are`. What follows is why.
+- **The pack (with the economy on).** In `world` mode everything dug is carried (4.6 t after a while: speed at its
+  35% floor, every grab refused). A cap does not work: one person's stroke digs about as much as a
+  person carries (≈1 t; a tiny's 2.3 g against 1.4 g), so brush size, yield and capacity must be
+  balanced together, or the pack made weightless, or the excess left as a heap.
+
 ### J. Brick cache and performance (one to one and a half weeks)
 
 - **Measure first**: per frame, chunk build time split into WASM sampling, edits, elements and
@@ -627,6 +668,41 @@ covers param ranges.
 **Done when** the tiny holds ≥ 90 FPS on the GTX 1650 on `pond-sketched`; a person-size stroke
 re-meshes its chunks in under 20 ms; 200 promoted trees cost no more per sample than 20 did; every
 law and hash still holds.
+
+#### Bounded cost under heavy play (from the session played by hand 2026-11-28)
+
+Players will carve, cut and pile things up all the time. **The rule: what an action costs follows
+what it touches, never how much happened before it** (how many edits a thing has had, how many
+pieces lie near it, how fine the smallest stroke ever was). The played session (a bridge dug round
+with 378 strokes, then cut a dozen times) broke it in four places; measured by replaying its log
+under tracing spans (`carve*`, `fall`, `tip`, `obstacle_distances`, `entry_distances`, …):
+
+| Where | Grew with | Before | Done 2026-11-28 | After |
+|---|---|---|---|---|
+| Drawing a carved element | triangles near any edit, divided to a cell | 4.5 M triangles, GPU out of memory | divide only where the kept edge crosses (`keep_outside`) | 358 k |
+| A stroke beside a carved element | its edit count; the finest stroke ever made | 0.2–2.9 s (309 bricks) | bricks asked of the edits that reach them; grid bound to the maker's size (`CELLS_PER_STAMP`) | 0.1–0.3 s (18–37 bricks) |
+| A cut | the piece's whole carve history, made again | up to 3.2 s | grid no finer than a piece's length ÷ 24 | up to 1.2 s |
+| Settling after a cut | every nearby piece, at every tipping step | up to 1.8 s | pieces whose bounds are no nearer than what was met are not asked (exact: the session replays identically) | up to 1.0 s |
+
+Still to do, in order:
+
+1. **Drawing never holds up an action.** A carved element's mesh is made on a worker, as chunks are,
+   and swapped in when ready (the old one shown meanwhile). It is not part of the world's state, so
+   determinism is untouched; strokes and cuts then cost their physics alone.
+2. **A cut reuses its parent's bricks.** A piece is carved from its parent's source with its clip
+   planes as part of the field, so only bricks a plane crosses are made again: a cut costs its cut
+   face, not its history. Pieces keep only the edits that reach them.
+3. **Edits are compacted.** Past a number of edits, an element's (and a region's) edits are baked into
+   sparse bricks of distance and material (the bricks above), so a sample costs the same after
+   1,000 strokes as after 10. Saves keep the edits; bricks are a cache made again from them.
+4. **Settling has a budget.** Tipping advances by the clearance a broad phase finds (fewer, larger
+   steps), and obstacle queries go through a BVH over elements, so cost follows contacts, not pile
+   size; `FALL_LIMIT` stays as the hard stop.
+5. **Elements have levels of detail.** A carved element is drawn for the size class that sees it
+   (tiny, person, giant), chosen by distance like chunks, within a triangle budget per element.
+6. **Budgets are laws.** A heavy-play corpus (sessions like this one, kept as logs and replayed) holds
+   every action under a time budget and every element under a triangle budget, so growth is caught
+   by tests, not by playing.
 
 ### K. The inspector (one to one and a half weeks)
 

@@ -377,7 +377,7 @@ impl World {
                     Err(e) => return Outcome::Denied(format!("tool check failed: {e}")),
                 }
                 // What an element yields is what it is carved to now, not only what was recorded.
-                if self.mode == WorldMode::World
+                if self.counts_material()
                     && let Some((tf, sdf, _, carving)) = &brush
                 {
                     match carve_yield_kg(&stroke, &mut BrushTarget::Element { sdf, edits: carving, scale: tf.scale }) {
@@ -392,20 +392,23 @@ impl World {
                 if let Err(reason) = tool.can_add(mat) {
                     return Outcome::Denied(reason);
                 }
-                let need = match &brush {
-                    Some((tf, sdf, _, carving)) => estimate_add_mass_kg(&stroke, mat, &mut BrushTarget::Element { sdf, edits: carving, scale: tf.scale }),
-                    None => estimate_add_mass_kg(&stroke, mat, &mut recorded_target(&mut self.region, &brush, &unpromoted)),
-                };
-                let need_kg = match need {
-                    Ok(kg) => kg,
-                    Err(e) => return Outcome::Denied(format!("material check failed: {e}")),
-                };
-                if need_kg > 0.0 {
-                    let mut preview = self.inventory(actor.id);
-                    if let Err(reason) = preview.take(mat, need_kg) {
-                        return Outcome::Denied(reason);
+                // Without the economy, what is built is made out of nothing.
+                if self.rules.economy {
+                    let need = match &brush {
+                        Some((tf, sdf, _, carving)) => estimate_add_mass_kg(&stroke, mat, &mut BrushTarget::Element { sdf, edits: carving, scale: tf.scale }),
+                        None => estimate_add_mass_kg(&stroke, mat, &mut recorded_target(&mut self.region, &brush, &unpromoted)),
+                    };
+                    let need_kg = match need {
+                        Ok(kg) => kg,
+                        Err(e) => return Outcome::Denied(format!("material check failed: {e}")),
+                    };
+                    if need_kg > 0.0 {
+                        let mut preview = self.inventory(actor.id);
+                        if let Err(reason) = preview.take(mat, need_kg) {
+                            return Outcome::Denied(reason);
+                        }
+                        add_cost = Some((mat, need_kg));
                     }
-                    add_cost = Some((mat, need_kg));
                 }
             }
             // Workshop mode: any tool adds, for free.
@@ -421,7 +424,7 @@ impl World {
             (SculptTarget::Element(id), None) => self.unsculptable(id),
         };
         if let Outcome::Done(summary) = &mut outcome {
-            if self.mode == WorldMode::World {
+            if self.counts_material() {
                 for m in Material::ALL {
                     let kg = carve_yield[m as usize];
                     if edit.op == Op::Carve && kg > 0.0 {

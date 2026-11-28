@@ -131,7 +131,16 @@ impl World {
         self.release_held(PlacementTransform::with_rot(pos, rot, scale), true, Some(&mut *actor.body));
         self.shaken(held.id);
         self.unrelate_moved(held.id);
+        // Carried away, its roots hold in nothing: a half stump sawn down its length, set down
+        // tilted on a root, stood so (played by hand, 2026-11-28).
+        if self.physics_of(held.id).is_some_and(|p| p.rooted) && !self.graph.contains(&Relation::uprooted(held.id)) {
+            self.relate(Relation::uprooted(held.id));
+        }
         self.settle_relations(held.id);
+        // How it was set down is asked like anything whose support changed: it tips if its mass
+        // is not over what it touches.
+        self.pending.mend.insert(held.id);
+        self.pending.unsteady.insert(held.id);
         let name = self.element_name(held.id);
         Outcome::Done(self.said(format!("placed {name} down")))
     }

@@ -275,6 +275,20 @@ impl Player {
         let rotation = look(self.body.yaw, self.pitch);
         rotation * Vec3::NEG_Z
     }
+
+    /// Where the crosshair's ray starts: the eyes, or seen from behind the point above them the
+    /// camera turns about (the camera sits back along the look from it, so the ray through the
+    /// middle of the view passes through it). Everything aimed (tools, `F`, what an element is
+    /// told is targeted) is asked from here, so it is what the `+` is on.
+    fn pivot(&self) -> [f64; 3] {
+        let eye = self.eye.unwrap_or(self.body.eye());
+        if self.third {
+            let per = (self.body.size / DRAWN_AS) as f64;
+            [eye[0], eye[1] + self.lift as f64 * per, eye[2]]
+        } else {
+            eye
+        }
+    }
 }
 
 #[derive(Component)]
@@ -1087,15 +1101,9 @@ fn look_and_ask(
     ctx.live.holding_use = keys.pressed(KeyCode::KeyF) || (!tool_active && buttons.pressed(MouseButton::Right));
 
     // Helper closure for camera-pivot raycast collinear with the `+` crosshair.
-    let eye = player.eye.unwrap_or(player.body.eye());
     let dir = player.looking().to_array();
     let psize = player.body.size;
-    let pivot = if player.third {
-        let per = (psize / DRAWN_AS) as f64;
-        [eye[0], eye[1] + player.lift as f64 * per, eye[2]]
-    } else {
-        eye
-    };
+    let pivot = player.pivot();
     let asking = Asking { keys: &keys, buttons: &buttons, scroll: &scroll, time: &time, grabbed, ctrl, pivot, dir, psize, tool_active };
 
     measure_site(&mut ctx, &mut player, &asking);
@@ -1174,16 +1182,30 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
     let dt = time.delta_secs().min(0.1);
     live.elapsed += dt;
 
-    let eye64 = player.body.eye();
-    let eye32 = eye64.map(|c| c as f32);
+    let eye32 = player.body.eye().map(|c| c as f32);
     let look_dir = player.looking().to_array();
     let size = player.body.size;
-    let (hit_owner, hit_id) = world.scene.raycast_dynamic_owned(eye32, look_dir, size * 12.0).map_or((BASE_OWNER, 0), |(o, id, _)| (o, id));
+    // What the `+` is on, asked along the same ray as the tools (from behind, not from the body's
+    // eyes, which look past it).
+    let from64 = player.pivot();
+    let from = from64.map(|c| c as f32);
+    // A scene object behind the SDF layer (a carved trunk, the ground) is not what the `+` is on:
+    // the oak's own triangles, drawn carved, are still whole for this ray.
+    let (hit_owner, hit_id) = match world.scene.raycast_dynamic_owned(from, look_dir, size * 12.0) {
+        Some((o, id, t)) => {
+            let before = body::look(&mut world.region, from64, look_dir, size, t).ok().flatten().map(|h| {
+                let d = [0, 1, 2].map(|a| h[a] - from64[a]);
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32
+            });
+            if before.is_some_and(|d| d < t - size * 0.05) { (BASE_OWNER, 0) } else { (o, id) }
+        }
+        None => (BASE_OWNER, 0),
+    };
     let aim = {
         let mut combined = world.combined();
-        match body::look(&mut combined, eye64, look_dir, size, size * 30.0) {
+        match body::look(&mut combined, from64, look_dir, size, size * 30.0) {
             Ok(Some(hit)) => hit.map(|c| c as f32),
-            _ => [eye32[0] + look_dir[0] * size * 3.0, eye32[1] + look_dir[1] * size * 3.0, eye32[2] + look_dir[2] * size * 3.0],
+            _ => [from[0] + look_dir[0] * size * 3.0, from[1] + look_dir[1] * size * 3.0, from[2] + look_dir[2] * size * 3.0],
         }
     };
     let ps_world = PlayerState {
@@ -1406,7 +1428,7 @@ fn hud(
         feet[2]
     );
     let inv = world.inventory(&sculpt.player_id);
-    if world.mode == WorldMode::World && !inv.is_empty() {
+    if world.counts_material() && !inv.is_empty() {
         let pace = (world.carry_speed_factor(&sculpt.player_id, b.size) * 100.0).round() as i32;
         s += &format!("\nPACK: {} (pace {pace}%) — {}", format_mass(inv.total_mass_kg()), inv.summary());
     }

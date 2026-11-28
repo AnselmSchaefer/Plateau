@@ -251,12 +251,20 @@ fn a_chopped_trunk_is_carried_and_laid_as_a_bridge_and_the_session_replays() {
     let at = placement_pos_for_aim(&phys, aim, rot, 1.0);
     assert!(act(&mut world, &mut body, Action::Drop { pos: at, rot }).is_done());
     assert!(world.held.is_none());
+    // Its tipping is shown as it happens; seen to its end, it is where it lies.
+    world.finish_all_falls(None);
     let laid = world.find(trunk).unwrap().transform();
+    // Set down, it is asked how it stands like anything else: laid with a bough pointing down, it
+    // stood on that bough's tip with its mass beyond it, so it tips onto its cut end and lies
+    // propped a little off flat.
     let up = plateau_engine::compose::quat_rotate(laid.rot, [0.0, 1.0, 0.0]);
-    assert!(up[1].abs() < 1e-3, "laid flat: its up is {up:?}");
+    assert!(up[1].abs() < 0.5, "lies on the lawn: its up is {up:?}");
 
-    // Stood on: it holds a person up off the lawn, and the tiny's home went with it.
-    let on_it = Body::standing(&mut world.combined(), [aim[0] as f64, 40.0, aim[2] as f64], PERSON).unwrap();
+    // Stood on, two metres along it from its foot: it holds a person up off the lawn, and the
+    // tiny's home went with it.
+    let along = plateau_engine::compose::quat_rotate(laid.rot, [0.0, 2.0, 0.0]);
+    let on = [0, 1, 2].map(|a| laid.pos[a] + along[a]);
+    let on_it = Body::standing(&mut world.combined(), [on[0] as f64, 40.0, on[2] as f64], PERSON).unwrap();
     assert!(on_it.feet[1] > lawn_y + 0.05, "standing on the laid trunk: {} over a lawn at {lawn_y}", on_it.feet[1]);
     assert_eq!(world.find(trunk).unwrap().local_edits.len(), 1);
 

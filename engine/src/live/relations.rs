@@ -91,6 +91,7 @@ impl World {
     /// field with the terrain's carves made since it entered the SDF (a stump the terrain was carved
     /// through is carved). Kept while the edits and the element are as they were.
     pub(super) fn entry_distances(&mut self, entry: &SdfElementEntry, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
+        let _span = tracing::info_span!("entry_distances").entered();
         let rev = self.edits.revision();
         let log = match self.alone.get(&entry.placed.id) {
             Some((r, pl, log)) if *r == rev && *pl == entry.placed => log.clone(),
@@ -115,6 +116,7 @@ impl World {
     /// Distances from `pts` to the terrain alone (the areas with `edits`, no water, no elements), at
     /// `size`.
     pub(super) fn terrain_distances(&mut self, edits: Arc<EditLog>, pts: &[[f32; 3]], size: f32) -> Option<Vec<f32>> {
+        let _span = tracing::info_span!("terrain_distances").entered();
         let log = ComposedLog::new_with_water(edits, Vec::new(), Arc::new(WaterLog::new()), 0);
         let mut out = Vec::new();
         Composed::new(&mut self.region.region, log).sample(pts, size, &mut out).ok()?;
@@ -182,6 +184,7 @@ impl World {
     /// Asked of the terrain without water (a floating thing rests on nothing) and of each other
     /// element alone, at the element's own size; in order.
     pub fn contacts_at(&mut self, id: u32, tf: PlacementTransform) -> Vec<Node> {
+        let _span = tracing::info_span!("contacts").entered();
         if let Some((pts, radii)) = self.carved_body(id, tf) {
             return self.touching(id, &pts, Some(&radii), CONTACT_TOLERANCE, 1e-4).0;
         }
@@ -194,6 +197,7 @@ impl World {
     /// above, within `share` of the smaller one's size (and at least `least`), and which of them
     /// touch anything.
     pub(super) fn touching(&mut self, id: u32, pts: &[[f32; 3]], radii: Option<&[f32]>, share: f32, least: f32) -> (Vec<Node>, Vec<bool>) {
+        let _span = tracing::info_span!("touching").entered();
         let mut touched = vec![false; pts.len()];
         let Some(phys) = self.physics_of(id) else { return (Vec::new(), touched) };
         if pts.is_empty() {

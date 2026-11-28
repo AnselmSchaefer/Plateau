@@ -227,6 +227,7 @@ pub fn make_with(area: &mut dyn Region, key: Key, making: Making) -> Result<Made
     if mesh.indices.is_empty() && collar.is_empty() {
         return Ok(Made { mesh: None, samples });
     }
+    samples += surface_materials(area, &mut mesh, &slopes, origin, size, voxel as f32)?;
     if making.shading {
         samples += shade(area, &mut mesh, &slopes, origin, size)?;
     }
@@ -346,6 +347,44 @@ fn net(distance: &[f32], material: &[Material], voxel: f32, with_collar: bool) -
 /// nearer than the
 /// vertex's own would be there takes away some of the sky. Hollows, cracks and the feet of walls
 /// are darker (spike: "hollows need shading to be seen"). Gives how many points it asked.
+/// How far below the surface a vertex's material is asked: under the thinnest coat an area lays
+/// (moss on a wall, a few centimetres), and a small share of a fine voxel.
+const MATERIAL_DEPTH: f32 = 0.002;
+
+/// Gives each vertex the material of the surface where it lies, not of the solid corner nearest it
+/// (`net`): that corner may be up to a voxel deep, and under a coat thinner than a coarse voxel
+/// (grass 8 cm over soil, moss 3 cm over stone) the lawns of far chunks showed soil and the walls
+/// blotches of stone, changing as the view turned and other levels covered them (played by hand,
+/// 2026-11-28). Each vertex is moved along its normal by the distance asked there (no farther than
+/// a voxel) to the surface, and the material asked `MATERIAL_DEPTH` beneath it. Where that lands
+/// outside the solid or in water (a feature thinner than the step), the corner's material stays.
+fn surface_materials(area: &mut dyn Region, mesh: &mut Mesh, slopes: &[f32], origin: [f64; 3], size: f32, voxel: f32) -> Result<usize> {
+    if mesh.positions.is_empty() {
+        return Ok(0);
+    }
+    let at: Vec<[f32; 3]> = mesh.positions.iter().map(|p| [0, 1, 2].map(|a| (origin[a] + p[a] as f64) as f32)).collect();
+    let mut out = Vec::new();
+    sample(area, &at, size, &mut out)?;
+    let depth = MATERIAL_DEPTH.min(0.05 * voxel);
+    let below: Vec<[f32; 3]> = at
+        .iter()
+        .zip(&mesh.normals)
+        .zip(&out)
+        .zip(slopes)
+        .map(|(((p, n), a), slope)| {
+            let to_surface = (a.distance / slope.clamp(0.3, 1.0)).clamp(-voxel, voxel);
+            [0, 1, 2].map(|i| p[i] - n[i] * (to_surface + depth))
+        })
+        .collect();
+    sample(area, &below, size, &mut out)?;
+    for (m, a) in mesh.materials.iter_mut().zip(&out) {
+        if a.distance <= 0.0 && a.material != Material::Water {
+            *m = a.material;
+        }
+    }
+    Ok(2 * at.len())
+}
+
 fn shade(area: &mut dyn Region, mesh: &mut Mesh, slopes: &[f32], origin: [f64; 3], size: f32) -> Result<usize> {
     let mut asked = 0;
     let mut out = Vec::new();

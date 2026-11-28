@@ -48,10 +48,13 @@ const BRICK: i32 = 16;
 const LEAF: i32 = 4;
 /// Cells across an edit's smallest extent.
 const CELLS_PER_FEATURE: f32 = 6.0;
+/// Cells to the height of who made an edit, at most: what they see of it (the terrain gives them
+/// twenty, `chunk::VOXELS_A_HEIGHT`).
+const CELLS_PER_STAMP: f32 = 40.0;
 /// The grid is never finer than the element's longest side over this, nor coarser than it over
 /// `COARSEST_ALONG`.
 const FINEST_ALONG: f32 = 1024.0;
-const COARSEST_ALONG: f32 = 96.0;
+const COARSEST_ALONG: f32 = 24.0;
 /// How many times a triangle near an edit is divided (into four) before it is cut.
 const MAX_DEPTH: u32 = 10;
 /// A remade corner turns to its face's normal where its own differs from it more than this (cos).
@@ -63,7 +66,7 @@ const MAX_CACHED_BRICKS: usize = 8192;
 /// At most this many remade triangles for one element (the rest of a too-large carve is not drawn).
 const MAX_PATCH_TRIS: usize = 600_000;
 /// Changes whenever what is made changes, so nothing kept from before is reused.
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 const CUBE: [[i32; 3]; 8] = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
 const CUBE_EDGES: [(usize, usize); 12] = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)];
@@ -116,6 +119,7 @@ impl Carver {
     /// them: one static solid instance of the carved mesh (added after its meshes, which keep their
     /// indices, as `SceneWorld`'s instances of it name them), every other instance and light as it was.
     pub fn carve(&mut self, scene: &Scene, carving: &Carving) -> Scene {
+        let _span = tracing::info_span!("carve", edits = carving.edits.len()).entered();
         if !scene.instances.iter().any(|i| i.solid) {
             return scene.clone();
         }
@@ -157,14 +161,19 @@ impl Carver {
             let h = cell_size(&carving.edits, &carving.sdf);
             let reach: Vec<Reach> = carving.edits.iter().map(|&e| Reach::new(e)).collect();
             let mut out = Vec::with_capacity(tris.len() * 3);
-            for &t in &tris {
-                keep_outside(t, &reach, h, 0, &mut out);
+            {
+                let _span = tracing::info_span!("carve_keep").entered();
+                for &t in &tris {
+                    keep_outside(t, &reach, h, 0, &mut out);
+                }
             }
             let field = Field { sdf: &carving.sdf, edits: &carving.edits };
             let mut bricks = Vec::new();
             if let Some((lo, size)) = root(&reach, h) {
+                let _span = tracing::info_span!("carve_find_bricks").entered();
                 collect_bricks(&field, &reach, h, lo, size, &mut bricks);
             }
+            let _span = tracing::info_span!("carve_bricks", n = bricks.len()).entered();
             let mut patch = 0usize;
             for b in bricks {
                 let made = self.brick(carving, &field, &reach, h, b);
@@ -191,16 +200,21 @@ impl Carver {
         let bhi = lo.map(|c| (c + BRICK + 1) as f32 * h + pad);
         let mut key = DefaultHasher::new();
         (VERSION, carving.source, h.to_bits(), lo).hash(&mut key);
-        for r in reach {
-            if (0..3).all(|a| r.hi[a] >= blo[a] && r.lo[a] <= bhi[a]) {
-                hash_edit(&r.edit, &mut key);
-            }
+        // What the brick is made of, and kept by: the edits that reach it (and its pad), in order.
+        // Those beyond change no sign in it, nor any distance near its surface, so the brick is
+        // asked of these alone: one stroke beside a much-carved element asks its few, not all.
+        let near: Vec<Reach> = reach.iter().filter(|r| (0..3).all(|a| r.hi[a] >= blo[a] && r.lo[a] <= bhi[a])).copied().collect();
+        for r in &near {
+            hash_edit(&r.edit, &mut key);
         }
         let key = key.finish();
         if let Some(b) = self.bricks.get(&key) {
             return b.clone();
         }
-        let mut contour = Contour::new(field, reach, h);
+        let _span = tracing::info_span!("carve_brick_made", edits = near.len()).entered();
+        let edits: Vec<Edit> = near.iter().map(|r| r.edit).collect();
+        let field = Field { sdf: field.sdf, edits: &edits };
+        let mut contour = Contour::new(&field, &near, h);
         contour.visit(lo, BRICK);
         let made = Arc::new(contour.finish());
         if self.bricks.len() >= MAX_CACHED_BRICKS {
@@ -579,19 +593,33 @@ impl<'a> Contour<'a> {
 }
 
 /// `t`, or the parts of it, outside every edit's reach by `KEEP` cells.
+///
+/// It is divided only where the edge of what is kept may cross it: each reach's `g` is a distance
+/// (it grows no faster than the point moves), so a triangle whose every point lies within `rad` of
+/// its middle is wholly on one side of a reach's edge when `g` at the middle is further than `rad`
+/// from `keep`; nor does a reach cross a triangle beyond its bounding ball. Dividing every triangle near an edit down to a cell, as before, made a few dozen
+/// plank triangles of a carved and cut bridge into 1.2 million (played by hand, 2026-11-28).
 fn keep_outside(t: Tri, reach: &[Reach], h: f32, depth: u32, out: &mut Vec<Tri>) {
     let keep = KEEP * h;
-    let mut near = false;
+    let mid = [0, 1, 2].map(|a| (t[0].pos[a] + t[1].pos[a] + t[2].pos[a]) / 3.0);
+    let rad = t.iter().map(|v| dist2(v.pos, mid)).fold(0.0f32, f32::max).sqrt();
+    let mut crossed = false;
     for r in reach {
         // Each reach is convex: a triangle whose corners are all within one is wholly within it.
         if t.iter().all(|v| r.g(v.pos) < keep) {
             return;
         }
-        if !near && point_triangle_distance(r.edit.center, t[0].pos, t[1].pos, t[2].pos) <= r.radius + keep {
-            near = true;
+        let at_mid = r.g(mid) - keep;
+        if at_mid < -rad {
+            return;
+        }
+        // Both must allow it: near the middle (tight for small triangles), and within the reach's
+        // bounding ball of the triangle itself (tight for a long one passing by).
+        if !crossed && at_mid <= rad && point_triangle_distance(r.edit.center, t[0].pos, t[1].pos, t[2].pos) <= r.radius + keep {
+            crossed = true;
         }
     }
-    if !near {
+    if !crossed {
         out.push(t);
         return;
     }
@@ -633,8 +661,13 @@ fn clip_keep(t: Tri, s: [f32; 3], out: &mut Vec<Tri>) {
     }
 }
 
-/// The grid's cell: a sixth of the smallest edit, a power of two (in the element's units), within
-/// what the element's size allows.
+/// The grid's cell: a sixth of the smallest edit, but no finer than its maker's size allows
+/// (`CELLS_PER_STAMP` to their height), a power of two (in the element's units), within what the
+/// element's size allows.
+///
+/// Bound to the maker's size, the grid stays the same while one size carves: a small stroke among
+/// a person's strokes used to make the whole grid finer, and every brick was made again (a third
+/// of a second to three seconds a stroke, played by hand 2026-11-28).
 fn cell_size(edits: &[Edit], sdf: &MeshSdf) -> f32 {
     let mut h = f32::INFINITY;
     for e in edits {
@@ -643,7 +676,9 @@ fn cell_size(edits: &[Edit], sdf: &MeshSdf) -> f32 {
             Shape::Box { half, .. } => half[0].min(half[1]).min(half[2]),
             Shape::Cylinder { radius, half_height, .. } => radius.min(half_height),
         };
-        h = h.min(feature / CELLS_PER_FEATURE);
+        // `stamp_size` is the maker's height, in the element's units as the edit is.
+        let finest = e.stamp_size / CELLS_PER_STAMP;
+        h = h.min((feature / CELLS_PER_FEATURE).max(finest));
     }
     let (lo, hi) = (sdf.lo(), sdf.hi());
     let longest = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2]).max(1e-3);

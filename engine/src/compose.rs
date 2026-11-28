@@ -369,6 +369,7 @@ impl CompiledElement {
     /// Builds a deterministic element-local `MeshSdf` from all `solid: true` instances emitted by
     /// this element for `seed`, clipped by `clips`. Returns `Ok(None)` if no solid triangles remain.
     pub fn build_mesh_sdf(&self, seed: u64, params: &[f32], clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
+        let _span = tracing::info_span!("mesh_sdf", clips = clips.len()).entered();
         let mut inst = self.compiled.instantiate_with(seed, params)?;
         let raw = inst.scene()?;
         let sc = clip_scene(&raw, clips);
@@ -1113,22 +1114,32 @@ impl ElementRuntime {
 
     /// Routes a player interaction (`F` / right-click):
     /// - If the crosshair targets a placed element (`hit_owner > 0`), calls `interact` on that element.
-    /// - Otherwise, calls `interact` on placed elements within reasonable proximity of the player.
+    /// - If it targets none, or the one it targets does nothing with it (a door fitted in an oak:
+    ///   the crosshair on the oak's bark beside it), calls `interact` on placed elements within
+    ///   reasonable proximity of the player, in order.
     pub fn interact(&mut self, player: &PlayerState, hit_owner: u32, hit_id: u32, world: &mut SceneWorld) -> Vec<Applied> {
         let mut results = Vec::new();
+        if hit_owner != 0
+            && let Some(l) = self.live.iter_mut().find(|l| l.placed.id == hit_owner && !l.held)
+        {
+            let tf = l.placed.transform();
+            let local_ps = tf.world_to_local_player(player, l.placed.id, hit_owner, hit_id);
+            match l.wasm.interact(&local_ps) {
+                Ok(cmds) if !cmds.is_empty() => {
+                    results.push(world.apply_for(l.placed.id, &cmds, Some(tf)));
+                    return results;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("element {} ({}) interact error: {e}", l.placed.id, l.placed.module),
+            }
+        }
         for l in &mut self.live {
-            if l.held {
+            if l.held || l.placed.id == hit_owner {
                 continue;
             }
-            let targeted = hit_owner == l.placed.id;
-            let nearby = if hit_owner == 0 {
-                let d2: f32 = (0..3).map(|a| (player.feet[a] - l.placed.pos[a]).powi(2)).sum();
-                let reach = max_f32(player.size * 6.0, l.placed.scale * 6.0);
-                d2 <= reach * reach
-            } else {
-                false
-            };
-            if !targeted && !nearby {
+            let d2: f32 = (0..3).map(|a| (player.feet[a] - l.placed.pos[a]).powi(2)).sum();
+            let reach = max_f32(player.size * 6.0, l.placed.scale * 6.0);
+            if d2 > reach * reach {
                 continue;
             }
             let tf = l.placed.transform();

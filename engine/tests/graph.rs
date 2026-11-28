@@ -87,8 +87,11 @@ fn lay_on_bridge(world: &mut World, who: &str, body: &mut Body, trunk: u32) {
     let phys = world.physics_of(trunk).unwrap();
     let at = placement_pos_for_aim(&phys, aim, rot, 1.0);
     done(act_as(world, who, body, Action::Drop { pos: at, rot }));
+    // Set down, it is asked how it stands like anything else: laid along the arched deck with its
+    // middle on the crown, its heavier end (the boughs) tips it down the deck's slope until it lies
+    // on it, so it lies along the deck, not exactly flat.
     let up = quat_rotate(world.find(trunk).unwrap().transform().rot, [0.0, 1.0, 0.0]);
-    assert!(up[1].abs() < 1e-3, "laid flat: its up is {up:?}");
+    assert!(up[1].abs() < 0.5, "lies along the deck: its up is {up:?}");
 }
 
 fn graph_holds(world: &mut World) {
@@ -499,4 +502,35 @@ fn carves_say_what_they_cut_and_floods_what_they_let_in() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains(&format!("rel flooded_by water:{body_id} edit:3\n")) && text.contains(&format!("rel carved_into edit:0 {tree}\n")), "{text}");
     assert_eq!(open(WorldSave::load(&path).unwrap()).graph, world.graph);
+}
+
+/// Played by hand (2026-11-28): a piece with roots (a stump sawn down its length), carried and set
+/// down tilted on a root, stood so: what is set down was never asked how it stands, and what has
+/// roots by its shape stayed rooted wherever it was carried. Now it is uprooted once carried, and
+/// tips if its mass is not over what it touches.
+#[test]
+fn what_is_set_down_tilted_with_roots_is_uprooted_and_tips_over() {
+    let mut world = open(garden_save());
+    let mut giant = person(&mut world);
+    giant.size = 17.0;
+    let tree = place(&mut world, "local", &mut giant, TREE, LAWN);
+    assert_eq!(world.footing(tree), Some(Footing::Rooted));
+
+    // A giant pulls the whole tree up and sets it down a little away, leaning 40° east.
+    done(act_as(&mut world, "local", &mut giant, Action::Grab { id: tree }));
+    let rot = euler_quat(0.0, 0.0, -40f32.to_radians());
+    let aim = top_at(&mut world, LAWN[0] + 6.0, LAWN[2]);
+    let phys = world.physics_of(tree).unwrap();
+    let at = placement_pos_for_aim(&phys, aim, rot, 1.0);
+    done(act_as(&mut world, "local", &mut giant, Action::Drop { pos: at, rot }));
+
+    assert!(world.graph.contains(&Relation::uprooted(tree)), "carried away, its roots hold in nothing");
+    assert_ne!(world.footing(tree), Some(Footing::Rooted));
+    let up = quat_rotate(world.find(tree).unwrap().transform().rot, [0.0, 1.0, 0.0]);
+    assert!(up[1] < 40f32.to_radians().cos() - 0.05, "it tipped further over than it was set down: up {up:?}");
+    graph_holds(&mut world);
+
+    // Undone, it is carried again as it was, and its roots with it.
+    done(act_as(&mut world, "local", &mut giant, Action::Undo));
+    assert!(!world.graph.contains(&Relation::uprooted(tree)));
 }

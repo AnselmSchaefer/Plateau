@@ -768,6 +768,12 @@ impl WorldSave {
                     bail!("line {}: module {} recorded twice", line_no + 1, m.path);
                 }
                 modules.push(m);
+            } else if let Some(rest) = line.strip_prefix("economy ") {
+                rules.economy = match rest.trim() {
+                    "on" => true,
+                    "off" => false,
+                    other => bail!("line {}: `economy {other}`: on or off", line_no + 1),
+                };
             } else if line.starts_with("policy ") {
                 rules.set_area(RuleBook::parse_policy_line(line, line_no + 1)?);
             } else if line.starts_with("plot ") {

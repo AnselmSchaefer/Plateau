@@ -107,12 +107,13 @@ fn a_carved_tree_keeps_its_own_triangles_and_remakes_only_the_carve() {
     assert!(away > 100, "most of the tree is away from the carve ({away})");
     assert_eq!(kept, away, "every original triangle away from the carve is kept exactly");
 
-    // Nothing is drawn inside what was carved, and the remade surface is on the SDF.
+    // Nothing is drawn inside what was carved, and the remade surface is on the SDF, within a
+    // quarter of its grid's cell (a person's carve: 3.1 cm, a fortieth of their height).
     for v in &mesh.vertices {
         assert!(edit.distance(v.pos) > -0.01, "a vertex inside the carve: {:?}", v.pos);
         if edit.distance(v.pos) < 0.08 {
             let f = field(&sdf, &edits, v.pos);
-            assert!(f.abs() < 0.006, "a remade vertex off the surface by {f}: {:?}", v.pos);
+            assert!(f.abs() < 0.25 * 0.03125, "a remade vertex off the surface by {f}: {:?}", v.pos);
         }
     }
 
@@ -246,4 +247,30 @@ fn a_sculpted_tree_draws_itself_carved_and_the_chunks_leave_it_out() {
     let mut out: Vec<Answer> = Vec::new();
     c.sample(&[[LAWN[0], 2.0, LAWN[2]]], PERSON, &mut out).unwrap();
     assert!(out[0].distance < 0.0, "the trunk is still solid to physics: {:?}", out[0]);
+}
+
+/// Played by hand (2026-11-28): a timber bridge dug round with a pickaxe (fifteen box strokes, 10
+/// to 29 cm) was drawn with 538 thousand triangles from its 216, and its cut pieces with up to 1.2
+/// million, until the graphics card ran out of memory: every plank triangle near a stroke was
+/// divided down to a cell. Only those its kept part's edge crosses are divided now.
+#[test]
+fn a_bridge_carved_many_times_stays_light() {
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let bridge = "elements/modules/bridge.wasm";
+    let scene = catalog.get_or_load(bridge).unwrap().compiled.instantiate(7).unwrap().scene().unwrap();
+    let sdf = catalog.get_or_build_mesh_sdf(bridge, 7, &[], &[]).unwrap().unwrap();
+    let source = Carving::source_of(bridge, 7, &[]);
+    let (lo, hi) = (sdf.lo(), sdf.hi());
+    let mut edits = Vec::new();
+    for k in 0..15 {
+        let u = (k as f32 + 0.5) / 15.0;
+        let half = [0.286, 0.214, 0.143, 0.1][k % 4];
+        let at = [lo[0] + (hi[0] - lo[0]) * u, lo[1] + (hi[1] - lo[1]) * 0.4, lo[2] + (hi[2] - lo[2]) * (0.2 + 0.6 * ((k * 7 % 5) as f32 / 4.0))];
+        edits.push(Edit::carve(Shape::Box { half: [half; 3], round: 0.07 * half }, at, 0.0, None, PERSON));
+    }
+    let original = tris(solid_mesh(&Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), edits: Vec::new() }))).len();
+    let carved = Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), edits: edits.clone() });
+    let n = tris(solid_mesh(&carved)).len();
+    println!("bridge: {original} triangles, carved fifteen times: {n}");
+    assert!(n < 150_000, "a carved bridge is drawn with {n} triangles (from {original})");
 }

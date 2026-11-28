@@ -196,6 +196,7 @@ impl World {
     /// The carved element `id`'s body as balls on its surface, at `tf` (see `Cells::body`): what it
     /// touches with, where its meshes no longer say (they do not know its carving).
     pub(super) fn carved_body(&mut self, id: u32, tf: PlacementTransform) -> Option<(Vec<[f32; 3]>, Vec<f32>)> {
+        let _span = tracing::info_span!("carved_body").entered();
         if !self.find(id)?.is_promoted() {
             return None;
         }
@@ -302,6 +303,7 @@ impl World {
 
     /// The element `pl`'s solid alone, if it is a scene element with solid meshes.
     fn solid_of(&mut self, pl: &PlacedElement) -> Option<Solid> {
+        let _span = tracing::info_span!("solid_of").entered();
         if self.is_sdf_element(pl) {
             return None;
         }
@@ -317,6 +319,7 @@ impl World {
 
     /// The element `id` made into cells (kept while it and the edits are as they were).
     fn cells_of(&mut self, id: u32) -> Option<Cells> {
+        let _span = tracing::info_span!("cells_of").entered();
         let pl = self.find(id)?.clone();
         let rev = self.edits.revision();
         if let Some((r, was, c)) = self.cells.get(&id)
@@ -392,6 +395,7 @@ impl World {
 
     /// Distances from `pts` to `node` alone (the terrain, or an element), at most `far`.
     fn node_distances(&mut self, node: &Node, pts: &[[f32; 3]], size: f32, far: f32) -> Vec<f32> {
+        let _span = tracing::info_span!("node_distances").entered();
         match node {
             Node::Terrain => {
                 let edits = self.edits.clone();
@@ -410,6 +414,7 @@ impl World {
 
     /// Which of the element `id`'s solid cells touch what holds it up (within a cell).
     fn anchored(&mut self, id: u32, cells: &Cells, tf: PlacementTransform) -> Vec<bool> {
+        let _span = tracing::info_span!("anchored").entered();
         let world = cells.world(tf);
         let cell_w = cells.grid.cell * tf.scale;
         let size = self.physics_of(id).map_or(1.0, |p| p.world_span).clamp(SMALLEST, LARGEST);
@@ -428,6 +433,7 @@ impl World {
     /// distance near the carve's lip (never more), so whether a point is really there is asked
     /// again further on (`meets`).
     fn obstacle_distances(&mut self, id: u32, pts: &[[f32; 3]], size: f32, far: f32) -> (Vec<f32>, Vec<f32>) {
+        let _span = tracing::info_span!("obstacle_distances").entered();
         let mut field = self.node_distances(&Node::Terrain, pts, size, far);
         let mut meshes = vec![far; pts.len()];
         let (lo, hi) = bounds(pts);
@@ -447,6 +453,12 @@ impl World {
             if Some(entry.placed.id) == carried {
                 continue;
             }
+            // An element's field is never nearer than its bounds: where those are no nearer than
+            // what each point has already met, it changes nothing, and is not asked (a pile of
+            // carved pieces was asked whole at every step a piece tipped, played by hand 2026-11-28).
+            if pts.iter().zip(&field).all(|(p, &d)| box_distance(*p, entry.world_lo, entry.world_hi) - entry.world_blend >= d) {
+                continue;
+            }
             if let Some(e) = self.entry_distances(&entry, pts, size) {
                 for (a, b) in field.iter_mut().zip(e) {
                     *a = a.min(b);
@@ -460,6 +472,7 @@ impl World {
     /// or grazing away from) any other solid scene element (`!= id`, not carried), using its cached
     /// exact `MeshSdf` signed distance and Signorini's directional condition (`d(p + eps*way) < d(p)`).
     fn entering_other_mesh(&mut self, id: u32, pts: &[[f32; 3]], ways: &[[f32; 3]], eps: f32) -> Vec<bool> {
+        let _span = tracing::info_span!("entering_other_mesh").entered();
         let mut hit = vec![false; pts.len()];
         if pts.is_empty() {
             return hit;
@@ -512,6 +525,7 @@ impl World {
     /// `ways` keeps a piece resting on top of `id` from blocking `id` from dropping away beneath it.
     #[allow(clippy::too_many_arguments)]
     fn meets(&mut self, id: u32, pts: &[[f32; 3]], radii: &[f32], ways: &[[f32; 3]], field: &[f32], meshes: &[f32], stop: f32, size: f32) -> Vec<bool> {
+        let _span = tracing::info_span!("meets").entered();
         let mut met = vec![false; pts.len()];
         let ask_mesh: Vec<usize> = (0..pts.len()).filter(|&i| meshes[i] - radii[i] <= stop).collect();
         if !ask_mesh.is_empty() {
@@ -538,6 +552,7 @@ impl World {
 
     /// Whether the rooted element `id`'s roots still hold: some cell of it touches the terrain.
     fn roots_hold(&mut self, id: u32) -> bool {
+        let _span = tracing::info_span!("roots_hold").entered();
         let Some(tf) = self.find(id).map(|pl| pl.transform()) else { return true };
         let Some(cells) = self.cells_of(id) else { return true };
         let world = cells.world(tf);
@@ -550,6 +565,7 @@ impl World {
     /// separating plane if one parts it from the rest, else by complementary element-local carve
     /// boxes (`support::mask_boxes`). `None` if it holds together.
     fn parting(&mut self, id: u32) -> Option<Parting> {
+        let _span = tracing::info_span!("parting").entered();
         if !matches!(self.footing(id), Some(Footing::Rooted | Footing::Loose)) {
             return None;
         }
@@ -592,6 +608,7 @@ impl World {
     /// cross-section a carve left there cannot hold what is above it (the part above on its kept
     /// side); and the way the part above tips (x, z), over which edge of the section.
     fn breaking(&mut self, id: u32) -> Option<(ClipPlane, [f32; 2], [f32; 3])> {
+        let _span = tracing::info_span!("breaking").entered();
         if !matches!(self.footing(id), Some(Footing::Rooted | Footing::Loose)) {
             return None;
         }
@@ -694,6 +711,7 @@ impl World {
     /// the rest and the part, as a cut does: both `derived_from` it and owned by its owner; the
     /// rest keeps what it hung from; what rested on, hung from or filled it is found again.
     fn split(&mut self, id: u32, parting: Parting, settled: &mut Settled) -> Option<(u32, u32)> {
+        let _span = tracing::info_span!("split").entered();
         let original = self.find(id)?.clone();
         let (rest_rel, part_rel, mut rest, mut part, masked) = match parting {
             Parting::Plane(plane) => {
@@ -849,6 +867,7 @@ impl World {
     /// Signed distance from each point in `pts` to the nearest obstacle other than `id` (and not
     /// carried), combining terrain/SDF fields with cached exact `MeshSdf`s for scene elements.
     fn signed_obstacle_distances(&mut self, id: u32, pts: &[[f32; 3]], size: f32, far: f32) -> Vec<f32> {
+        let _span = tracing::info_span!("signed_obstacle_distances").entered();
         let (mut best, _) = self.obstacle_distances(id, pts, size, far);
         if pts.is_empty() {
             return best;
@@ -882,6 +901,7 @@ impl World {
     /// distance down and away along the slope's tangent until it clears the snag without entering
     /// any obstacle. Returns the world-space displacement, or `None` if it cannot move safely.
     fn slide_off_snag(&mut self, id: u32, pts: &[[f32; 3]], radii: &[f32], span: f32, size: f32) -> Option<[f32; 3]> {
+        let _span = tracing::info_span!("slide_off_snag").entered();
         let stop = (STOP * span).max(1e-4);
         let far = 4.0 * span + 8.0;
         let down = vec![[0.0, -1.0, 0.0]; pts.len()];
@@ -954,6 +974,7 @@ impl World {
     /// How far the points `pts` of the element `id` can drop straight down before one meets
     /// something from above; nought if nothing is beneath them.
     fn drop_distance(&mut self, id: u32, pts: &[[f32; 3]], radii: &[f32], span: f32, size: f32) -> f32 {
+        let _span = tracing::info_span!("drop_distance").entered();
         let stop = (STOP * span).max(1e-4);
         let far = 4.0 * span + 8.0;
         let mut t = vec![0.0f32; pts.len()];
@@ -990,6 +1011,7 @@ impl World {
     /// it turned.
     #[allow(clippy::too_many_arguments)]
     fn tip(&mut self, id: u32, local: &[[f32; 3]], radii: &[f32], tf: PlacementTransform, pivot: [f32; 3], u: [f32; 2], span: f32, size: f32) -> (PlacementTransform, f32) {
+        let _span = tracing::info_span!("tip").entered();
         // Turning about (u.z, 0, -u.x) carries up towards u.
         let k = [u[1], 0.0, -u[0]];
         let stop = (STOP * span).max(1e-4);
@@ -1055,6 +1077,7 @@ impl World {
     /// until it stands; then onto water. What rested on it is shaken; it rests on what it now
     /// touches. Whether it moved.
     fn fall(&mut self, id: u32, push: Option<([f32; 2], Option<[f32; 3]>)>, shown: &mut Vec<Shown>) -> bool {
+        let _span = tracing::info_span!("fall").entered();
         if self.footing(id) != Some(Footing::Loose) {
             return false;
         }
@@ -1276,4 +1299,10 @@ impl World {
             self.commit(Invalidation::Some { edits: Vec::new(), bounds: stale, water: None });
         }
     }
+}
+
+/// How far `p` is from the box `lo..hi` (0 within it).
+fn box_distance(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> f32 {
+    let d = [0, 1, 2].map(|a| (lo[a] - p[a]).max(p[a] - hi[a]).max(0.0));
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }

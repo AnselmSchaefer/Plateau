@@ -450,9 +450,14 @@ impl World {
         self.inventories.get(player).map_or(0.0, Inventory::total_mass_kg)
     }
 
-    /// Extra carried pack mass counted toward carry limits & speed (`0.0` in `workshop` mode).
+    /// Whether material is counted: in `world` mode, where the rule book's `economy` is on.
+    pub fn counts_material(&self) -> bool {
+        self.mode == WorldMode::World && self.rules.economy
+    }
+
+    /// Extra carried pack mass counted toward carry limits & speed (`0.0` unless material is counted).
     pub fn carried_pack_kg(&self, player: &str) -> f32 {
-        if self.mode == WorldMode::World { self.inventory_mass_kg(player) } else { 0.0 }
+        if self.counts_material() { self.inventory_mass_kg(player) } else { 0.0 }
     }
 
     /// Movement speed multiplier in `[0.35..=1.0]` accounting for both any held object and carried
