@@ -1,5 +1,5 @@
 # What an area's program is written against (POC_PLAN.md, step 1): the bindings of the WIT world
-# `plateau:region@0.1.0` made ahead of time (no proc macro in an area's build), a little runtime in
+# `plateau:region@0.2.0` made ahead of time (no proc macro in an area's build), a little runtime in
 # place of wit-bindgen's, distances and their sums, noise, the engine's materials, `Seeds`. No
 # dependencies, as Caprice's theme SDK.
 [package]

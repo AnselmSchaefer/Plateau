@@ -305,7 +305,7 @@ impl World {
         if self.is_sdf_element(pl) {
             return None;
         }
-        let mesh = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips).ok().flatten()?;
+        let mesh = self.catalog.mesh_sdf_of(pl).ok().flatten()?;
         let carves: Vec<Edit> =
             if pl.is_promoted() { self.edits.edits()[pl.sdf_after_edits().min(self.edits.len())..].iter().filter(|e| e.op == Op::Carve).copied().collect() } else { Vec::new() };
         let mut alone = pl.clone();
@@ -474,7 +474,7 @@ impl World {
                 continue;
             }
             let Some(pl) = self.find(other).cloned() else { continue };
-            let Ok(Some(msdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) else {
+            let Ok(Some(msdf)) = self.catalog.mesh_sdf_of(&pl) else {
                 for (i, &p) in pts.iter().enumerate() {
                     if !hit[i] && self.scene.distance_to_solids_of(other, p, 1e-3).is_some() {
                         hit[i] = true;
@@ -714,7 +714,7 @@ impl World {
                 if for_rest.is_empty() || for_part.is_empty() {
                     return None;
                 }
-                self.catalog.get_or_build_mesh_sdf(&original.module, original.seed, &original.clips).ok().flatten()?;
+                self.catalog.mesh_sdf_of(&original).ok().flatten()?;
                 let promoted_at = original.promoted.unwrap_or(self.edits.len());
                 let mut rest = original.clone();
                 rest.promoted = Some(promoted_at);
@@ -820,7 +820,14 @@ impl World {
     pub(super) fn restore_placed(&mut self, pl: PlacedElement) {
         let Some(idx) = self.placed.iter().position(|e| e.id == pl.id) else { return };
         let cur = self.placed[idx].clone();
-        if cur.local_edits == pl.local_edits && cur.promoted == pl.promoted && cur.clips == pl.clips && cur.scale == pl.scale {
+        if cur.local_edits == pl.local_edits
+            && cur.promoted == pl.promoted
+            && cur.clips == pl.clips
+            && cur.scale == pl.scale
+            && cur.params == pl.params
+            && cur.module == pl.module
+            && cur.seed == pl.seed
+        {
             if cur.transform() != pl.transform() {
                 self.relocate_placed(pl.id, pl.transform(), None);
             }
@@ -855,7 +862,7 @@ impl World {
                 continue;
             }
             let Some(pl) = self.find(other).cloned() else { continue };
-            let Ok(Some(msdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) else { continue };
+            let Ok(Some(msdf)) = self.catalog.mesh_sdf_of(&pl) else { continue };
             let tf = pl.transform();
             let inv_scale = 1.0 / tf.scale.max(1e-4);
             for (i, &p) in pts.iter().enumerate() {

@@ -60,6 +60,33 @@ measuring player is **1.7 m tall** in your coordinate system (`+X` right, `+Y` u
 toward whoever approaches). The engine scales, rotates, and translates your element into the world
 via `site.frame`.
 
+### Params: one element for every site like it
+
+The numbers in the prompt are also given to your element when it runs, as `params()` (call it once,
+in `new`). Write the element from them, not from numbers copied out of the prompt. Then the same
+element fits every site like the one it was made for: any opening, of any shape and size. When the
+player widens the opening, the engine measures it again and gives the element the new numbers.
+
+`params()` is empty when the element is placed for no site. Then make a sensible default, such as
+the shape the prompt describes. Read each number with `param(&p, index, default)`. Lengths are in
+local metres, like the prompt's:
+
+| Index | Param |
+|---|---|
+| 0 | 1 if there is an opening, else 0 (and every number after it is 0) |
+| 1, 2 | the opening's width and height |
+| 3 | how high its middle is above the sill; the radii below are measured from `(0, this, 0)` |
+| 4 | how deep it goes along `-Z` |
+| 5 | 1 if it goes on through, open behind |
+| 6 | the least wall beyond the outline at the rim |
+| 7 | roundness: 1 for a circle, less the less round it is |
+| 8 | headroom: how far it is from floor to ceiling inside |
+| 9 | 1 if a 1.7 m tall body walks in through it |
+| 10 to 57 | 48 distances from the middle to the outline, in the rim's plane. The `k`th is at the angle `a = k / 48` of a turn, anticlockwise from straight right, so its point is `(r cos a, middle + r sin a, 0)`. Together they are the same outline as `OPENING` |
+
+For example, `elements/hobbit-door/element.rs` (below) builds its frame, leaf and trim along these
+48 radii.
+
 ### Fitting an opening
 
 When the site has a measured cavity/opening (such as a carved cave, tunnel, or hollowed tree trunk):
@@ -68,8 +95,8 @@ When the site has a measured cavity/opening (such as a carved cave, tunnel, or h
   the carved opening back in.
 - **Origin & rim plane**: `(0, 0, 0)` lies on the opening's sill (bottom-center) in the rim plane
   `z = 0`. The surrounding wall lies at `z <= 0`; open air outside is `z > 0`.
-- **Static solid frame (`id = 0`, `solid = true`)**: trace the provided `const OPENING: [(f32, f32); 48]`
-  outline around the rim in `z = 0` (spanning slightly in and out, e.g. `z = -0.20..0.12`). Its outer
+- **Static solid frame (`id = 0`, `solid = true`)**: trace the opening's outline (from the params'
+  radii; `const OPENING: [(f32, f32); 48]` in the prompt is the same outline) around the rim in `z = 0` (spanning slightly in and out, e.g. `z = -0.20..0.12`). Its outer
   edge MUST overlap into the surrounding wall by **1% to 35%** of the opening's mean radius (aim for
   **6% to 12%**) all the way around, with no floating gaps and without burying the inner edge inside
   the wall. The floor edge may be left to a sill or the bottom of a door leaf (within 5% of mean radius).

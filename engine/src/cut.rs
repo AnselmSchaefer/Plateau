@@ -400,15 +400,14 @@ pub fn world_edit_to_local(edit: &Edit, tf: PlacementTransform) -> Edit {
             Shape::Cylinder { radius: radius * inv, half_height: half_height * inv, round: round * inv }
         }
     };
-    Edit {
-        op: edit.op,
-        shape,
-        center,
-        blend: edit.blend * inv,
-        material: edit.material,
-        stamp_size: edit.stamp_size * inv,
-        tool: edit.tool,
-    }
+    Edit { shape, center, blend: edit.blend * inv, stamp_size: edit.stamp_size * inv, ..*edit }
+}
+
+/// Converts an element-local `Edit` back to world space under `tf` (inverse of `world_edit_to_local`).
+pub fn local_edit_to_world(edit: &Edit, tf: PlacementTransform) -> Edit {
+    let s = max_f32(tf.scale, 1e-5);
+    let center = tf.local_to_world_point(edit.center);
+    Edit { shape: edit.shape.scaled(s), center, blend: edit.blend * s, stamp_size: edit.stamp_size * s, ..*edit }
 }
 
 /// Chooses a clean element-local cut plane perpendicular to the object's longest structural axis

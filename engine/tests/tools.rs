@@ -185,6 +185,7 @@ fn shovel_aimed_at_moss_over_stone_core_is_refused_or_shrunk_naming_stone() {
         fitted: false,
         opening: None,
         seed: Some(7),
+        params: Vec::new(),
     });
     assert!(placed_hill.is_done(), "{placed_hill:?}");
     let hill_hit = body::look(&mut world.combined(), [28.0, 0.5, 54.0], [0.0, 0.0, -1.0], PERSON, 6.0).unwrap().unwrap().map(|c| c as f32);
@@ -312,6 +313,7 @@ fn carrying_weight_counts_carried_material_pack() {
         fitted: false,
         opening: None,
         seed: Some(11),
+        params: Vec::new(),
     }) {
         Outcome::Done(s) => s.added[0],
         other => panic!("place tree failed: {other:?}"),
@@ -414,6 +416,7 @@ fn save_and_action_log_replay_check_every_edits_tool_and_round_trip_deterministi
         fitted: false,
         opening: None,
         seed: Some(7),
+        params: Vec::new(),
     }) {
         Outcome::Done(s) => s.added[0],
         other => panic!("place tree failed: {other:?}"),
@@ -543,4 +546,179 @@ fn legacy_saves_without_tool_mode_or_inv_still_load_cleanly() {
     assert!(v2_text.contains("tool all"));
     let again = WorldSave::from_text(&v2_text).unwrap();
     assert_eq!(again.to_text(), v2_text);
+}
+
+fn place_tree(world: &mut World, body: &mut Body, at: [f32; 3], seed: u64) -> u32 {
+    match act(world, body, Action::Place { module: TREE.into(), pos: at, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(seed), params: Vec::new() }) {
+        Outcome::Done(s) => s.added[0],
+        other => panic!("place tree failed: {other:?}"),
+    }
+}
+
+#[test]
+fn sawing_a_tree_where_it_meets_the_ground_yields_only_its_wood() {
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    let tree = place_tree(&mut world, &mut body, LAWN, 11);
+    let pos = world.find(tree).unwrap().pos;
+    // A brush on the trunk's foot reaches into the soil under it: the soil is not carved (the
+    // stroke is the tree's own), so it neither stops the saw nor goes into the pack.
+    let notch = Edit::carve(Shape::Sphere { radius: 0.2 }, [pos[0], pos[1] + 0.05, pos[2]], 0.02, None, PERSON);
+    let sawn = act(&mut world, &mut body, Action::Sculpt { edit: notch, hit: notch.center, tool: Tool::Saw, target: SculptTarget::Element(tree) });
+    assert!(sawn.is_done(), "{sawn:?}");
+    let inv = world.inventory("local");
+    assert!(inv.get(Material::Wood) > 0.0, "the notch yields wood: {inv:?}");
+    for m in [Material::Soil, Material::Stone, Material::Grass] {
+        assert_eq!(inv.get(m), 0.0, "no {} from ground the stroke never carved: {inv:?}", m.name());
+    }
+    // The same stroke again yields nothing more: the wood there is gone.
+    let wood = inv.get(Material::Wood);
+    let again = Edit { center: [pos[0], pos[1] + 0.05 + 1e-3, pos[2]], ..notch };
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: again, hit: again.center, tool: Tool::Saw, target: SculptTarget::Element(tree) }).is_done());
+    let more = world.inventory("local").get(Material::Wood) - wood;
+    assert!(more < 0.1 * wood, "carving what is carved yields (almost) nothing: {more} after {wood}");
+}
+
+#[test]
+fn carving_air_yields_nothing() {
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    let air = Edit::carve(Shape::Sphere { radius: 0.3 }, [LAWN[0], 3.0, LAWN[2]], 0.02, None, PERSON);
+    let _ = act(&mut world, &mut body, Action::Sculpt { edit: air, hit: air.center, tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } });
+    assert!(world.inventory("local").is_empty(), "{:?}", world.inventory("local"));
+}
+
+#[test]
+fn adding_into_the_ground_pays_for_what_it_turns_to_its_material() {
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    // Some stone to build with, from the east wall.
+    let quarry = Edit::carve(Shape::Sphere { radius: 0.5 }, [53.95, 1.0, 26.0], 0.05, None, PERSON);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: quarry, hit: [53.7, 1.0, 26.0], tool: Tool::Pickaxe, target: SculptTarget::Terrain { aimed: None } }).is_done());
+    let have = world.inventory("local").get(Material::Stone);
+    // A stone ball half sunk in the lawn: the soil inside it that becomes stone (all of it but
+    // what lies deeper in the ground than in the ball) is paid for, not only its half in the air.
+    let ball = Edit::add(Shape::Sphere { radius: 0.2 }, [LAWN[0], 0.0, LAWN[2]], 0.0, Material::Stone, PERSON);
+    let added = act(&mut world, &mut body, Action::Sculpt { edit: ball, hit: LAWN, tool: Tool::Pickaxe, target: SculptTarget::Terrain { aimed: None } });
+    assert!(added.is_done(), "{added:?}");
+    let paid = have - world.inventory("local").get(Material::Stone);
+    let whole = ball.shape.volume_m3() * material_props(Material::Stone).density_kg_m3;
+    assert!(paid > 0.75 * whole && paid <= whole * 1.001, "paid {paid} kg for a ball of {whole} kg");
+}
+
+#[test]
+fn undoing_an_add_gives_back_only_what_it_took() {
+    use plateau_engine::physics::{BrushTarget, estimate_add_mass_kg};
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    let mound = Edit::add(Shape::Sphere { radius: 0.25 }, [LAWN[0] + 2.0, 0.15, LAWN[2]], 0.05, Material::Soil, PERSON).with_tool(Tool::Shovel);
+    let need = estimate_add_mass_kg(&mound, Material::Soil, &mut BrushTarget::World { region: &mut world.region, unpromoted: &[] }).unwrap();
+    // A pack a rounding's slack short of what the mound takes: allowed, and emptied.
+    let short = need * (1.0 - 0.5e-4);
+    world.inventories.entry("local".into()).or_default().add(Material::Soil, short);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: mound, hit: [LAWN[0] + 2.0, 0.0, LAWN[2]], tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } }).is_done());
+    assert_eq!(world.inventory("local").get(Material::Soil), 0.0);
+    assert!(act(&mut world, &mut body, Action::Undo).is_done());
+    assert_eq!(world.inventory("local").get(Material::Soil), short, "undo gives back what was taken, not what was asked");
+    assert!(act(&mut world, &mut body, Action::Redo).is_done());
+    assert_eq!(world.inventory("local").get(Material::Soil), 0.0);
+}
+
+#[test]
+fn only_who_owns_the_world_switches_its_mode() {
+    use plateau_engine::rules::AreaPolicy;
+    let mut world = open(garden_save(WorldMode::World));
+    world.rules.set_area(AreaPolicy::owned([0, 0], "alice"));
+    let mut body = person(&mut world);
+    let visitor = world.apply(Actor { id: "bob", body: &mut body }, Action::SetMode { mode: WorldMode::Workshop });
+    assert!(matches!(&visitor, Outcome::Denied(r) if r.contains("mode")), "{visitor:?}");
+    assert_eq!(world.mode, WorldMode::World);
+    assert!(world.apply(Actor { id: "alice", body: &mut body }, Action::SetMode { mode: WorldMode::Workshop }).is_done());
+    assert_eq!(world.mode, WorldMode::Workshop);
+}
+
+#[test]
+fn workshop_mode_adds_with_any_tool() {
+    let mut world = open(garden_save(WorldMode::Workshop));
+    let mut body = person(&mut world);
+    let mound = Edit::add(Shape::Sphere { radius: 0.25 }, [LAWN[0] + 2.0, 0.15, LAWN[2]], 0.05, Material::Soil, PERSON);
+    for (k, tool) in [Tool::Saw, Tool::Hands].into_iter().enumerate() {
+        let edit = Edit { center: [LAWN[0] + 2.0 + k as f32, 0.15, LAWN[2]], ..mound };
+        let out = act(&mut world, &mut body, Action::Sculpt { edit, hit: edit.center, tool, target: SculptTarget::Terrain { aimed: None } });
+        assert!(out.is_done(), "{tool:?}: {out:?}");
+    }
+}
+
+#[test]
+fn a_save_switched_to_world_mode_verifies_each_edit_under_its_own_mode() {
+    let mut world = open(garden_save(WorldMode::Workshop));
+    let mut body = person(&mut world);
+    // Workshop edits: the workshop tool, a repainting carve.
+    let hill = Edit::add(Shape::Sphere { radius: 0.6 }, [LAWN[0], 0.3, LAWN[2]], 0.1, Material::Soil, PERSON);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: hill, hit: LAWN, tool: Tool::All, target: SculptTarget::Terrain { aimed: None } }).is_done());
+    let paint = Edit::carve(Shape::Sphere { radius: 0.3 }, [LAWN[0] + 3.0, -0.1, LAWN[2]], 0.05, Some(Material::Wood), PERSON);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: paint, hit: LAWN, tool: Tool::All, target: SculptTarget::Terrain { aimed: None } }).is_done());
+    // Then world mode, and a shovel.
+    assert!(act(&mut world, &mut body, Action::SetMode { mode: WorldMode::World }).is_done());
+    let dig = Edit::carve(Shape::Sphere { radius: 0.3 }, [LAWN[0] - 3.0, -0.05, LAWN[2]], 0.05, None, PERSON);
+    assert!(act(&mut world, &mut body, Action::Sculpt { edit: dig, hit: [LAWN[0] - 3.0, 0.0, LAWN[2]], tool: Tool::Shovel, target: SculptTarget::Terrain { aimed: None } }).is_done());
+    let save = world.to_save();
+    assert_eq!(save.edits.iter().map(|e| e.mode).collect::<Vec<_>>(), vec![WorldMode::Workshop, WorldMode::Workshop, WorldMode::World]);
+    let text = save.to_text();
+    let loaded = WorldSave::from_text(&text).unwrap();
+    assert_eq!(loaded.to_text(), text, "per-edit mode round-trips");
+    assert_eq!(verify_save_edits(&loaded, None, &repo_root(), Limits::default(), ModuleCheck::Strict).unwrap(), Ok(()));
+    // A world-mode edit forged to the workshop tool is still caught.
+    let mut bad = loaded.clone();
+    bad.edits[2].tool = Tool::All;
+    let err = verify_save_edits(&bad, None, &repo_root(), Limits::default(), ModuleCheck::Strict).unwrap().expect_err("forged");
+    assert!(err.contains("edit #2") && err.contains("workshop"), "{err}");
+}
+
+#[test]
+fn an_element_carved_then_carried_elsewhere_still_verifies() {
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    let tree = place_tree(&mut world, &mut body, LAWN, 11);
+    let pos = world.find(tree).unwrap().pos;
+    let trunk = match act(&mut world, &mut body, Action::Cut { id: tree, hit: [pos[0], pos[1] + 0.9, pos[2]], dir: [1.0, 0.0, 0.0], tool: Tool::Saw, material: Some(Material::Wood) }) {
+        Outcome::Done(s) => s.added[1],
+        other => panic!("cut failed: {other:?}"),
+    };
+    world.finish_all_falls(None);
+    // A notch sawn into the log where it lies.
+    let at = world.find(trunk).unwrap().transform().local_to_world_point([0.0, 0.5, 0.0]);
+    let notch = Edit::carve(Shape::Sphere { radius: 0.06 }, at, 0.01, None, PERSON);
+    let sawn = act(&mut world, &mut body, Action::Sculpt { edit: notch, hit: at, tool: Tool::Saw, target: SculptTarget::Element(trunk) });
+    assert!(sawn.is_done(), "{sawn:?}");
+    // Carried and set down on its side by the stone wall.
+    assert!(act(&mut world, &mut body, Action::Grab { id: trunk }).is_done());
+    let side = [0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
+    assert!(act(&mut world, &mut body, Action::Drop { pos: [52.6, 0.2, 30.0], rot: side }).is_done());
+    let save = world.to_save();
+    let el = save.elements.iter().find(|e| e.id == trunk).unwrap();
+    assert!(!el.local_edits.is_empty());
+    assert_eq!(verify_save_edits(&save, None, &repo_root(), Limits::default(), ModuleCheck::Strict).unwrap(), Ok(()));
+}
+
+#[test]
+fn an_uprooted_tree_once_grabbed_stays_held() {
+    use plateau_engine::graph::{GraphDelta, Relation};
+    let mut world = open(garden_save(WorldMode::World));
+    let mut body = person(&mut world);
+    let tree = place_tree(&mut world, &mut body, LAWN, 11);
+    // A size that could carry the tree but not pull up its roots.
+    let size = SIZES
+        .iter()
+        .map(|s| s.1)
+        .find(|&size| {
+            body.size = size;
+            matches!(act(&mut world, &mut body, Action::Grab { id: tree }), Outcome::Denied(r) if r.contains("Rooted in the ground"))
+        })
+        .expect("some size is held only by the roots");
+    body.size = size;
+    world.graph.add(Relation::uprooted(tree), &mut GraphDelta::default());
+    let grabbed = act(&mut world, &mut body, Action::Grab { id: tree });
+    assert!(grabbed.is_done(), "{grabbed:?}");
+    assert!(world.can_still_hold("local", size), "what grabbing allowed, holding allows");
 }

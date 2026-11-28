@@ -72,7 +72,7 @@ fn bark_east(sdf: &MeshSdf, y: f32) -> f32 {
 fn a_carved_tree_keeps_its_own_triangles_and_remakes_only_the_carve() {
     let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
     let scene = tree_scene(&mut catalog);
-    let sdf = catalog.get_or_build_mesh_sdf(TREE, 7, &[]).unwrap().unwrap();
+    let sdf = catalog.get_or_build_mesh_sdf(TREE, 7, &[], &[]).unwrap().unwrap();
     let source = Carving::source_of(TREE, 7, &[]);
 
     let uncarved = Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), edits: Vec::new() });
@@ -167,7 +167,7 @@ fn a_carved_tree_keeps_its_own_triangles_and_remakes_only_the_carve() {
 fn a_rim_cut_by_a_box_stays_sharp() {
     let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
     let scene = tree_scene(&mut catalog);
-    let sdf = catalog.get_or_build_mesh_sdf(TREE, 7, &[]).unwrap().unwrap();
+    let sdf = catalog.get_or_build_mesh_sdf(TREE, 7, &[], &[]).unwrap().unwrap();
     let east = bark_east(&sdf, 1.0);
     // A flat-floored notch: its floor at y = 0.94, cut in from the east.
     let edit = Edit::carve(Shape::Box { half: [0.3, 0.06, 0.6], round: 0.0 }, [east + 0.15, 1.0, 0.0], 0.0, None, PERSON);
@@ -207,7 +207,7 @@ fn a_sculpted_tree_draws_itself_carved_and_the_chunks_leave_it_out() {
     let mut body = Body::standing(&mut world.combined(), [LAWN[0] as f64 - 3.0, 40.0, LAWN[2] as f64], PERSON).unwrap();
     let tree = done(world.apply(
         Actor { id: "local", body: &mut body },
-        Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7) },
+        Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7), params: Vec::new() },
     ))
     .added[0];
     let solid_before = world.runtime.local_scene_of(tree).unwrap().instances.iter().filter(|i| i.solid).count();

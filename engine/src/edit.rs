@@ -178,15 +178,19 @@ pub struct Edit {
     /// Tool used to make this edit (`Tool::All` for legacy saves/logs that omit it; `WORLD_PLAN.md`, phase H).
     #[serde(default)]
     pub tool: Tool,
+    /// The mode the world was in when this edit was made (`Workshop` for legacy saves and engine-made
+    /// edits), so a save that changed mode is verified edit by edit under the rules then in force.
+    #[serde(default, skip_serializing_if = "WorldMode::is_workshop")]
+    pub mode: WorldMode,
 }
 
 impl Edit {
     pub fn add(shape: Shape, center: [f32; 3], blend: f32, material: Material, stamp_size: f32) -> Edit {
-        Edit { op: Op::Add, shape, center, blend, material: Some(material), stamp_size, tool: Tool::All }
+        Edit { op: Op::Add, shape, center, blend, material: Some(material), stamp_size, tool: Tool::All, mode: WorldMode::Workshop }
     }
 
     pub fn carve(shape: Shape, center: [f32; 3], blend: f32, material: Option<Material>, stamp_size: f32) -> Edit {
-        Edit { op: Op::Carve, shape, center, blend, material, stamp_size, tool: Tool::All }
+        Edit { op: Op::Carve, shape, center, blend, material, stamp_size, tool: Tool::All, mode: WorldMode::Workshop }
     }
 
     pub fn with_tool(mut self, tool: Tool) -> Edit {
@@ -693,6 +697,12 @@ impl WorldSave {
             if let Some(author) = &el.author {
                 s.push_str(&format!(" author {author}"));
             }
+            if !el.params.is_empty() {
+                s.push_str(&format!(" params {}", el.params.len()));
+                for p in &el.params {
+                    s.push_str(&format!(" {p}"));
+                }
+            }
             s.push('\n');
             for le in &el.local_edits {
                 write_sdf_record(&mut s, &format!("el-sdf {}", el.id), le, None);
@@ -872,6 +882,7 @@ fn write_sdf_record(s: &mut String, prefix: &str, e: &Edit, author: Option<&str>
     let mat = e.material.map_or("none", Material::name);
     let [cx, cy, cz] = e.center;
     let tool = format!(" tool {}", e.tool.save_name());
+    let tool = if e.mode == WorldMode::World { format!("{tool} mode world") } else { tool };
     let auth = author.map_or_else(String::new, |a| format!(" author {a}"));
     match e.shape {
         Shape::Sphere { radius } => {
@@ -986,6 +997,7 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<(Edit, Option<String>)> 
     expect(tail + 4, "size")?;
     let stamp_size = pf(tail + 5)?;
     let mut tool: Option<Tool> = None;
+    let mut mode: Option<WorldMode> = None;
     let mut author: Option<String> = None;
     let mut idx = tail + 6;
     while idx < tok.len() {
@@ -996,6 +1008,14 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<(Edit, Option<String>)> 
                 }
                 let name = tok.get(idx + 1).copied().ok_or_else(|| wasmtime::format_err!("line {line_no}: missing tool name"))?;
                 tool = Some(Tool::from_name(name).ok_or_else(|| wasmtime::format_err!("line {line_no}: unknown tool `{name}`"))?);
+                idx += 2;
+            }
+            "mode" => {
+                if mode.is_some() {
+                    bail!("line {line_no}: duplicate `mode` in sdf record");
+                }
+                let name = tok.get(idx + 1).copied().ok_or_else(|| wasmtime::format_err!("line {line_no}: missing mode name"))?;
+                mode = Some(WorldMode::from_name(name).ok_or_else(|| wasmtime::format_err!("line {line_no}: unknown mode `{name}`"))?);
                 idx += 2;
             }
             "author" => {
@@ -1009,7 +1029,7 @@ fn parse_sdf_line(line: &str, line_no: usize) -> Result<(Edit, Option<String>)> 
             other => bail!("line {line_no}: trailing token `{other}` in sdf record"),
         }
     }
-    Ok((Edit { op, shape, center, blend, material, stamp_size, tool: tool.unwrap_or(Tool::All) }, author))
+    Ok((Edit { op, shape, center, blend, material, stamp_size, tool: tool.unwrap_or(Tool::All), mode: mode.unwrap_or_default() }, author))
 }
 
 fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
@@ -1048,6 +1068,7 @@ fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
     let mut promoted = None;
     let mut clips = Vec::new();
     let mut author = None;
+    let mut params = Vec::new();
     let mut idx = 17;
     while idx < tok.len() {
         match tok[idx] {
@@ -1075,10 +1096,25 @@ fn parse_element_line(line: &str, line_no: usize) -> Result<PlacedElement> {
                 author = Some((*a).to_string());
                 idx += 2;
             }
+            "params" => {
+                if !params.is_empty() {
+                    bail!("line {line_no}: duplicate `params` in element record");
+                }
+                let n = tok
+                    .get(idx + 1)
+                    .ok_or_else(|| wasmtime::format_err!("line {line_no}: missing params count"))?
+                    .parse::<usize>()
+                    .map_err(|e| wasmtime::format_err!("line {line_no}: bad params count: {e}"))?;
+                if n == 0 || n > crate::wasm::MOST_PARAMS {
+                    bail!("line {line_no}: an element has 1 to {} params, not {n}", crate::wasm::MOST_PARAMS);
+                }
+                params = (0..n).map(|k| pf(idx + 2 + k)).collect::<Result<_>>()?;
+                idx += 2 + n;
+            }
             other => bail!("line {line_no}: unknown element field `{other}`"),
         }
     }
-    Ok(PlacedElement { id, module, seed, pos, yaw, rot, scale, stamp_size, after_edits, promoted, clips, local_edits: Vec::new(), author })
+    Ok(PlacedElement { id, module, seed, pos, yaw, rot, scale, stamp_size, after_edits, promoted, clips, local_edits: Vec::new(), author, params })
 }
 
 fn material_from_name(name: &str) -> Option<Material> {

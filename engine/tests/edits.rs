@@ -257,7 +257,7 @@ fn undo_and_validation() {
     // Invalid edits rejected.
     assert!(log.push(Edit::add(Shape::Sphere { radius: 0.0 }, [0.0; 3], 0.0, Material::Soil, 1.7)).is_err());
     assert!(log.push(Edit::add(Shape::Sphere { radius: f32::NAN }, [0.0; 3], 0.0, Material::Soil, 1.7)).is_err());
-    assert!(log.push(Edit { op: Op::Add, shape: Shape::Sphere { radius: 1.0 }, center: [0.0; 3], blend: 0.0, material: None, stamp_size: 1.7, tool: plateau_engine::Tool::All }).is_err());
+    assert!(log.push(Edit { op: Op::Add, shape: Shape::Sphere { radius: 1.0 }, center: [0.0; 3], blend: 0.0, material: None, stamp_size: 1.7, tool: plateau_engine::Tool::All, mode: plateau_engine::WorldMode::Workshop }).is_err());
     assert!(log.push(Edit::carve(Shape::Sphere { radius: 1.0 }, [0.0; 3], -0.1, None, 1.7)).is_err());
     assert_eq!(log.revision(), 0);
 

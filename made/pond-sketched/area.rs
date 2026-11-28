@@ -205,7 +205,7 @@ impl Area for Pond {
         let solid = self.ground(p, view, &lie).or(self.stones(p, view)).or(self.rock(p, view));
         let solid = self.hollow(solid, p, view);
         let solid = solid.or(self.nest(p, view)).or(self.willow(p, view)).or(self.trees(p, view)).or(self.log(p, view));
-        let solid = solid.or(self.bushes(p, view, &lie)).or(self.heron(p, view));
+        let solid = deepen(solid.or(self.bushes(p, view, &lie)).or(self.heron(p, view)));
         let water = Answer::new(max(p.y - LEVEL, lie.raw - 3.0), Material::Water).cut(solid.distance);
         solid.or(water).or(self.lilies(p, view, lie.raw))
     }
@@ -1423,4 +1423,17 @@ impl Pond {
         }
         best
     }
+}
+
+/// Materials go down (`make/GUIDE.md`): a thin coat (grass, moss, leaf) only near a surface,
+/// giving way to what lies under it with depth.
+fn deepen(a: Answer) -> Answer {
+    let depth = -a.distance;
+    let material = match a.material {
+        Material::Grass => strata(depth, &[(Material::Grass, 0.08), (Material::Soil, 0.7), (Material::Stone, 0.0)]),
+        Material::Moss => strata(depth, &[(Material::Moss, 0.04), (Material::Stone, 0.0)]),
+        Material::Leaf => strata(depth, &[(Material::Leaf, 0.08), (Material::Wood, 0.0)]),
+        m => m,
+    };
+    Answer::new(a.distance, material)
 }

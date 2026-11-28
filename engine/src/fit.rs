@@ -7,6 +7,12 @@
 //!   bare opening still walks in through the open door, and `F` shuts it as tight as it was.
 //! - **`ground_fit`**, for anywhere else: the element stands on the ground in every quarter of its
 //!   footprint (over water it may reach out), and is not buried.
+//! - **`span_fit`**, for a bridge: its ends rest on both banks, it spans a gap between them, and
+//!   whoever it is meant for walks across it from end to end on its deck.
+//! - **`wall_fit`**, for a shelf or a sign: it meets the wall over its back face, neither standing
+//!   off it nor sunk into it.
+//! - **`style_fit`**, for any: how much of it is made of what is round about the site; never a
+//!   failing, a note for the `look` round when little is.
 //! - **`fit_check`** asks whichever the site calls for.
 //! - **`fit_transform`** finds where an element made for no site in particular goes: turned to face
 //!   out of the opening, and scaled until its frame just goes into the wall all round.
@@ -15,7 +21,7 @@
 //! pressed by a player standing before the door with the crosshair on it, `tick`ed at 30 Hz.
 //! Like the site's own measure, the verdicts are IEEE arithmetic all the way: the same everywhere.
 
-use crate::body::{EYE, RADIUS};
+use crate::body::{Body, EYE, Intent, RADIUS, STEP as CLIMB};
 use crate::compose::{CompiledElement, ElementRuntime, PlacedElement, PlacementTransform};
 use crate::laws::{Verdict, length};
 use crate::mesh_sdf::MeshSdf;
@@ -190,7 +196,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(world: &SceneWorld, element: &CompiledElement, seed: u64, tf: PlacementTransform, size: f32) -> Result<Rig> {
+    fn new(world: &SceneWorld, element: &CompiledElement, seed: u64, params: &[f32], tf: PlacementTransform, size: f32) -> Result<Rig> {
         let mut rig = Rig { runtime: ElementRuntime::new(), world: world.clone(), time: 0.0, size };
         let placed = PlacedElement {
             id: JUDGED,
@@ -206,6 +212,7 @@ impl Rig {
             clips: Vec::new(),
             local_edits: Vec::new(),
             author: None,
+            params: params.to_vec(),
         };
         rig.runtime.spawn_for_size(placed, element, &mut rig.world, size)?;
         Ok(rig)
@@ -269,21 +276,22 @@ impl Rig {
     }
 }
 
-/// Holds `element`, placed at `tf` with `seed`, to the opening of `site` in `area` (with `world`'s
-/// solid geometry about it): how it fits, or why it does not.
+/// Holds `element`, placed at `tf` with `seed` and `params`, to the opening of `site` in `area`
+/// (with `world`'s solid geometry about it): how it fits, or why it does not.
 pub fn cavity_fit(
     area: &mut dyn Region,
     world: &SceneWorld,
     site: &SiteContext,
     element: &CompiledElement,
     seed: u64,
+    params: &[f32],
     tf: PlacementTransform,
 ) -> Result<std::result::Result<CavityFit, String>> {
     let Some(cavity) = &site.cavity else { return Ok(Err("there is no opening here to fit".into())) };
     if element.is_sdf() {
         return Ok(Err("what fits an opening is made of meshes (`sdf_bounds() == None`), not a landform that fills it".into()));
     }
-    let scene = element.compiled.instantiate(seed)?.scene()?;
+    let scene = element.compiled.instantiate_with(seed, params)?.scene()?;
     let rim = {
         let mut combined = Combined { region: &mut *area, world };
         match rim_fit(&mut combined, site, &scene, tf)? {
@@ -291,7 +299,7 @@ pub fn cavity_fit(
             Err(why) => return Ok(Err(why)),
         }
     };
-    let mut rig = Rig::new(world, element, seed, tf, site.size)?;
+    let mut rig = Rig::new(world, element, seed, params, tf, site.size)?;
     let reach = rig.reach(&scene, tf, cavity);
     let (shut, beside) = rig.past(area, cavity, reach)?;
     // Most of it filled is a leaf: it must fill it all, open, and shut again.
@@ -342,8 +350,16 @@ pub fn cavity_fit(
 
 /// `world` with `element` placed at `tf` in it, as it is found, or (`pressed`) once whoever measured
 /// `site` has pressed `F` before it and what moves has moved: for picturing it.
-pub fn staged(world: &SceneWorld, site: &SiteContext, element: &CompiledElement, seed: u64, tf: PlacementTransform, pressed: bool) -> Result<SceneWorld> {
-    let mut rig = Rig::new(world, element, seed, tf, site.size)?;
+pub fn staged(
+    world: &SceneWorld,
+    site: &SiteContext,
+    element: &CompiledElement,
+    seed: u64,
+    params: &[f32],
+    tf: PlacementTransform,
+    pressed: bool,
+) -> Result<SceneWorld> {
+    let mut rig = Rig::new(world, element, seed, params, tf, site.size)?;
     if pressed {
         let h = site.size;
         let out = tf.local_to_world_dir([0.0, 0.0, 1.0]);
@@ -414,15 +430,326 @@ pub fn ground_fit(area: &mut dyn Region, size: f32, scene: &Scene, tf: Placement
     Ok(Ok(()))
 }
 
-/// Holds an element made for `site` to it, where it is placed for it (`site.frame`): to its opening
-/// if it has one (`cavity_fit`), else to its ground (`ground_fit`).
-pub fn fit_check(area: &mut dyn Region, world: &SceneWorld, site: &SiteContext, element: &CompiledElement, seed: u64) -> Result<Verdict> {
-    if site.cavity.is_some() {
-        return Ok(cavity_fit(area, world, site, element, seed, site.frame)?.map(|_| ()));
+/// How much of a span's length at each end is its end, resting on a bank.
+const SPAN_END: f32 = 0.15;
+/// How many points along it are looked at.
+const SPAN_STATIONS: usize = 32;
+
+/// Holds `scene`, placed at `tf` in `area` (with `world`'s solid geometry about it, but not the
+/// element's own), to what a bridge is: its solid deck runs along its longer local axis (x or z),
+/// both its ends rest on the ground (dry ground, not water), there is a gap under its middle (ground
+/// lower than the banks by at least a fifth of the smallest of `sizes`, or water), nothing rises through
+/// its deck, and someone of each of `sizes` walks across it from one end to the other on it,
+/// neither too wide for it nor falling off.
+pub fn span_fit(area: &mut dyn Region, world: &SceneWorld, scene: &Scene, tf: PlacementTransform, sizes: &[f32]) -> Result<Verdict> {
+    let Some(solid) = MeshSdf::from_solid_scene(scene) else { return Ok(Err("it has no solid deck to span with".into())) };
+    let (lo, hi) = (solid.lo(), solid.hi());
+    let along = if hi[0] - lo[0] > hi[2] - lo[2] { 0 } else { 2 };
+    let across = 2 - along;
+    let (start, end) = (lo[along], hi[along]);
+    let long = end - start;
+    let mid = 0.5 * (lo[across] + hi[across]);
+    let tall = hi[1] - lo[1];
+    let steps = 96usize;
+    let y = |k: usize| lo[1] + tall * (k as f32 + 0.5) / steps as f32;
+    let local = |t: f32, c: f32, y: f32| {
+        let mut p = [0.0f32; 3];
+        p[along] = t;
+        p[across] = c;
+        p[1] = y;
+        p
+    };
+    // The deck's bottom and top at each station, along its middle (world), where there is deck.
+    let mut deck: Vec<(f32, [f32; 3], [f32; 3])> = Vec::new();
+    for i in 0..SPAN_STATIONS {
+        let t = start + long * (i as f32 + 0.5) / SPAN_STATIONS as f32;
+        let Some(first) = (0..steps).find(|&k| inside(&solid, local(t, mid, y(k)))) else { continue };
+        let last = (0..steps).rev().find(|&k| inside(&solid, local(t, mid, y(k)))).unwrap_or(first);
+        deck.push(((t - start) / long, tf.local_to_world_point(local(t, mid, y(first))), tf.local_to_world_point(local(t, mid, y(last)))));
     }
-    let scene = element.compiled.instantiate(seed)?.scene()?;
+    if deck.len() < SPAN_STATIONS / 2 {
+        return Ok(Err("it has no deck running along it from end to end".into()));
+    }
+    let wide = (hi[across] - lo[across]) * tf.scale;
+    for &size in sizes {
+        if wide < 2.4 * RADIUS * size {
+            return Ok(Err(format!("its deck is {} wide, too narrow for someone {} tall", length(wide), length(size))));
+        }
+    }
+    let least = sizes.iter().copied().fold(f32::INFINITY, min);
+    let least = if least.is_finite() { least } else { crate::SIZES[1].1 };
+    let top = deck.iter().map(|d| d.2[1]).fold(f32::NEG_INFINITY, max) + 3.0 * least;
+    let rays: Vec<Ray> = deck.iter().map(|d| Ray { from: [d.1[0], top, d.1[2]], along: [0.0, -1.0, 0.0], far: 60.0 * least + 4.0 * tall * tf.scale }).collect();
+    let (wet, dry) = {
+        let mut combined = Combined { region: &mut *area, world };
+        let mut sight = Sight::new(&mut combined, least);
+        (sight.cast(&rays, true)?, sight.cast(&rays, false)?)
+    };
+    let give = 0.02 * tf.scale + tall * tf.scale / steps as f32;
+    let ground = |k: usize| dry[k].map(|h| top - h.t);
+    let watery = |k: usize| wet[k].is_some_and(|w| w.material == Material::Water && dry[k].is_none_or(|d| w.t < d.t - 1e-4));
+    // Each end rests on a bank.
+    for (name, near) in [("near", true), ("far", false)] {
+        let ends: Vec<usize> = (0..deck.len()).filter(|&k| if near { deck[k].0 < SPAN_END } else { deck[k].0 > 1.0 - SPAN_END }).collect();
+        if ends.is_empty() {
+            return Ok(Err(format!("its {name} end has no deck")));
+        }
+        if ends.iter().all(|&k| watery(k)) {
+            return Ok(Err(format!("its {name} end stands in water, not on a bank")));
+        }
+        let off = ends.iter().map(|&k| ground(k).map_or(f32::INFINITY, |g| deck[k].1[1] - g)).fold(f32::INFINITY, min);
+        if off > give {
+            return Ok(Err(format!(
+                "its {name} end does not rest on the bank: it is {} ({:.3} m local) above the ground there; lengthen it or lower its ends",
+                if off.is_finite() { length(off) } else { "far".into() },
+                off / tf.scale
+            )));
+        }
+    }
+    // A gap under its middle (ground lower than under its ends, or water), and nothing rising
+    // through its deck.
+    let bank = (0..deck.len())
+        .filter(|&k| deck[k].0 < SPAN_END || deck[k].0 > 1.0 - SPAN_END)
+        .filter_map(ground)
+        .fold(f32::INFINITY, min);
+    let mut gap = 0.0f32;
+    for k in (0..deck.len()).filter(|&k| deck[k].0 >= SPAN_END && deck[k].0 <= 1.0 - SPAN_END) {
+        let below = if watery(k) { f32::INFINITY } else { ground(k).map_or(f32::INFINITY, |g| bank - g) };
+        gap = max(gap, below);
+        if let Some(g) = ground(k)
+            && g > deck[k].2[1] + give
+        {
+            return Ok(Err(format!("the ground rises through its deck, {:.0}% of the way across", deck[k].0 * 100.0)));
+        }
+    }
+    if gap < 0.2 * least {
+        return Ok(Err(format!("it spans no gap: the ground under its middle is at most {} below the banks it rests on", length(max(gap, 0.0)))));
+    }
+    // Walked across, end to end, by each it is meant for.
+    let mut on = world.clone();
+    on.add_layer(JUDGED, scene, Some(tf));
+    let mut combined = Combined { region: area, world: &on };
+    let (first, last) = (deck[0], deck[deck.len() - 1]);
+    let way = unit(sub(last.2, first.2)).unwrap_or([0.0, 0.0, 1.0]);
+    let span = {
+        let d = sub(last.2, first.2);
+        (d[0] * d[0] + d[2] * d[2]).sqrt()
+    };
+    let lowest = deck.iter().map(|d| d.2[1]).fold(f32::INFINITY, min);
+    for &size in sizes {
+        let from = add(first.2, [0.0, 2.0 * size, 0.0]);
+        let mut body = Body::standing(&mut combined, from.map(|c| c as f64), size)?;
+        body.yaw = crate::math::atan2(-way[0], -way[2]);
+        let start = body.feet;
+        let gone = |b: &Body| ((b.feet[0] - start[0]) * way[0] as f64 + (b.feet[2] - start[2]) * way[2] as f64) as f32;
+        let mut deepest = body.feet[1] as f32;
+        let speed_steps = (60.0 * (span / size) * 2.0) as usize + 120;
+        for _ in 0..speed_steps.min(20_000) {
+            body.step(&mut combined, Intent { forward: 1.0, ..Intent::default() }, 1.0 / 60.0)?;
+            deepest = min(deepest, body.feet[1] as f32);
+            if gone(&body) >= span {
+                break;
+            }
+        }
+        if deepest < lowest - CLIMB * size - give {
+            return Ok(Err(format!(
+                "someone {} tall falls off it, {:.0}% of the way across: {} below its deck",
+                length(size),
+                100.0 * gone(&body) / span,
+                length(lowest - deepest)
+            )));
+        }
+        if gone(&body) < span {
+            return Ok(Err(format!("someone {} tall gets only {:.0}% of the way across it", length(size), 100.0 * max(gone(&body), 0.0) / span)));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// How much of an element's back must meet the wall.
+const WALL_MET: f32 = 0.75;
+/// The back's grid, a side.
+const WALL_GRID: usize = 12;
+
+/// Where on an element's back a point is, in words, as seen from before it.
+fn part(x: f32, y: f32) -> &'static str {
+    match (y > 0.33, y < -0.33, x > 0.33, x < -0.33) {
+        (true, _, true, _) => "top right",
+        (true, _, _, true) => "top left",
+        (true, ..) => "top",
+        (_, true, true, _) => "bottom right",
+        (_, true, _, true) => "bottom left",
+        (_, true, ..) => "bottom",
+        (.., true, _) => "right",
+        (.., true) => "left",
+        _ => "middle",
+    }
+}
+
+/// Holds `scene`, placed at `tf` in `area` (with `world`'s solid geometry about it, but not the
+/// element's own), to a wall: its solid's back face (its local -Z side) meets the wall behind it
+/// over at least three quarters of it, standing off it by no more than a little and sunk into it by
+/// no more than a little more.
+pub fn wall_fit(area: &mut dyn Region, world: &SceneWorld, scene: &Scene, tf: PlacementTransform, size: f32) -> Result<Verdict> {
+    let Some(solid) = MeshSdf::from_solid_scene(scene) else { return Ok(Err("it has no solid back to meet a wall with".into())) };
+    let (lo, hi) = (solid.lo(), solid.hi());
+    let thick = hi[2] - lo[2];
+    let give = 0.02 * tf.scale;
+    let probe = lo[2] + min(0.1 * thick, 0.01);
+    // The back: where the solid is just in front of its least z.
+    let mut back = Vec::new();
+    for i in 0..WALL_GRID {
+        for j in 0..WALL_GRID {
+            let x = lo[0] + (hi[0] - lo[0]) * (i as f32 + 0.5) / WALL_GRID as f32;
+            let y = lo[1] + (hi[1] - lo[1]) * (j as f32 + 0.5) / WALL_GRID as f32;
+            if inside(&solid, [x, y, probe]) {
+                let (cx, cy) = (0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]));
+                back.push((part((x - cx) / max(0.5 * (hi[0] - lo[0]), 1e-6), (y - cy) / max(0.5 * (hi[1] - lo[1]), 1e-6)), [x, y]));
+            }
+        }
+    }
+    if back.is_empty() {
+        return Ok(Err("it has no flat back facing -Z to meet a wall with".into()));
+    }
+    // From a little in front of the back, in towards the wall.
+    let into = tf.local_to_world_dir([0.0, 0.0, -1.0]);
+    let into = unit(into).unwrap_or([0.0, 0.0, -1.0]);
+    let before = 3.0 * give;
+    let rays: Vec<Ray> =
+        back.iter().map(|(_, [x, y])| Ray { from: tf.local_to_world_point([*x, *y, lo[2] + before / tf.scale]), along: into, far: before + 2.0 * size }).collect();
+    let hits = {
+        let mut combined = Combined { region: area, world };
+        Sight::new(&mut combined, size).cast(&rays, false)?
+    };
+    let (mut met, mut off, mut sunk): (usize, Option<(f32, &str)>, Option<&str>) = (0, None, None);
+    for ((name, _), hit) in back.iter().zip(&hits) {
+        match hit {
+            // Started within the wall: sunk in more than three gives.
+            Some(h) if h.t <= 0.0 => {
+                sunk.get_or_insert(*name);
+            }
+            Some(h) if h.t - before <= give => met += 1,
+            Some(h) => {
+                if off.is_none_or(|(o, _)| h.t - before > o) {
+                    off = Some((h.t - before, *name));
+                }
+            }
+            None => {
+                if off.is_none_or(|(o, _)| o.is_finite()) {
+                    off = Some((f32::INFINITY, *name));
+                }
+            }
+        }
+    }
+    if met as f32 >= WALL_MET * back.len() as f32 {
+        return Ok(Ok(()));
+    }
+    let share = 100.0 * met as f32 / back.len() as f32;
+    Ok(Err(match (sunk, off) {
+        (Some(at), _) if met == 0 || off.is_none() => format!("it is sunk into the wall at its {at}: its back must lie on the wall's face, not within it"),
+        (_, Some((o, at))) if o.is_infinite() => format!("there is no wall behind its {at} (its back meets the wall over only {share:.0}% of it)"),
+        (_, Some((o, at))) => format!(
+            "a gap of {} ({:.3} m local) is left between its back and the wall at its {at}; its back meets the wall over only {share:.0}% of it (at least {:.0}%)",
+            length(o),
+            o / tf.scale,
+            WALL_MET * 100.0
+        ),
+        _ => format!("its back meets the wall over only {share:.0}% of it"),
+    }))
+}
+
+/// How much of an element is made of what is round about its site.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleFit {
+    /// The share of its surface (by area, as placed) made of a material that is at least a
+    /// twentieth of what the site's surfaces round about are made of.
+    pub share: f32,
+    /// Its own materials, most first, as shares of one.
+    pub materials: Vec<(Material, f32)>,
+    /// For the `look` round, when little of it is of its site: what to look at.
+    pub note: Option<String>,
+}
+
+/// How `scene` goes with what is round about `site` (`SiteContext::materials`): never a failing (an
+/// element may be meant to stand out), but noted when less than half of it is of what is there.
+pub fn style_fit(site: &SiteContext, scene: &Scene) -> StyleFit {
+    let mut by = [0.0f32; Material::ALL.len()];
+    for i in &scene.instances {
+        let Some(mesh) = scene.meshes.get(i.mesh as usize) else { continue };
+        let k = abs(i.scale[0] * i.scale[1] * i.scale[2]).sqrt();
+        for t in mesh.indices.as_chunks::<3>().0 {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|v| mesh.vertices.get(v as usize));
+            let (Some(a), Some(b), Some(c)) = (a, b, c) else { continue };
+            let (u, v) = (sub(b.pos, a.pos), sub(c.pos, a.pos));
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let area = 0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() * k;
+            by[a.material as usize] += area;
+        }
+    }
+    let total: f32 = by.iter().sum();
+    let mut materials: Vec<(Material, f32)> = Material::ALL.iter().map(|&m| (m, if total > 0.0 { by[m as usize] / total } else { 0.0 })).filter(|(_, k)| *k > 0.0).collect();
+    materials.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let round: Vec<Material> = site.materials.iter().filter(|(_, k)| *k >= 0.05).map(|(m, _)| *m).collect();
+    let share = materials.iter().filter(|(m, _)| round.contains(m)).map(|(_, k)| k).sum::<f32>();
+    let words = |ms: &[(Material, f32)]| ms.iter().take(3).map(|(m, k)| format!("{} {:.0}%", m.name(), k * 100.0)).collect::<Vec<_>>().join(", ");
+    let note = (share < 0.5 && !materials.is_empty()).then(|| {
+        format!(
+            "only {:.0}% of it is made of what is round about it (it is {}; round about is {}): look that it goes with its site, or stands out from it as it is meant to",
+            share * 100.0,
+            words(&materials),
+            words(&site.materials)
+        )
+    });
+    StyleFit { share, materials, note }
+}
+
+/// Holds an element made for `site` to it, where it is placed for it (`site.frame`), given `params`:
+/// to its opening if it has one (`cavity_fit`), else to its ground (`ground_fit`).
+pub fn fit_check(area: &mut dyn Region, world: &SceneWorld, site: &SiteContext, element: &CompiledElement, seed: u64, params: &[f32]) -> Result<Verdict> {
+    if site.cavity.is_some() {
+        return Ok(cavity_fit(area, world, site, element, seed, params, site.frame)?.map(|_| ()));
+    }
+    let scene = element.compiled.instantiate_with(seed, params)?.scene()?;
     let mut combined = Combined { region: area, world };
     ground_fit(&mut combined, site.size, &scene, site.frame)
+}
+
+/// Where an element goes to fit the opening of `site`, given what: placed where the site is
+/// (`site.frame`), given the site's params, if it makes itself to fit them; else given none, turned
+/// and scaled to fit (`fit_transform`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fitted {
+    pub tf: PlacementTransform,
+    pub params: Vec<f32>,
+    pub rim: RimFit,
+}
+
+/// Where `element` goes to fit the opening of `site` in `area` (with `world`'s solid geometry), and
+/// what it is given: the site's params, where the site is, if it then fits (it made itself for the
+/// opening); else none, turned and scaled to fit if it can be. Its rim is judged as made with
+/// `seed`; `cavity_fit` holds it to the rest.
+pub fn fit_to_site(area: &mut dyn Region, world: &SceneWorld, site: &SiteContext, element: &CompiledElement, seed: u64) -> Result<std::result::Result<Fitted, String>> {
+    if site.cavity.is_none() {
+        return Ok(Err("there is no opening here to fit".into()));
+    }
+    if element.is_sdf() {
+        return Ok(Err("what fits an opening is made of meshes (`sdf_bounds() == None`), not a landform that fills it".into()));
+    }
+    let params = site.params();
+    let made = element.compiled.instantiate_with(seed, &params)?.scene()?;
+    let by_params = {
+        let mut combined = Combined { region: &mut *area, world };
+        rim_fit(&mut combined, site, &made, site.frame)?
+    };
+    let made_for_it = match by_params {
+        Ok(rim) => return Ok(Ok(Fitted { tf: site.frame, params, rim })),
+        Err(why) => why,
+    };
+    let scene = element.compiled.instantiate(seed)?.scene()?;
+    Ok(match fit_transform(area, world, site, &scene)? {
+        Ok((tf, rim)) => Ok(Fitted { tf, params: Vec::new(), rim }),
+        Err(why) => Err(format!("given the site's params, {made_for_it}; given none, turned and scaled to fit, {why}")),
+    })
 }
 
 /// Where `element` goes to fit the opening of `site`, and how its rim does: as it was made, if it was

@@ -395,6 +395,7 @@ fn world_save_phase_a_manifest_round_trips_bit_exactly_and_preserves_legacy_save
         clips: Vec::new(),
         local_edits: Vec::new(),
         author: Some("eve".into()),
+        params: Vec::new(),
     }];
 
     let mut save = WorldSave::with_elements("The walled garden", 7, edits, elements);

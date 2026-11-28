@@ -41,6 +41,35 @@ pub const GRID: usize = 7;
 /// Current site file format version.
 pub const SITE_VERSION: u32 = 1;
 
+/// What a site gives an element placed for it (`SiteContext::params`, `host.params` of
+/// `plateau:region@0.2.0`): this many numbers, each at its index below, lengths in the frame's
+/// local metres (`ELEMENT_GUIDE.md`, "Params"). Without an opening, all but `P_OPENING` are 0.
+pub const PARAMS: usize = P_RADII + SPOKES;
+/// 1 if there is an opening, else 0.
+pub const P_OPENING: usize = 0;
+/// Its outline's width and height.
+pub const P_WIDTH: usize = 1;
+pub const P_HEIGHT: usize = 2;
+/// How high its middle is above the sill (the origin): the middle the radii are measured from is
+/// (0, this, 0).
+pub const P_MIDDLE: usize = 3;
+/// How far in it goes along -Z, and 1 if it goes on through, open behind.
+pub const P_DEPTH: usize = 4;
+pub const P_THROUGH: usize = 5;
+/// The least wall there is beyond its outline at the rim.
+pub const P_WALL: usize = 6;
+/// 1 for a circle, less the less round it is (`Cavity::roundness`).
+pub const P_ROUND: usize = 7;
+/// From floor to ceiling inside, and 1 if whoever measured it walks in through it.
+pub const P_HEADROOM: usize = 8;
+pub const P_WALKABLE: usize = 9;
+/// The first of `SPOKES` distances from the middle to the outline, in the rim's plane (z = 0), at
+/// even angles anticlockwise from straight right (+X) as seen from outside: the `k`th towards
+/// (cos a, sin a) for a = k / SPOKES of a turn. The whole outline as it was measured (`CONTOUR`
+/// points): fewer would cut a square doorway's corners.
+pub const P_RADII: usize = 10;
+pub const SPOKES: usize = CONTOUR;
+
 /// Person height in metres: a site's local frame is scaled so whoever measured it is this tall.
 const PERSON: f32 = SIZES[1].1;
 /// An opening is looked for and measured within this many of the player's heights.
@@ -504,6 +533,74 @@ impl SiteContext {
             .collect()
     }
 
+    /// What an element placed for this site is given (`host.params`): `PARAMS` numbers, laid out
+    /// as `P_OPENING` and those after it say, in the frame's local metres.
+    pub fn params(&self) -> Vec<f32> {
+        let mut p = vec![0.0f32; PARAMS];
+        let Some(c) = &self.cavity else { return p };
+        let l = |m: f32| self.local(m);
+        p[P_OPENING] = 1.0;
+        p[P_WIDTH] = l(c.width());
+        p[P_HEIGHT] = l(c.height());
+        p[P_MIDDLE] = l(c.drop());
+        p[P_DEPTH] = l(c.depth);
+        p[P_THROUGH] = c.through as u8 as f32;
+        p[P_WALL] = l(c.wall.iter().copied().fold(f32::INFINITY, min));
+        p[P_ROUND] = c.roundness();
+        p[P_HEADROOM] = l(c.headroom);
+        p[P_WALKABLE] = c.walkable as u8 as f32;
+        let n = c.radii.len();
+        for k in 0..SPOKES {
+            p[P_RADII + k] = l(c.radii[k * n / SPOKES]);
+        }
+        if !p[P_WALL].is_finite() {
+            p[P_WALL] = 0.0;
+        }
+        p
+    }
+
+    /// The site with its opening `wide` times as wide and `high` times as high about its sill, all
+    /// else as it was: one like it, to judge an element over a range of openings (`plateau
+    /// check-element`). Its headroom grows with it; whoever measured it walks in only if it grew.
+    pub fn varied(&self, wide: f32, high: f32) -> SiteContext {
+        let mut s = self.clone();
+        let Some(c) = &mut s.cavity else { return s };
+        let n = c.radii.len();
+        let drop = c.drop();
+        // About the middle, which stays over the sill, `high` times as far up.
+        let scaled: Vec<[f32; 2]> = (0..n).map(|k| {
+            let [x, y] = flat(&c.radii, k);
+            [x * wide, y * high]
+        }).collect();
+        let radii: Vec<f32> = (0..n)
+            .map(|j| {
+                let [dx, dy] = turn(j, n);
+                let mut far = 0.0f32;
+                for k in 0..n {
+                    let (p, q) = (scaled[k], scaled[(k + 1) % n]);
+                    let (ex, ey) = (q[0] - p[0], q[1] - p[1]);
+                    let den = dx * ey - dy * ex;
+                    if abs(den) < 1e-12 {
+                        continue;
+                    }
+                    let t = (p[0] * ey - p[1] * ex) / den;
+                    let u = (p[0] * dy - p[1] * dx) / den;
+                    if t > 0.0 && (-1e-6..=1.0 + 1e-6).contains(&u) {
+                        far = max(far, t);
+                    }
+                }
+                far
+            })
+            .collect();
+        let (_, up) = c.across();
+        let sill = add(c.center, scale(up, -drop));
+        c.center = add(sill, scale(up, drop * high));
+        c.radii = radii;
+        c.headroom *= high;
+        c.walkable &= wide >= 1.0 && high >= 1.0;
+        s
+    }
+
     /// A world length in the frame's local metres.
     pub fn local(&self, world: f32) -> f32 {
         world / self.frame.scale
@@ -632,6 +729,10 @@ impl SiteContext {
                 s += &format!("    {}\n", cells.join(" "));
             }
             s += "];\n```\n";
+            s += &format!(
+                "\nYour element is given these measures when it runs, too: `params()`, {PARAMS} numbers (\"Params\" in the guide), the \
+                 outline's radii among them. Build from those, not from the numbers above, so it fits every opening like this one.\n"
+            );
         }
         s
     }

@@ -4,8 +4,9 @@
 //! lanterns, carvable hills/arches, contraptions) onto any existing area at any scale
 //! (`tiny`, `person`, `giant`) without recompiling the base area:
 //!
-//! - **Same strict Wasmtime sandbox**: every element uses `plateau:region@0.1.0` (`check::check`,
-//!   fuel & memory caps, zero host capabilities beyond `seed()`).
+//! - **Same strict Wasmtime sandbox**: every element uses `plateau:region@0.2.0` or `0.1.0`
+//!   (`check::check`, fuel & memory caps, zero host capabilities beyond `seed()` and the pure data
+//!   of its placement's `params()`).
 //! - **Hybrid Layer Ownership**:
 //!   - Pure procedural `Scene` elements (`element_bounds() == None`) never touch SDF sampling or
 //!     invalidate terrain chunks; they add isolated meshes, solid collision, lights, and local-space
@@ -235,6 +236,9 @@ pub struct PlacedElement {
     pub local_edits: Vec<Edit>,
     /// Optional creator/owner player identifier (`None` for legacy saves / unclaimed elements).
     pub author: Option<String>,
+    /// What the element was given to fit, as `host.params` gives them (`plateau:region@0.2.0`;
+    /// empty for none, and for every `0.1.0` module). For a site, `SiteContext::params`.
+    pub params: Vec<f32>,
 }
 
 impl PlacedElement {
@@ -304,6 +308,7 @@ impl PlacedElement {
         for e in &self.local_edits {
             e.validate()?;
         }
+        crate::wasm::check_params(&self.params)?;
         if let Some(a) = &self.author
             && (a.is_empty() || a.chars().any(char::is_whitespace))
         {
@@ -318,8 +323,16 @@ pub struct CompiledElement {
     pub module: String,
     pub name: String,
     pub compiled: Arc<Compiled>,
+    /// Its bounds in the SDF layer given no params (`None`: it is all `Scene`); see `sdf_bounds_for`.
     pub sdf_bounds: Option<ElementBounds>,
+    /// Its scene given no params, to show before it is placed.
     pub preview_scene: Scene,
+    /// Its bounds for each set of params asked (by their bits).
+    bounds_by_params: std::sync::Mutex<HashMap<Vec<u32>, Option<ElementBounds>>>,
+}
+
+fn param_bits(params: &[f32]) -> Vec<u32> {
+    params.iter().map(|p| p.to_bits()).collect()
 }
 
 impl CompiledElement {
@@ -331,7 +344,22 @@ impl CompiledElement {
         let desc = probe.describe()?;
         let sdf_bounds = probe.element_bounds()?;
         let preview_scene = probe.scene()?;
-        Ok(Arc::new(CompiledElement { module, name: desc.name, compiled, sdf_bounds, preview_scene }))
+        Ok(Arc::new(CompiledElement { module, name: desc.name, compiled, sdf_bounds, preview_scene, bounds_by_params: Default::default() }))
+    }
+
+    /// Its bounds in the SDF layer for a placement given `params`: an element with params may grow
+    /// or shrink with them. `None` for a `Scene` element (which it is is not changed by params: one
+    /// that answers bounds for some params and not others counts as what it is given none), and if
+    /// the module cannot be asked (it is then refused where it is placed).
+    pub fn sdf_bounds_for(&self, params: &[f32]) -> Option<ElementBounds> {
+        let given = self.sdf_bounds?;
+        if params.is_empty() {
+            return Some(given);
+        }
+        let mut cache = self.bounds_by_params.lock().unwrap_or_else(|e| e.into_inner());
+        *cache
+            .entry(param_bits(params))
+            .or_insert_with(|| self.compiled.instantiate_with(1, params).and_then(|mut w| w.element_bounds()).ok().flatten())
     }
 
     pub fn is_sdf(&self) -> bool {
@@ -340,18 +368,18 @@ impl CompiledElement {
 
     /// Builds a deterministic element-local `MeshSdf` from all `solid: true` instances emitted by
     /// this element for `seed`, clipped by `clips`. Returns `Ok(None)` if no solid triangles remain.
-    pub fn build_mesh_sdf(&self, seed: u64, clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
-        let mut inst = self.compiled.instantiate(seed)?;
+    pub fn build_mesh_sdf(&self, seed: u64, params: &[f32], clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
+        let mut inst = self.compiled.instantiate_with(seed, params)?;
         let raw = inst.scene()?;
         let sc = clip_scene(&raw, clips);
         Ok(MeshSdf::from_solid_scene(&sc).map(Arc::new))
     }
 }
 
-type PromotedKey = (String, u64, Vec<[u32; 4]>);
+type PromotedKey = (String, u64, Vec<u32>, Vec<[u32; 4]>);
 
-fn promoted_key(module: &str, seed: u64, clips: &[ClipPlane]) -> PromotedKey {
-    (module.to_string(), seed, clips.iter().map(|c| c.key_bits()).collect())
+fn promoted_key(module: &str, seed: u64, params: &[f32], clips: &[ClipPlane]) -> PromotedKey {
+    (module.to_string(), seed, param_bits(params), clips.iter().map(|c| c.key_bits()).collect())
 }
 
 /// Caches compiled standalone element `.wasm` modules and lazily promoted `MeshSdf`s.
@@ -407,20 +435,25 @@ impl ElementCatalog {
     }
 
     /// Builds (or retrieves from cache) the exact local `MeshSdf` for a lazily promoted `Scene`
-    /// element `(module, seed, clips)`.
-    pub fn get_or_build_mesh_sdf(&mut self, module: &str, seed: u64, clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
-        let key = promoted_key(module, seed, clips);
+    /// element `(module, seed, params, clips)`.
+    pub fn get_or_build_mesh_sdf(&mut self, module: &str, seed: u64, params: &[f32], clips: &[ClipPlane]) -> Result<Option<Arc<MeshSdf>>> {
+        let key = promoted_key(module, seed, params, clips);
         if let Some(cached) = self.promoted_sdfs.get(&key) {
             return Ok(cached.clone());
         }
         let el = self.get_or_load(module)?;
-        let sdf = el.build_mesh_sdf(seed, clips)?;
+        let sdf = el.build_mesh_sdf(seed, params, clips)?;
         self.promoted_sdfs.insert(key, sdf.clone());
         Ok(sdf)
     }
 
-    pub fn cached_mesh_sdf(&self, module: &str, seed: u64, clips: &[ClipPlane]) -> Option<&Arc<MeshSdf>> {
-        self.promoted_sdfs.get(&promoted_key(module, seed, clips)).and_then(Option::as_ref)
+    /// `get_or_build_mesh_sdf` for the placement `pl` as it is.
+    pub fn mesh_sdf_of(&mut self, pl: &PlacedElement) -> Result<Option<Arc<MeshSdf>>> {
+        self.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.params, &pl.clips)
+    }
+
+    pub fn cached_mesh_sdf(&self, module: &str, seed: u64, params: &[f32], clips: &[ClipPlane]) -> Option<&Arc<MeshSdf>> {
+        self.promoted_sdfs.get(&promoted_key(module, seed, params, clips)).and_then(Option::as_ref)
     }
 
     pub fn root(&self) -> &Path {
@@ -627,7 +660,8 @@ pub struct Composed<R, L = Arc<ComposedLog>> {
     pub region: R,
     pub log: L,
     /// Per-thread cache of instantiated SDF element Wasmtime modules keyed by `PlacedElement::id`.
-    instances: HashMap<u32, (u64, Wasm)>,
+    /// Each SDF element's instance, with the seed and params it was made with.
+    instances: HashMap<u32, (u64, Vec<u32>, Wasm)>,
 }
 
 impl<R, L> Composed<R, L> {
@@ -748,14 +782,15 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
 
                     let id = entry.placed.id;
                     let seed = entry.placed.seed;
-                    let need_new = self.instances.get(&id).is_none_or(|(s, _)| *s != seed);
+                    let bits = param_bits(&entry.placed.params);
+                    let need_new = self.instances.get(&id).is_none_or(|(s, b, _)| *s != seed || *b != bits);
                     if need_new {
-                        let inst = compiled.instantiate(seed)?;
-                        self.instances.insert(id, (seed, inst));
+                        let inst = compiled.instantiate_with(seed, &entry.placed.params)?;
+                        self.instances.insert(id, (seed, bits, inst));
                     }
                     let local_size = (size / scale).clamp(SMALLEST, LARGEST);
                     let res = {
-                        let (_, wasm) = self.instances.get_mut(&id).unwrap();
+                        let (_, _, wasm) = self.instances.get_mut(&id).unwrap();
                         wasm.sample(&local_pts, local_size, &mut elem_out)
                     };
                     if let Err(e) = res {
@@ -902,7 +937,7 @@ impl ElementRuntime {
         carving: Option<Carving>,
     ) -> Result<Scene> {
         placed.validate()?;
-        let mut wasm = compiled.compiled.instantiate(placed.seed)?;
+        let mut wasm = compiled.compiled.instantiate_with(placed.seed, &placed.params)?;
         let raw_scene = wasm.scene()?;
         let clipped = clip_scene(&raw_scene, &placed.clips);
         let physics = ObjectPhysics::compute(&clipped, placed.scale);

@@ -18,9 +18,8 @@ use std::sync::Arc;
 use crate::chunk;
 use crate::compose::{PlacementTransform, quat_mul, quat_rotate};
 use crate::cut::{ObjectPhysics, format_mass};
-use crate::edit::{Edit, Shape};
+use crate::edit::Edit;
 use crate::mesh_sdf::MeshSdf;
-use crate::scene::SceneWorld;
 use crate::{Answer, Material, Region, Result, SIZES, math};
 
 const PERSON_HEIGHT: f32 = SIZES[1].1;
@@ -274,6 +273,10 @@ impl WorldMode {
         }
     }
 
+    pub fn is_workshop(&self) -> bool {
+        *self == WorldMode::Workshop
+    }
+
     pub fn toggle(self) -> WorldMode {
         match self {
             WorldMode::Workshop => WorldMode::World,
@@ -375,12 +378,52 @@ pub enum BrushCheck {
 const BRUSH_GRID: usize = 5;
 const SHRINK_STEPS: [f32; 4] = [0.75, 0.50, 0.35, 0.25];
 
+/// What a brush stroke is checked against (`WORLD_PLAN.md`, phase H): only what the stroke will
+/// actually change, so a tool is refused, and material is paid or yielded, for that alone.
+pub enum BrushTarget<'a> {
+    /// The SDF layer (terrain, landforms, promoted elements) in world space, with the exact solids
+    /// of the unpromoted scene elements the stroke reaches (a terrain carve promotes and cuts them).
+    /// The base areas' own scene meshes are never carved, so they are not counted.
+    World { region: &'a mut dyn Region, unpromoted: &'a [(PlacementTransform, Arc<MeshSdf>)] },
+    /// One element alone, in its own frame: its solid, carved by `edits` in order. Brushes and
+    /// points given are in the element's frame; volumes count `scale³` times (its world size).
+    Element { sdf: &'a MeshSdf, edits: &'a [Edit], scale: f32 },
+}
+
+impl BrushTarget<'_> {
+    fn sample(&mut self, pts: &[[f32; 3]], size: f32, out: &mut Vec<Answer>) -> Result<()> {
+        match self {
+            BrushTarget::World { region, unpromoted } => {
+                chunk::sample(&mut **region, pts, size, out)?;
+                for (p, ans) in pts.iter().zip(out.iter_mut()) {
+                    *ans = sample_with_unpromoted(*p, *ans, unpromoted);
+                }
+            }
+            BrushTarget::Element { sdf, edits, .. } => {
+                out.clear();
+                for &p in pts {
+                    let mut ans = sdf.sample(p, f32::INFINITY).unwrap_or(Answer { distance: 1e4, material: Material::Stone });
+                    for e in edits.iter() {
+                        ans = e.apply(p, ans);
+                    }
+                    out.push(ans);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How many cubic metres one cubic unit of a brush here is.
+    fn volume_scale(&self) -> f32 {
+        match self {
+            BrushTarget::World { .. } => 1.0,
+            BrushTarget::Element { scale, .. } => scale * scale * scale,
+        }
+    }
+}
+
 /// Combines `sdf` (from `region`) with exact signed distances of any unpromoted `MeshSdf` elements.
-fn sample_with_unpromoted(
-    p: [f32; 3],
-    mut sdf: Answer,
-    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
-) -> Answer {
+fn sample_with_unpromoted(p: [f32; 3], mut sdf: Answer, unpromoted: &[(PlacementTransform, Arc<MeshSdf>)]) -> Answer {
     for (tf, msdf) in unpromoted {
         let lp = tf.world_to_local_point(p);
         if let Some(ans) = msdf.sample(lp, f32::INFINITY) {
@@ -393,71 +436,44 @@ fn sample_with_unpromoted(
     sdf
 }
 
-/// Evaluates a `5×5×5` cell-centered grid inside `edit`'s shape against `region`, `scene`, and
-/// `unpromoted` solid scene elements, returning `(first_disallowed_material, solid_cell_count,
-/// yield_kg_per_material)`.
-fn probe_carve_volume(
-    tool: Tool,
-    edit: &Edit,
-    region: &mut dyn Region,
-    scene: &SceneWorld,
-    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
-) -> Result<(Option<Material>, usize, [f32; 9])> {
+/// The cell centres of a `5×5×5` grid over `edit`'s bounds that lie inside its shape (its centre
+/// alone if none do), and what they answer in `target`.
+fn brush_cells(edit: &Edit, target: &mut BrushTarget<'_>) -> Result<(Vec<[f32; 3]>, Vec<Answer>)> {
     let half = edit.shape.half_extents();
     let mut pts = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
-    let mut depths = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
     for iz in 0..BRUSH_GRID {
         let uz = -1.0 + (2.0 * iz as f32 + 1.0) / BRUSH_GRID as f32;
         for iy in 0..BRUSH_GRID {
             let uy = -1.0 + (2.0 * iy as f32 + 1.0) / BRUSH_GRID as f32;
             for ix in 0..BRUSH_GRID {
                 let ux = -1.0 + (2.0 * ix as f32 + 1.0) / BRUSH_GRID as f32;
-                let p = [
-                    edit.center[0] + ux * half[0],
-                    edit.center[1] + uy * half[1],
-                    edit.center[2] + uz * half[2],
-                ];
-                let bd = edit.distance(p);
-                if bd <= 0.0 {
+                let p = [edit.center[0] + ux * half[0], edit.center[1] + uy * half[1], edit.center[2] + uz * half[2]];
+                if edit.distance(p) <= 0.0 {
                     pts.push(p);
-                    depths.push(-bd);
                 }
             }
         }
     }
     if pts.is_empty() {
         pts.push(edit.center);
-        depths.push(edit.shape.radius());
     }
     let mut out = Vec::new();
-    chunk::sample(region, &pts, edit.stamp_size, &mut out)?;
+    target.sample(&pts, edit.stamp_size, &mut out)?;
+    Ok((pts, out))
+}
 
-    let dx = half[0] / BRUSH_GRID as f32;
-    let dy = half[1] / BRUSH_GRID as f32;
-    let dz = half[2] / BRUSH_GRID as f32;
-    let cell_r = (dx * dx + dy * dy + dz * dz).sqrt();
-    let per_cell_vol = edit.shape.volume_m3() / pts.len() as f32;
-
+/// Evaluates the brush grid of `edit` against `target`: `(first_disallowed_material,
+/// solid_cell_count, yield_kg_per_material)`. Only cells inside a solid count (signed distance
+/// `<= 0`, not water), so carving air beside a solid neither yields nor is refused.
+fn probe_carve_volume(tool: Tool, edit: &Edit, target: &mut BrushTarget<'_>) -> Result<(Option<Material>, usize, [f32; 9])> {
+    let (pts, out) = brush_cells(edit, target)?;
+    let per_cell_vol = edit.shape.volume_m3() * target.volume_scale() / pts.len() as f32;
     let mut blocked: Option<Material> = None;
     let mut solid_count = 0usize;
     let mut yield_kg = [0.0f32; 9];
-
-    for ((&p, &d_in), &raw_ans) in pts.iter().zip(&depths).zip(&out) {
-        let ans = sample_with_unpromoted(p, raw_ans, unpromoted);
-        let mat = if ans.distance <= 0.0 && ans.material != Material::Water {
-            Some(ans.material)
-        } else if unpromoted.is_empty() {
-            // Fallback for base-area scene solids not in `unpromoted`.
-            let margin = min_f32(cell_r, d_in);
-            if margin > 0.0 {
-                scene.distance_to_solids(p, margin).map(|h| h.material)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(m) = mat {
+    for ans in &out {
+        if ans.distance <= 0.0 && ans.material != Material::Water {
+            let m = ans.material;
             solid_count += 1;
             if blocked.is_none() && tool.can_carve(m).is_err() {
                 blocked = Some(m);
@@ -468,26 +484,22 @@ fn probe_carve_volume(
     Ok((blocked, solid_count, yield_kg))
 }
 
+/// What a carve of `edit` yields from `target` (kg per material), without any tool check.
+pub fn carve_yield_kg(edit: &Edit, target: &mut BrushTarget<'_>) -> Result<[f32; 9]> {
+    Ok(probe_carve_volume(Tool::All, edit, target)?.2)
+}
+
 /// Checks the whole brush volume (`5×5×5` grid at `edit.stamp_size`) before carving (`WORLD_PLAN.md`,
 /// phase H). If a disallowed solid material lies inside the brush, tries shrinking the brush toward
 /// `hit` until only allowed materials remain; if it still cannot fit (or `hit` itself is disallowed),
-/// refuses the stroke with a message naming the blocking material.
-pub fn check_carve_brush(
-    tool: Tool,
-    edit: Edit,
-    hit: [f32; 3],
-    region: &mut dyn Region,
-    scene: &SceneWorld,
-    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
-) -> Result<BrushCheck> {
+/// refuses the stroke with a message naming the blocking material. `edit` and `hit` are in
+/// `target`'s frame.
+pub fn check_carve_brush(tool: Tool, edit: Edit, hit: [f32; 3], target: &mut BrushTarget<'_>) -> Result<BrushCheck> {
     if tool == Tool::Hands {
-        return Ok(BrushCheck::Refused {
-            blocked: Material::Stone,
-            reason: tool.can_carve(Material::Stone).unwrap_err(),
-        });
+        return Ok(BrushCheck::Refused { blocked: Material::Stone, reason: tool.can_carve(Material::Stone).unwrap_err() });
     }
     if tool == Tool::All {
-        let (_, _, yield_kg) = probe_carve_volume(tool, &edit, region, scene, unpromoted)?;
+        let (_, _, yield_kg) = probe_carve_volume(tool, &edit, target)?;
         return Ok(BrushCheck::Ok { yield_kg });
     }
 
@@ -495,23 +507,8 @@ pub fn check_carve_brush(
     let r = edit.shape.radius();
     let hit_margin = max_f32(0.05 * r, 0.01 * edit.stamp_size);
     let mut hit_out = Vec::new();
-    chunk::sample(region, &[hit], edit.stamp_size, &mut hit_out)?;
-    let hit_mat = {
-        let sdf = sample_with_unpromoted(hit, hit_out[0], unpromoted);
-        if sdf.distance <= 0.0 && sdf.material != Material::Water {
-            Some(sdf.material)
-        } else if let Some(sh) = scene.distance_to_solids(hit, hit_margin) {
-            if sdf.distance <= hit_margin && sdf.distance < sh.distance && sdf.material != Material::Water {
-                Some(sdf.material)
-            } else {
-                Some(sh.material)
-            }
-        } else if sdf.distance <= hit_margin && sdf.material != Material::Water {
-            Some(sdf.material)
-        } else {
-            None
-        }
-    };
+    target.sample(&[hit], edit.stamp_size, &mut hit_out)?;
+    let hit_mat = (hit_out[0].distance <= hit_margin && hit_out[0].material != Material::Water).then_some(hit_out[0].material);
     if let Some(m) = hit_mat
         && let Err(reason) = tool.can_carve(m)
     {
@@ -519,7 +516,7 @@ pub fn check_carve_brush(
     }
 
     // 2. Check the full brush volume.
-    let (blocked, _, yield_kg) = probe_carve_volume(tool, &edit, region, scene, unpromoted)?;
+    let (blocked, _, yield_kg) = probe_carve_volume(tool, &edit, target)?;
     let Some(blocked_mat) = blocked else {
         return Ok(BrushCheck::Ok { yield_kg });
     };
@@ -537,7 +534,7 @@ pub fn check_carve_brush(
             hit[2] + (edit.center[2] - hit[2]) * s,
         ];
         let shrunk = Edit { shape, center, blend: edit.blend * s, ..edit };
-        let (b, solid_n, y_kg) = probe_carve_volume(tool, &shrunk, region, scene, unpromoted)?;
+        let (b, solid_n, y_kg) = probe_carve_volume(tool, &shrunk, target)?;
         if b.is_none() && (solid_n > 0 || hit_mat.is_some()) {
             return Ok(BrushCheck::Shrunk { edit: shrunk, blocked: blocked_mat, yield_kg: y_kg });
         }
@@ -550,72 +547,29 @@ pub fn check_carve_brush(
     })
 }
 
-/// Estimates the mass (kg) of `mat` needed to add `edit` into open space (`WORLD_PLAN.md`, phase H):
-/// fraction of brush cells currently in air/water × `shape.volume_m3()` × `density_kg_m3`.
-pub fn estimate_add_mass_kg(
-    edit: &Edit,
-    mat: Material,
-    region: &mut dyn Region,
-    scene: &SceneWorld,
-    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
-) -> Result<f32> {
-    let half = edit.shape.half_extents();
-    let mut pts = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
-    let mut depths = Vec::with_capacity(BRUSH_GRID * BRUSH_GRID * BRUSH_GRID);
-    for iz in 0..BRUSH_GRID {
-        let uz = -1.0 + (2.0 * iz as f32 + 1.0) / BRUSH_GRID as f32;
-        for iy in 0..BRUSH_GRID {
-            let uy = -1.0 + (2.0 * iy as f32 + 1.0) / BRUSH_GRID as f32;
-            for ix in 0..BRUSH_GRID {
-                let ux = -1.0 + (2.0 * ix as f32 + 1.0) / BRUSH_GRID as f32;
-                let p = [
-                    edit.center[0] + ux * half[0],
-                    edit.center[1] + uy * half[1],
-                    edit.center[2] + uz * half[2],
-                ];
-                let bd = edit.distance(p);
-                if bd <= 0.0 {
-                    pts.push(p);
-                    depths.push(-bd);
-                }
-            }
+/// Estimates the mass (kg) of `mat` an `Add` of `edit` takes from the pack (`WORLD_PLAN.md`,
+/// phase H): every brush cell it fills or turns into `mat` — open (air or water), or solid of
+/// another material that the add takes over (`Edit::apply`: where the add is nearer than what is
+/// there) — counts `shape.volume_m3() / cells × density_kg_m3`. Solid already of `mat` is free.
+pub fn estimate_add_mass_kg(edit: &Edit, mat: Material, target: &mut BrushTarget<'_>) -> Result<f32> {
+    let (pts, out) = brush_cells(edit, target)?;
+    let mut changed = 0usize;
+    for (&p, ans) in pts.iter().zip(&out) {
+        let occupied = ans.distance <= 0.0 && ans.material != Material::Water;
+        let takes_over = edit.distance(p) < ans.distance;
+        if !occupied || (takes_over && ans.material != mat) {
+            changed += 1;
         }
     }
-    if pts.is_empty() {
-        pts.push(edit.center);
-        depths.push(edit.shape.radius());
-    }
-    let mut out = Vec::new();
-    chunk::sample(region, &pts, edit.stamp_size, &mut out)?;
-
-    let dx = half[0] / BRUSH_GRID as f32;
-    let dy = half[1] / BRUSH_GRID as f32;
-    let dz = half[2] / BRUSH_GRID as f32;
-    let cell_r = (dx * dx + dy * dy + dz * dz).sqrt();
-
-    let mut open_count = 0usize;
-    for ((&p, &d_in), &raw_ans) in pts.iter().zip(&depths).zip(&out) {
-        let ans = sample_with_unpromoted(p, raw_ans, unpromoted);
-        let occupied = (ans.distance <= 0.0 && ans.material != Material::Water)
-            || (unpromoted.is_empty() && min_f32(cell_r, d_in) > 0.0 && scene.distance_to_solids(p, min_f32(cell_r, d_in)).is_some());
-        if !occupied {
-            open_count += 1;
-        }
-    }
-    let vol = edit.shape.volume_m3() * (open_count as f32 / pts.len() as f32);
+    let vol = edit.shape.volume_m3() * target.volume_scale() * (changed as f32 / pts.len() as f32);
     Ok(vol * material_props(mat).density_kg_m3)
 }
 
-/// Checks whether `edit`'s tool is valid against the world state *without* shrinking (for server /
-/// save-replay verification of recorded edits; `WORLD_PLAN.md`, phase H).
-pub fn verify_edit_tool(
-    mode: WorldMode,
-    edit: &Edit,
-    region: &mut dyn Region,
-    scene: &SceneWorld,
-    unpromoted: &[(PlacementTransform, Arc<MeshSdf>)],
-) -> Result<std::result::Result<(), String>> {
-    if mode == WorldMode::World {
+/// Checks whether `edit`'s recorded tool could make it, under the mode it was made in
+/// (`Edit::mode`), against `target` *without* shrinking (for server / save-replay verification of
+/// recorded edits; `WORLD_PLAN.md`, phase H).
+pub fn verify_edit_tool(edit: &Edit, target: &mut BrushTarget<'_>) -> Result<std::result::Result<(), String>> {
+    if edit.mode == WorldMode::World {
         if edit.tool == Tool::All {
             return Ok(Err("workshop tool (all) is not allowed in world mode".into()));
         }
@@ -625,6 +579,9 @@ pub fn verify_edit_tool(
     }
     match edit.op {
         crate::edit::Op::Add => {
+            if edit.mode == WorldMode::Workshop {
+                return Ok(Ok(()));
+            }
             let mat = edit.material.unwrap_or(Material::Soil);
             Ok(edit.tool.can_add(mat))
         }
@@ -635,7 +592,7 @@ pub fn verify_edit_tool(
             if edit.tool == Tool::Hands {
                 return Ok(Err(edit.tool.can_carve(Material::Stone).unwrap_err()));
             }
-            let (blocked, _, _) = probe_carve_volume(edit.tool, edit, region, scene, unpromoted)?;
+            let (blocked, _, _) = probe_carve_volume(edit.tool, edit, target)?;
             match blocked {
                 None => Ok(Ok(())),
                 Some(m) => Ok(Err(format!(
@@ -648,10 +605,6 @@ pub fn verify_edit_tool(
         }
     }
 }
-
-/// Computes `Shape::volume_m3` helper validation (sanity check for `Shape`).
-#[allow(dead_code)]
-fn _shape_uses(_: Shape) {}
 
 /// Deterministic buoyancy & resting result for a discrete `Scene` object at a given world placement.
 #[derive(Clone, Copy, Debug, PartialEq)]

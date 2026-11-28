@@ -109,6 +109,7 @@ fn tool_material_matrix_enforces_saw_vs_pickaxe_vs_shovel_on_real_elements() {
         clips: Vec::new(),
         local_edits: Vec::new(),
         author: None,
+        params: Vec::new(),
     };
     runtime.spawn(pl_bridge, &bridge, &mut world).unwrap();
     let (_, _, _, mid_mat) = world.raycast_placed_surface_material([32.0, 3.0, 45.0], [0.0, -1.0, 0.0], 5.0).expect("hit bridge deck");
@@ -269,6 +270,7 @@ fn boat_and_pillar_are_walkable_cuttable_and_discovered_by_catalog() {
         clips: Vec::new(),
         local_edits: Vec::new(),
         author: None,
+        params: Vec::new(),
     };
     runtime.spawn(pl_boat, &boat, &mut world).unwrap();
 

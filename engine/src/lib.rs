@@ -1,7 +1,8 @@
 //! Plateau's engine (POC_PLAN.md). An area as the engine sees it: a `Region`, answering what is
 //! where for a viewer of a size and what it is, from its module (`Wasm`, checked on load by
 //! `check`, run in wasmtime with the limits the engine keeps) or, in tests, from its source played
-//! natively. The interface is the WIT world `plateau:region@0.1.0` (`sdk/wit/region.wit`); the
+//! natively. The interface is the WIT world `plateau:region@0.2.0` (`sdk/wit/region.wit`; modules
+//! of `0.1.0` load as they did, given no params); the
 //! engine writes and reads its canonical ABI itself (`wasm`).
 //!
 //! What the engine makes of an area, without a window: the surface in chunks at the detail each

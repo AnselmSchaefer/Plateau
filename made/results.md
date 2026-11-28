@@ -1,5 +1,8 @@
 # The test set
 
+The last run, before phase H's "materials go down". Its areas were removed on 2026-11-28;
+`plateau test-set` makes them again under the laws as they are now.
+
 | Area | Request | Kept every law | Rounds | Fixes | Look | Took | Reckoned |
 |---|---|---|---|---|---|---|---|
 | table | A giant's kitchen table with a village of tiny people living under it. | yes | 2 | 0 | yes | 18 min | $2.42 |

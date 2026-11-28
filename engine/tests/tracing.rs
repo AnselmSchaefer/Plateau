@@ -30,7 +30,7 @@ fn session() -> (String, [u64; 2]) {
     let mut world = open();
     let mut body = Body::standing(&mut world.combined(), [LAWN[0] as f64 - 3.0, 40.0, LAWN[2] as f64], PERSON).unwrap();
     let mut act = |world: &mut World, action| world.apply(Actor { id: "local", body: &mut body }, action);
-    let tree = match act(&mut world, Action::Place { module: "elements/modules/tree.wasm".into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None }) {
+    let tree = match act(&mut world, Action::Place { module: "elements/modules/tree.wasm".into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None, params: Vec::new() }) {
         Outcome::Done(s) => s.added[0],
         other => panic!("{other:?}"),
     };

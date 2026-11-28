@@ -500,6 +500,29 @@ carried area keeps "materials go down".
   canonical-NaN determinism; legacy v1 save backward compatibility. `engine/tests/laws.rs` adds
   `grass_thirty_centimetres_underground_breaks_materials_go_down`.
 
+*Review fixes 2026-11-27:*
+
+- **A stroke is checked against only what it changes** (`physics::BrushTarget`): a terrain stroke
+  against the SDF layer plus the exact solids of unpromoted elements it reaches; a stroke on an
+  element against that element alone, in its own frame (`World::element_brush`), so the ground
+  under a trunk neither stops a saw nor goes into the pack. Only cells inside a solid (signed
+  distance `<= 0`) count; the base areas' own scene meshes are never carved and no longer count.
+- **`Add` pays for what it turns to its material**, not only for open cells (`estimate_add_mass_kg`
+  follows `Edit::apply`), so repainting ground with an add is no longer free; adds are tool-gated
+  only in `world` mode.
+- **Inventory journal records what was applied** (a debit clamps at empty), so undo gives back no
+  more than was taken.
+- **`SetMode` needs the world's owner** (`RuleBook::check_world`: owner of every claimed area).
+- **Each edit records its mode** (`Edit::mode`, ` mode world` in `plateau-world 2`, absent =
+  workshop): `verify_save_edits` checks each edit under the mode it was made in; terrain edits
+  against the base areas, SDF landforms and earlier edits; element edits in the element's own
+  frame against it and its earlier edits (wherever it was carried since); mask boxes recognised on
+  every piece descended from a split.
+- **`World::carry_physics`** (uprooted means not rooted) is shared by `grab` and `can_still_hold`.
+- **Made areas held to "materials go down"**: the areas the engine tests walk (`pond-sketched`,
+  `forest-beside-pond`) layer their coats by depth (`deepen`, by hand, shapes unchanged); the
+  others, made before the law, were removed (`plateau test-set` makes the five again).
+
 ### I. Parametric elements and general fit (one to one and a half weeks)
 
 One element fits every site it is made for, and keeps fitting.
@@ -525,6 +548,67 @@ One element fits every site it is made for, and keeps fitting.
 **Done when** the hobbit door, made once, fits three different openings by params alone, and fits
 again after the cave is widened; a bridge passes `span_fit` across two gaps; `make/tests/make.rs`
 covers param ranges.
+
+*Done 2026-11-28:*
+
+- **`plateau:region@0.2.0`** (`sdk/wit/region.wit`): `host.params() -> list<f32>`. The engine writes
+  the list into memory the module allocates (`wasm::give_params`). `check` accepts imports from
+  either host version, refuses a module that asks both, and `check::reads_params` tells whether a
+  module asks for its params at all.
+  - Params are checked: at most 64 (`wasm::MOST_PARAMS`), each finite.
+  - They are given per placement (`PlacedElement::params`, `Action::Place { params }`) and saved
+    as ` params N v…`.
+  - Every cache of an element's instance, mesh SDF and bounds is keyed by its params
+    (`CompiledElement::sdf_bounds_for`).
+  - SDK: `params()`, `param`, `native::with_params`. The carried areas and elements are rebuilt;
+    the made ones stay `0.1.0` and still load.
+- **Sites become params** (`SiteContext::params`, `site::P_*`): 58 numbers.
+  - Width, height, middle, depth, through, wall, roundness, headroom and walkable, then all 48
+    outline radii.
+  - This departs from the planned 8 spokes: a square doorway's corners fall between 8 (or 16)
+    spokes, and its frame then leaves a gap there.
+  - `ELEMENT_GUIDE.md` ("Params") gives the table, and a test holds it to the constants. The
+    site's prompt says the numbers are the element's `params()`.
+- **The hobbit door makes itself for any opening** from its params: frame, leaf, trim and stones
+  follow the 48 radii. Given none, it is the round door as before.
+  - `fit::fit_to_site` first places an element where the site is, given the site's params. If that
+    fits, it is placed so; otherwise it falls back to `fit_transform`, given no params.
+  - Play's `O` and `make --place` give the params.
+- **Fitting again** (`live/refit.rs`): after a terrain sculpt, each element that `fills` an opening
+  the stroke reached is re-checked. The opening is measured again without the element, in both the
+  scene and the SDF.
+  - An element placed with params is given the new site's params where the new site is, and is
+    made again whole. Any carve the stroke promoted it for goes with the old opening.
+  - The refit is undone and redone with the stroke (`WorldAction::Refit`).
+  - Anything that then fails `cavity_fit` is told of in the outcome, for example a door fitted by
+    scale alone in an opening that outgrew it.
+- **More fit laws** (`engine/src/fit.rs`):
+  - `span_fit`: both ends rest on the banks, there is a gap under the middle (lower than the banks,
+    or water), nothing rises through the deck, and each size walks across. The deck's width is
+    checked first.
+  - `wall_fit`: the back meets the wall over at least ¾ of it, neither standing off nor sunk in.
+    It comes with a carried `sign` element.
+  - `style_fit`: measures materials only (a site measures no colours), and is a note for the
+    `look` round, never a failure.
+  - `plateau --fit` gains `span` and `wall`.
+- **`check-element` and `make-element` judge over a range**: an element that reads params is
+  held, given their params, to four openings beside its site's (`OTHER_OPENINGS`: 15% wider,
+  narrower, higher, lower; `SiteContext::varied`). One that reads none is noted to fit its own
+  opening alone. Notes (`Judged::notes`) go into the `look` round.
+- Tests: `engine/tests/params.rs`, `fit_params.rs`, `span.rs`, `wall.rs`, and a param-range test
+  in `make/tests/make.rs`.
+  - One door fits a round tunnel, a square doorway and a tiny's low arch by params alone. It fits
+    each again once widened, and the old params no longer fit the widened one.
+  - The bridge spans a person's ditch and a tiny's.
+
+*Still open in I:*
+
+- Refitting follows terrain sculpts only, not element sculpts or falls.
+- A cut element (with clips) is not made again.
+- Each stroke near a filled opening costs a measure and a `cavity_fit`.
+- The bridge takes no params: a ground site measures no gap to span.
+- Play's placement ghost still shows the element as it is given no params.
+- No browser host is in this repo; when one exists it must give `params` as `wasm.rs` does.
 
 ### J. Brick cache and performance (one to one and a half weeks)
 

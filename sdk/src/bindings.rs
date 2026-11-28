@@ -1097,13 +1097,14 @@ pub mod plateau {
             #[used]
             #[doc(hidden)]
             static __FORCE_SECTION_REF: fn() = super::super::super::__link_custom_section_describing_imports;
+            use super::super::super::_rt;
             #[allow(unused_unsafe, clippy::all)]
             /// The area's seed: the same module with the same seed is the same world on every machine.
             #[allow(async_fn_in_trait)]
             pub fn seed() -> u64 {
                 unsafe {
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "plateau:region/host@0.1.0")]
+                    #[link(wasm_import_module = "plateau:region/host@0.2.0")]
                     unsafe extern "C" {
                         #[link_name = "seed"]
                         fn wit_import0() -> i64;
@@ -1114,6 +1115,48 @@ pub mod plateau {
                     }
                     let ret = wit_import0();
                     ret as u64
+                }
+            }
+            #[allow(unused_unsafe, clippy::all)]
+            /// What this placement of an element was given to fit (WORLD_PLAN.md, phase I): at most 64
+            /// numbers, each finite, the same for as long as the placement is. An area, or an element
+            /// placed with none, gets an empty list. For a site, the numbers are `SiteContext::params`
+            /// (`make/ELEMENT_GUIDE.md`, "Params"). Since 0.2.0.
+            #[allow(async_fn_in_trait)]
+            pub fn params() -> _rt::Vec<f32> {
+                unsafe {
+                    #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+                    #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
+                    struct RetArea(
+                        [::core::mem::MaybeUninit<
+                            u8,
+                        >; 2 * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let mut ret_area = RetArea(
+                        [::core::mem::MaybeUninit::uninit(); 2
+                            * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let ptr0 = ret_area.0.as_mut_ptr().cast::<u8>();
+                    #[cfg(target_arch = "wasm32")]
+                    #[link(wasm_import_module = "plateau:region/host@0.2.0")]
+                    unsafe extern "C" {
+                        #[link_name = "params"]
+                        fn wit_import1(_: *mut u8);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    unsafe extern "C" fn wit_import1(_: *mut u8) {
+                        unreachable!()
+                    }
+                    wit_import1(ptr0);
+                    let l2 = *ptr0.add(0).cast::<*mut u8>();
+                    let l3 = *ptr0
+                        .add(::core::mem::size_of::<*const u8>())
+                        .cast::<usize>();
+                    let len4 = l3;
+                    let result5 = <_ as From<
+                        _rt::Vec<_>,
+                    >>::from(_rt::Vec::from_raw_parts(l2.cast(), len4, len4));
+                    result5
                 }
             }
         }
@@ -1557,8 +1600,8 @@ pub mod plateau {
 #[rustfmt::skip]
 mod _rt {
     #![allow(dead_code, unused_imports, clippy::all)]
-    pub use alloc_crate::string::String;
     pub use alloc_crate::vec::Vec;
+    pub use alloc_crate::string::String;
     #[cfg(target_arch = "wasm32")]
     pub fn run_ctors_once() {
         crate::rt::run_ctors_once();
@@ -1689,43 +1732,44 @@ macro_rules! __export_region_impl {
         $($path_to_types_root)*:: __export_world_region_cabi!($ty with_types_in
         $($path_to_types_root)*); const _ : () = { #[rustfmt::skip] #[cfg(target_arch =
         "wasm32")] #[unsafe (link_section =
-        "component-type:wit-bindgen:0.63.0:plateau:region@0.1.0:region:imports and exports")]
+        "component-type:wit-bindgen:0.63.0:plateau:region@0.2.0:region:imports and exports")]
         #[doc(hidden)] #[allow(clippy::octal_escapes)] pub static
-        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 1414] = *
+        __WIT_BINDGEN_COMPONENT_TYPE : [u8; 1433] = *
         b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x89\x0a\x01A\x02\x01\
-A\"\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B)\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
-rass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\x03\
-\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04\
-tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\x02\
-at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\x04\
-\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\x04\
-\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\x04\
-\0\x0bdescription\x03\0\x11\x01r\x06\x03pos\x01\x06normal\x01\x08material\x03\x06\
-tint-r}\x06tint-g}\x06tint-b}\x04\0\x06vertex\x03\0\x13\x01p\x14\x01py\x01r\x02\x08\
-vertices\x15\x07indices\x16\x04\0\x09mesh-data\x03\0\x17\x01r\x09\x02idy\x04mesh\
-y\x03pos\x01\x05rot-xv\x05rot-yv\x05rot-zv\x05rot-wv\x05scale\x01\x05solid\x7f\x04\
-\0\x08instance\x03\0\x19\x01r\x07\x02idy\x03pos\x01\x01rv\x01gv\x01bv\x09intensi\
-tyv\x06radiusv\x04\0\x05light\x03\0\x1b\x01p\x18\x01p\x1a\x01p\x1c\x01r\x03\x06m\
-eshes\x1d\x09instances\x1e\x06lights\x1f\x04\0\x05scene\x03\0\x20\x01r\x0a\x04fe\
-et\x01\x03eye\x01\x04look\x01\x08velocity\x01\x04sizev\x08grounded\x7f\x0bholdin\
-g-use\x7f\x06targety\x03aim\x01\x04timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\
-\x7f\x01q\x06\x0dset-transform\x01\x1a\0\x0bset-visible\x01$\0\x09set-solid\x01$\
-\0\x0dapply-impulse\x01\x01\0\x09set-light\x01\x1c\0\x03say\x01s\0\x04\0\x07comm\
-and\x03\0%\x01r\x03\x02lo\x01\x02hi\x01\x05blendv\x04\0\x0eelement-bounds\x03\0'\
-\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\0\x05poi\
-nt\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\x01\x0b\
-description\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05scene\
-\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\x03\
-\0\x01\x07command\x03\0\x07command\x03\0\x0c\x02\x03\0\x01\x0eelement-bounds\x03\
-\0\x0eelement-bounds\x03\0\x0e\x01p\x03\x01p\x05\x01@\x02\x06points\x10\x04sizev\
-\0\x11\x04\0\x06sample\x01\x12\x01@\0\0\x07\x04\0\x08describe\x01\x13\x01@\0\0\x09\
-\x04\0\x05scene\x01\x14\x01p\x0d\x01@\x02\x02dtv\x06player\x0b\0\x15\x04\0\x04ti\
-ck\x01\x16\x01@\x01\x06player\x0b\0\x15\x04\0\x08interact\x01\x17\x01k\x0f\x01@\0\
-\0\x18\x04\0\x0eelement-bounds\x01\x19\x04\0\x1bplateau:region/region@0.1.0\x04\0\
-\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-\
-component\x070.262.0\x10wit-bindgen-rust\x060.63.0";
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x9c\x0a\x01A\x02\x01\
+A\"\x01B\x05\x01@\0\0w\x04\0\x04seed\x01\0\x01pv\x01@\0\0\x01\x04\0\x06params\x01\
+\x02\x03\0\x19plateau:region/host@0.2.0\x05\0\x01B)\x01r\x03\x01xv\x01yv\x01zv\x04\
+\0\x05point\x03\0\0\x01m\x09\x04soil\x05grass\x04sand\x03mud\x05stone\x04wood\x04\
+leaf\x04moss\x05water\x04\0\x08material\x03\0\x02\x01r\x02\x08distancev\x08mater\
+ial\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04tiny\x06person\x05giant\x04\0\x04s\
+ize\x03\0\x06\x01r\x03\x04names\x04size\x07\x02at\x01\x04\0\x05place\x03\0\x08\x01\
+pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\x04\0\x04edge\x03\0\x0c\x01r\x04\x05\
+north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\x04\0\x07borders\x03\0\x0e\x01p\x09\
+\x01r\x03\x04names\x06places\x10\x07borders\x0f\x04\0\x0bdescription\x03\0\x11\x01\
+r\x06\x03pos\x01\x06normal\x01\x08material\x03\x06tint-r}\x06tint-g}\x06tint-b}\x04\
+\0\x06vertex\x03\0\x13\x01p\x14\x01py\x01r\x02\x08vertices\x15\x07indices\x16\x04\
+\0\x09mesh-data\x03\0\x17\x01r\x09\x02idy\x04meshy\x03pos\x01\x05rot-xv\x05rot-y\
+v\x05rot-zv\x05rot-wv\x05scale\x01\x05solid\x7f\x04\0\x08instance\x03\0\x19\x01r\
+\x07\x02idy\x03pos\x01\x01rv\x01gv\x01bv\x09intensityv\x06radiusv\x04\0\x05light\
+\x03\0\x1b\x01p\x18\x01p\x1a\x01p\x1c\x01r\x03\x06meshes\x1d\x09instances\x1e\x06\
+lights\x1f\x04\0\x05scene\x03\0\x20\x01r\x0a\x04feet\x01\x03eye\x01\x04look\x01\x08\
+velocity\x01\x04sizev\x08grounded\x7f\x0bholding-use\x7f\x06targety\x03aim\x01\x04\
+timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\x7f\x01q\x06\x0dset-transform\x01\x1a\
+\0\x0bset-visible\x01$\0\x09set-solid\x01$\0\x0dapply-impulse\x01\x01\0\x09set-l\
+ight\x01\x1c\0\x03say\x01s\0\x04\0\x07command\x03\0%\x01r\x03\x02lo\x01\x02hi\x01\
+\x05blendv\x04\0\x0eelement-bounds\x03\0'\x03\0\x1aplateau:region/types@0.2.0\x05\
+\x01\x02\x03\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\
+\0\x06answer\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\
+\x02\x03\0\x01\x05scene\x03\0\x05scene\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\
+\0\x0cplayer-state\x03\0\x0a\x02\x03\0\x01\x07command\x03\0\x07command\x03\0\x0c\
+\x02\x03\0\x01\x0eelement-bounds\x03\0\x0eelement-bounds\x03\0\x0e\x01p\x03\x01p\
+\x05\x01@\x02\x06points\x10\x04sizev\0\x11\x04\0\x06sample\x01\x12\x01@\0\0\x07\x04\
+\0\x08describe\x01\x13\x01@\0\0\x09\x04\0\x05scene\x01\x14\x01p\x0d\x01@\x02\x02\
+dtv\x06player\x0b\0\x15\x04\0\x04tick\x01\x16\x01@\x01\x06player\x0b\0\x15\x04\0\
+\x08interact\x01\x17\x01k\x0f\x01@\0\0\x18\x04\0\x0eelement-bounds\x01\x19\x04\0\
+\x1bplateau:region/region@0.2.0\x04\0\x0b\x0c\x01\0\x06region\x03\0\0\0G\x09prod\
+ucers\x01\x0cprocessed-by\x02\x0dwit-component\x070.262.0\x10wit-bindgen-rust\x06\
+0.63.0";
         };
     };
 }
@@ -1734,41 +1778,41 @@ pub use __export_region_impl as export;
 #[rustfmt::skip]
 #[cfg(target_arch = "wasm32")]
 #[unsafe(
-    link_section = "component-type:wit-bindgen:0.63.0:plateau:region@0.1.0:region-with-all-of-its-exports-removed:encoded world"
+    link_section = "component-type:wit-bindgen:0.63.0:plateau:region@0.2.0:region-with-all-of-its-exports-removed:encoded world"
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1327] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x92\x09\x01A\x02\x01\
-A\x12\x01B\x02\x01@\0\0w\x04\0\x04seed\x01\0\x03\0\x19plateau:region/host@0.1.0\x05\
-\0\x01B)\x01r\x03\x01xv\x01yv\x01zv\x04\0\x05point\x03\0\0\x01m\x09\x04soil\x05g\
-rass\x04sand\x03mud\x05stone\x04wood\x04leaf\x04moss\x05water\x04\0\x08material\x03\
-\0\x02\x01r\x02\x08distancev\x08material\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04\
-tiny\x06person\x05giant\x04\0\x04size\x03\0\x06\x01r\x03\x04names\x04size\x07\x02\
-at\x01\x04\0\x05place\x03\0\x08\x01pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\x04\
-\0\x04edge\x03\0\x0c\x01r\x04\x05north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\x04\
-\0\x07borders\x03\0\x0e\x01p\x09\x01r\x03\x04names\x06places\x10\x07borders\x0f\x04\
-\0\x0bdescription\x03\0\x11\x01r\x06\x03pos\x01\x06normal\x01\x08material\x03\x06\
-tint-r}\x06tint-g}\x06tint-b}\x04\0\x06vertex\x03\0\x13\x01p\x14\x01py\x01r\x02\x08\
-vertices\x15\x07indices\x16\x04\0\x09mesh-data\x03\0\x17\x01r\x09\x02idy\x04mesh\
-y\x03pos\x01\x05rot-xv\x05rot-yv\x05rot-zv\x05rot-wv\x05scale\x01\x05solid\x7f\x04\
-\0\x08instance\x03\0\x19\x01r\x07\x02idy\x03pos\x01\x01rv\x01gv\x01bv\x09intensi\
-tyv\x06radiusv\x04\0\x05light\x03\0\x1b\x01p\x18\x01p\x1a\x01p\x1c\x01r\x03\x06m\
-eshes\x1d\x09instances\x1e\x06lights\x1f\x04\0\x05scene\x03\0\x20\x01r\x0a\x04fe\
-et\x01\x03eye\x01\x04look\x01\x08velocity\x01\x04sizev\x08grounded\x7f\x0bholdin\
-g-use\x7f\x06targety\x03aim\x01\x04timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\
-\x7f\x01q\x06\x0dset-transform\x01\x1a\0\x0bset-visible\x01$\0\x09set-solid\x01$\
-\0\x0dapply-impulse\x01\x01\0\x09set-light\x01\x1c\0\x03say\x01s\0\x04\0\x07comm\
-and\x03\0%\x01r\x03\x02lo\x01\x02hi\x01\x05blendv\x04\0\x0eelement-bounds\x03\0'\
-\x03\0\x1aplateau:region/types@0.1.0\x05\x01\x02\x03\0\x01\x05point\x03\0\x05poi\
-nt\x03\0\x02\x02\x03\0\x01\x06answer\x03\0\x06answer\x03\0\x04\x02\x03\0\x01\x0b\
-description\x03\0\x0bdescription\x03\0\x06\x02\x03\0\x01\x05scene\x03\0\x05scene\
-\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\0\x0cplayer-state\x03\0\x0a\x02\x03\
-\0\x01\x07command\x03\0\x07command\x03\0\x0c\x02\x03\0\x01\x0eelement-bounds\x03\
-\0\x0eelement-bounds\x03\0\x0e\x04\0;plateau:region/region-with-all-of-its-expor\
-ts-removed@0.1.0\x04\0\x0b,\x01\0&region-with-all-of-its-exports-removed\x03\0\0\
-\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.262.0\x10wit-bind\
-gen-rust\x060.63.0";
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1346] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xa5\x09\x01A\x02\x01\
+A\x12\x01B\x05\x01@\0\0w\x04\0\x04seed\x01\0\x01pv\x01@\0\0\x01\x04\0\x06params\x01\
+\x02\x03\0\x19plateau:region/host@0.2.0\x05\0\x01B)\x01r\x03\x01xv\x01yv\x01zv\x04\
+\0\x05point\x03\0\0\x01m\x09\x04soil\x05grass\x04sand\x03mud\x05stone\x04wood\x04\
+leaf\x04moss\x05water\x04\0\x08material\x03\0\x02\x01r\x02\x08distancev\x08mater\
+ial\x03\x04\0\x06answer\x03\0\x04\x01m\x03\x04tiny\x06person\x05giant\x04\0\x04s\
+ize\x03\0\x06\x01r\x03\x04names\x04size\x07\x02at\x01\x04\0\x05place\x03\0\x08\x01\
+pv\x01kv\x01r\x02\x06ground\x0a\x05water\x0b\x04\0\x04edge\x03\0\x0c\x01r\x04\x05\
+north\x0d\x04east\x0d\x05south\x0d\x04west\x0d\x04\0\x07borders\x03\0\x0e\x01p\x09\
+\x01r\x03\x04names\x06places\x10\x07borders\x0f\x04\0\x0bdescription\x03\0\x11\x01\
+r\x06\x03pos\x01\x06normal\x01\x08material\x03\x06tint-r}\x06tint-g}\x06tint-b}\x04\
+\0\x06vertex\x03\0\x13\x01p\x14\x01py\x01r\x02\x08vertices\x15\x07indices\x16\x04\
+\0\x09mesh-data\x03\0\x17\x01r\x09\x02idy\x04meshy\x03pos\x01\x05rot-xv\x05rot-y\
+v\x05rot-zv\x05rot-wv\x05scale\x01\x05solid\x7f\x04\0\x08instance\x03\0\x19\x01r\
+\x07\x02idy\x03pos\x01\x01rv\x01gv\x01bv\x09intensityv\x06radiusv\x04\0\x05light\
+\x03\0\x1b\x01p\x18\x01p\x1a\x01p\x1c\x01r\x03\x06meshes\x1d\x09instances\x1e\x06\
+lights\x1f\x04\0\x05scene\x03\0\x20\x01r\x0a\x04feet\x01\x03eye\x01\x04look\x01\x08\
+velocity\x01\x04sizev\x08grounded\x7f\x0bholding-use\x7f\x06targety\x03aim\x01\x04\
+timev\x04\0\x0cplayer-state\x03\0\"\x01o\x02y\x7f\x01q\x06\x0dset-transform\x01\x1a\
+\0\x0bset-visible\x01$\0\x09set-solid\x01$\0\x0dapply-impulse\x01\x01\0\x09set-l\
+ight\x01\x1c\0\x03say\x01s\0\x04\0\x07command\x03\0%\x01r\x03\x02lo\x01\x02hi\x01\
+\x05blendv\x04\0\x0eelement-bounds\x03\0'\x03\0\x1aplateau:region/types@0.2.0\x05\
+\x01\x02\x03\0\x01\x05point\x03\0\x05point\x03\0\x02\x02\x03\0\x01\x06answer\x03\
+\0\x06answer\x03\0\x04\x02\x03\0\x01\x0bdescription\x03\0\x0bdescription\x03\0\x06\
+\x02\x03\0\x01\x05scene\x03\0\x05scene\x03\0\x08\x02\x03\0\x01\x0cplayer-state\x03\
+\0\x0cplayer-state\x03\0\x0a\x02\x03\0\x01\x07command\x03\0\x07command\x03\0\x0c\
+\x02\x03\0\x01\x0eelement-bounds\x03\0\x0eelement-bounds\x03\0\x0e\x04\0;plateau\
+:region/region-with-all-of-its-exports-removed@0.2.0\x04\0\x0b,\x01\0&region-wit\
+h-all-of-its-exports-removed\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0d\
+wit-component\x070.262.0\x10wit-bindgen-rust\x060.63.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

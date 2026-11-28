@@ -56,6 +56,7 @@ fn tree_at(id: u32, module: &str) -> PlacedElement {
         clips: Vec::new(),
         local_edits: Vec::new(),
         author: Some("local".into()),
+        params: Vec::new(),
     }
 }
 

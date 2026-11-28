@@ -65,10 +65,10 @@ impl OpenWorld {
         for pl in &save.elements {
             let element = catalog.get_or_load(&pl.module)?;
             runtime.spawn_for_size(pl.clone(), &element, &mut scene, size)?;
-            if let Some(bounds) = element.sdf_bounds {
+            if let Some(bounds) = element.sdf_bounds_for(&pl.params) {
                 sdf.push(SdfElementEntry::new(pl.clone(), element.compiled.clone(), bounds));
             } else if pl.is_promoted()
-                && let Some(mesh) = catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)?
+                && let Some(mesh) = catalog.mesh_sdf_of(&pl)?
             {
                 sdf.push(SdfElementEntry::from_promoted_mesh(pl.clone(), mesh));
             }

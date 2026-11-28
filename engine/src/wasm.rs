@@ -1,13 +1,13 @@
 //! An area's module in wasmtime, with the limits the engine keeps (POC_PLAN.md, "Running areas"):
 //! fuel for each batch, a memory limit, no SIMD and no threads, NaNs left as the machine makes them
 //! (the law `laws::nans_unseen` stands in for making them one). The engine writes the points and
-//! reads the answers and the description as the canonical ABI lays out `plateau:region@0.1.0`'s
-//! types, checking every pointer, length and number the area gives back.
+//! reads the answers and the description as the canonical ABI lays out `plateau:region@0.2.0`'s
+//! types (`0.1.0`'s are the same, without `params`), checking every pointer, length and number the area gives back.
 
 use wasmtime::error::Context;
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc, format_err};
 
-use crate::check::{self, HOST, MOST_MEMORY};
+use crate::check::{self, HOST, HOST_0_1, MOST_MEMORY};
 use crate::{Answer, Borders, Command, Description, Edge, ElementBounds, Instance, LARGEST, Light, Material, MeshData, Place, PlayerState, Region, Result, SMALLEST, Scene, Size, Vertex};
 
 /// How a module is run.
@@ -35,6 +35,8 @@ pub const MOST_LIGHTS: usize = 64;
 pub const MOST_COMMANDS: usize = 256;
 /// Maximum clamped magnitude for an `ApplyImpulse` verb (m/s).
 pub const MAX_IMPULSE: f32 = 25.0;
+/// The most numbers a placement may be given (`host.params`, `plateau:region@0.2.0`).
+pub const MOST_PARAMS: usize = 64;
 /// The most points in a batch: what a chunk's corner asks at once is well within it.
 pub const MOST_POINTS: usize = 1 << 16;
 /// The most places an area may name, and the longest name.
@@ -80,14 +82,24 @@ impl Compiled {
 
     /// The area made, with its seed: `describe` and `sample` may be called from now.
     pub fn instantiate(&self, seed: u64) -> Result<Wasm> {
-        let ctx = Ctx { seed, limits: StoreLimitsBuilder::new().memory_size(self.limits.memory).instances(1).build() };
+        self.instantiate_with(seed, &[])
+    }
+
+    /// The element made, with its seed and the params its placement gives it (`host.params`): at
+    /// most `MOST_PARAMS`, each finite, or refused.
+    pub fn instantiate_with(&self, seed: u64, params: &[f32]) -> Result<Wasm> {
+        check_params(params)?;
+        let ctx = Ctx { seed, params: params.to_vec(), limits: StoreLimitsBuilder::new().memory_size(self.limits.memory).instances(1).build() };
         let mut store = Store::new(&self.engine, ctx);
         store.limiter(|ctx| &mut ctx.limits);
         if self.limits.fuel_per_sample.is_some() {
             store.set_fuel(FUEL_PER_CALL)?;
         }
         let mut linker = Linker::new(&self.engine);
-        linker.func_wrap(HOST, "seed", |caller: Caller<'_, Ctx>| caller.data().seed as i64)?;
+        for host in [HOST_0_1, HOST] {
+            linker.func_wrap(host, "seed", |caller: Caller<'_, Ctx>| caller.data().seed as i64)?;
+        }
+        linker.func_wrap(HOST, "params", give_params)?;
         let instance = linker.instantiate(&mut store, &self.module)?;
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| format_err!("the area has no memory"))?;
         let scene = match (instance.get_typed_func(&mut store, "scene"), instance.get_typed_func(&mut store, "cabi_post_scene")) {
@@ -122,7 +134,46 @@ impl Compiled {
 
 struct Ctx {
     seed: u64,
+    params: Vec<f32>,
     limits: StoreLimits,
+}
+
+/// Whether `params` may be given to a placement: at most `MOST_PARAMS`, each finite.
+pub fn check_params(params: &[f32]) -> Result<()> {
+    if params.len() > MOST_PARAMS {
+        return Err(format_err!("{} params given, more than the {MOST_PARAMS} a placement may have", params.len()));
+    }
+    if let Some(i) = params.iter().position(|p| !p.is_finite()) {
+        return Err(format_err!("param {i} is {}, not a finite number", params[i]));
+    }
+    Ok(())
+}
+
+/// `host.params`: the list written into room the module gives (its `cabi_realloc`, as the
+/// canonical ABI lowers a list it is to own), its pointer and length at `ret`.
+fn give_params(mut caller: Caller<'_, Ctx>, ret: u32) -> wasmtime::Result<()> {
+    let params = caller.data().params.clone();
+    let memory = caller.get_export("memory").and_then(|e| e.into_memory()).ok_or_else(|| format_err!("the module has no memory"))?;
+    let at = if params.is_empty() {
+        // An empty list owns nothing: any pointer aligned for f32 will do.
+        4
+    } else {
+        let realloc = caller
+            .get_export("cabi_realloc")
+            .and_then(|e| e.into_func())
+            .ok_or_else(|| format_err!("the module has no cabi_realloc"))?
+            .typed::<(u32, u32, u32, u32), u32>(&caller)?;
+        realloc.call(&mut caller, (0, 0, 4, (params.len() * 4) as u32))?
+    };
+    let data = memory.data_mut(&mut caller);
+    let room = data.get_mut(at as usize..at as usize + params.len() * 4).ok_or_else(|| format_err!("the module gave room for params outside its memory"))?;
+    for (p, b) in params.iter().zip(room.as_chunks_mut::<4>().0) {
+        *b = p.to_le_bytes();
+    }
+    let out = data.get_mut(ret as usize..ret as usize + 8).ok_or_else(|| format_err!("the module asked for params to be written outside its memory"))?;
+    out[..4].copy_from_slice(&at.to_le_bytes());
+    out[4..].copy_from_slice(&(params.len() as u32).to_le_bytes());
+    Ok(())
 }
 
 /// An area's module, made and running. After an error (a trap, fuel run out, an answer the engine
@@ -146,6 +197,11 @@ impl Wasm {
     /// Checks, compiles and makes a module in one: for when one instance is enough.
     pub fn new(bytes: &[u8], seed: u64, limits: Limits) -> Result<Wasm> {
         Compiled::new(bytes, limits)?.instantiate(seed)
+    }
+
+    /// Like `new`, given `params` (`Compiled::instantiate_with`).
+    pub fn with_params(bytes: &[u8], seed: u64, params: &[f32], limits: Limits) -> Result<Wasm> {
+        Compiled::new(bytes, limits)?.instantiate_with(seed, params)
     }
 
     /// The fuel left after the last call, if counted.

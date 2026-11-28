@@ -11,18 +11,19 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use wasmtime::{bail, format_err};
 
 use super::{Action, Actor, Invalidation, Outcome, World};
 use crate::body::Body;
-use crate::compose::PlacementTransform;
 use crate::edit::{Edit, Op, SavedTile, Shape, WorldSave};
 use crate::graph::{Data, Kind};
 use crate::modules::ModuleCheck;
-use crate::physics::{Tool, verify_edit_tool};
+use crate::physics::{BrushTarget, Tool, verify_edit_tool};
 use crate::{Limits, Result, SIZES};
 
 /// The log format's name and version, on its first line.
@@ -129,24 +130,39 @@ pub fn replay(world: &mut World, log: &[Logged]) -> Result<()> {
     Ok(())
 }
 
-/// Converts an element-local `Edit` back to world space under `tf` (inverse of `world_edit_to_local`).
-fn local_edit_to_world(edit: &Edit, tf: PlacementTransform) -> Edit {
-    let s = tf.scale.max(1e-5);
-    let center = tf.local_to_world_point(edit.center);
-    let shape = edit.shape.scaled(s);
-    Edit {
-        op: edit.op,
-        shape,
-        center,
-        blend: edit.blend * s,
-        material: edit.material,
-        stamp_size: edit.stamp_size * s,
-        tool: edit.tool,
+/// Elements that carry a component-mask split's engine-made mask boxes in their `local_edits`: the
+/// pieces of a split (`derived_from` with `Data::Split`), and every piece later cut from one of
+/// those (which keeps its parent's edits).
+fn carries_mask_boxes(save: &WorldSave) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    loop {
+        let before = out.len();
+        for r in save.relations.iter().filter(|r| r.kind == Kind::DerivedFrom) {
+            let (Some(piece), Some(parent)) = (r.from.clone().element(), r.to.clone().element()) else { continue };
+            if r.data == Data::Split || out.contains(&parent) {
+                out.insert(piece);
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
     }
 }
 
-/// Replays every SDF edit in `save` chronologically against its base area(s) and placed elements,
-/// checking every edit's recorded `Edit::tool` and `save.mode` rules (`WORLD_PLAN.md`, phase H).
+/// Whether `le` is one of the engine's component-mask boxes (sharp box carves made with `Tool::All`).
+fn is_mask_box(le: &Edit) -> bool {
+    le.op == Op::Carve && le.tool == Tool::All && le.blend == 0.0 && matches!(le.shape, Shape::Box { .. })
+}
+
+/// Replays every SDF edit in `save` chronologically against its base area(s), checking each
+/// edit's recorded `Edit::tool` under the mode it was made in (`Edit::mode`; `WORLD_PLAN.md`,
+/// phase H), the way the stroke was checked when it was made:
+///
+/// - a terrain edit against the base areas, the SDF landforms placed before it, and the edits
+///   before it;
+/// - an edit on a scene element (`local_edits`) against that element alone, in its own frame,
+///   carved by the edits recorded on it before — so where it has since been carried, or what
+///   it fell onto, does not matter.
 ///
 /// Returns `Ok(Ok(()))` if every edit is valid for its tool, `Ok(Err(reason))` naming the first
 /// edit whose tool cannot perform it (e.g. a tampered save), or `Err` on module load error.
@@ -157,9 +173,6 @@ pub fn verify_save_edits(
     limits: Limits,
     check: ModuleCheck,
 ) -> Result<std::result::Result<(), String>> {
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-
     // Start from the save's base areas, modules, and mode, with no edits or elements yet.
     let mut base = WorldSave::new(save.area.clone(), save.seed, Vec::new());
     base.mode = save.mode;
@@ -168,64 +181,22 @@ pub fn verify_save_edits(
     base.rules = save.rules.clone();
     let (mut world, _) = World::open(base, tiles, root, limits, check, SIZES[1].1)?;
 
-    // Elements produced by a non-planar component-mask split carry engine-generated mask boxes
-    // (`Tool::All`, sharp `Shape::Box` carves) in `local_edits`; skip those when checking player tools.
-    let split_ids: BTreeSet<u32> = save
-        .relations
-        .iter()
-        .filter(|r| r.kind == Kind::DerivedFrom && r.data == Data::Split)
-        .filter_map(|r| r.from.clone().element())
-        .collect();
-
+    // 1. Terrain edits, in order, each against what was there when it was made.
     let total_edits = save.edits.len();
     for edit_idx in 0..=total_edits {
-        // Spawn elements placed at this point in the edit timeline and verify their local edits.
+        // SDF landforms placed at this point in the edit timeline are part of the terrain.
         for pl in save.elements.iter().filter(|e| e.after_edits.min(total_edits) == edit_idx) {
-            let mut initial = pl.clone();
-            initial.local_edits.clear();
-            initial.promoted = None;
-            let tf = initial.transform();
-            world.spawn_placed(initial, None)?;
-            let is_split = split_ids.contains(&pl.id);
-            for (li, le) in pl.local_edits.iter().enumerate() {
-                let is_mask_box = is_split
-                    && le.op == Op::Carve
-                    && le.tool == Tool::All
-                    && le.blend == 0.0
-                    && matches!(le.shape, Shape::Box { .. });
-                let world_le = local_edit_to_world(le, tf);
-                if !is_mask_box {
-                    let unpromoted = world.unpromoted_sdfs_near(&world_le, Some(pl.id));
-                    if let Err(why) = verify_edit_tool(save.mode, &world_le, &mut world.region, &world.scene, &unpromoted)? {
-                        return Ok(Err(format!(
-                            "element #{} local edit #{li} ({} with {}): {why}",
-                            pl.id,
-                            le.op.name(),
-                            le.tool.save_name()
-                        )));
-                    }
-                }
-                if let Some(pos) = world.placed.iter().position(|e| e.id == pl.id) {
-                    let newly_promoted = !world.placed[pos].is_promoted();
-                    world.placed[pos].local_edits.push(*le);
-                    if newly_promoted {
-                        world.set_promoted(pl.id, Some(edit_idx));
-                    }
-                    world.commit(Invalidation::edit(world_le));
-                }
+            world.catalog.get_or_load(&pl.module)?;
+            if world.is_sdf_element(pl) {
+                world.spawn_placed(pl.clone(), None)?;
             }
         }
         if edit_idx == total_edits {
             break;
         }
         let edit = save.edits[edit_idx];
-        let unpromoted = world.unpromoted_sdfs_near(&edit, None);
-        if let Err(why) = verify_edit_tool(save.mode, &edit, &mut world.region, &world.scene, &unpromoted)? {
-            return Ok(Err(format!(
-                "edit #{edit_idx} ({} with {}): {why}",
-                edit.op.name(),
-                edit.tool.save_name()
-            )));
+        if let Err(why) = verify_edit_tool(&edit, &mut BrushTarget::World { region: &mut world.region, unpromoted: &[] })? {
+            return Ok(Err(format!("edit #{edit_idx} ({} with {}): {why}", edit.op.name(), edit.tool.save_name())));
         }
         // Apply this edit to the running world so subsequent edits see its result.
         let water_bounds = if edit.op == Op::Carve {
@@ -240,15 +211,31 @@ pub fn verify_save_edits(
         } else {
             None
         };
-        let (_, promo_bounds, _) = if edit.op == Op::Carve {
-            world.promote_overlapping_scene_elements(&edit, None, edit_idx)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
         let mut next = (*world.edits).clone();
         next.push(edit)?;
         world.edits = Arc::new(next);
-        world.commit(Invalidation::Some { edits: vec![edit], bounds: promo_bounds, water: water_bounds });
+        world.commit(Invalidation::Some { edits: vec![edit], bounds: Vec::new(), water: water_bounds });
+    }
+
+    // 2. Each scene element's own edits, in its frame, against it alone.
+    let masked = carries_mask_boxes(save);
+    for pl in save.elements.iter().filter(|e| !e.local_edits.is_empty()) {
+        world.catalog.get_or_load(&pl.module)?;
+        if world.is_sdf_element(pl) {
+            continue;
+        }
+        let Some(sdf) = world.catalog.mesh_sdf_of(pl)? else {
+            return Ok(Err(format!("element #{} has edits recorded on it but no solid to carve", pl.id)));
+        };
+        for (li, le) in pl.local_edits.iter().enumerate() {
+            if masked.contains(&pl.id) && is_mask_box(le) {
+                continue;
+            }
+            let mut target = BrushTarget::Element { sdf: &sdf, edits: &pl.local_edits[..li], scale: 1.0 };
+            if let Err(why) = verify_edit_tool(le, &mut target)? {
+                return Ok(Err(format!("element #{} local edit #{li} ({} with {}): {why}", pl.id, le.op.name(), le.tool.save_name())));
+            }
+        }
     }
     Ok(Ok(()))
 }

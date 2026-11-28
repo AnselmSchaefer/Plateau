@@ -481,6 +481,19 @@ impl RuleBook {
         Ok(())
     }
 
+    /// Whether `player` may change what holds for the whole world at once (its `world` / `workshop`
+    /// mode): only one who owns every claimed area in it. A world with no claimed areas (single
+    /// player, open sandboxes) lets anyone.
+    pub fn check_world(&self, player: &str) -> std::result::Result<(), Denial> {
+        match self.areas.iter().find(|a| a.role_of(player) != Role::Owner) {
+            None => Ok(()),
+            Some(a) => Err(Denial {
+                tile: a.tile,
+                reason: format!("only the owners of area ({}, {}) may switch the world's mode", a.tile[0], a.tile[1]),
+            }),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         for a in &self.areas {
             a.validate()?;

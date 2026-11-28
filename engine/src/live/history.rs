@@ -21,6 +21,9 @@ pub enum WorldAction {
     /// An element fallen (phase G): as it was, and as it came to rest (with the terrain's carves
     /// into it its own, if it was promoted).
     Fell { before: PlacedElement, after: PlacedElement },
+    /// An element fitted again to the opening it fills, once a change reached it (phase I): as it
+    /// was, and as it was made for the opening as it is now (new params, where the new site is).
+    Refit { before: PlacedElement, after: PlacedElement },
     /// Several changes one action made (a cut, then what came apart and fell), in order.
     Many(Vec<WorldAction>),
 }

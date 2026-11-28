@@ -12,7 +12,7 @@ use plateau_engine::edit::{Edit, EditLog, Edited, Shape, surface_normal};
 use plateau_engine::site::{SiteContext, SiteProbe};
 use plateau_engine::{Material, SIZES, body};
 use plateau_make::{
-    Builder, FitLaw, Made, Neighbor, Reply, SEED, Settings, Site, Writer, element_guide_at, judge_element, load_neighbors, make, make_element,
+    Builder, FitLaw, Made, Neighbor, Reply, SEED, Settings, Site, Writer, element_guide_at, judge_element, judge_element_at, load_neighbors, make, make_element,
     make_element_at, make_with_neighbors, source_of,
 };
 
@@ -286,29 +286,19 @@ fn make_element_at_cavity_holds_element_to_cavity_fit_and_shows_pictures() {
     let hit = body::look(&mut world, from.map(|c| c as f64), [0.0, 0.0, -1.0], person, person * 45.0).unwrap().unwrap();
     let normal = surface_normal(&mut world, hit, person).unwrap();
     let context = SiteContext::measure(&mut world, &SiteProbe { target: hit.map(|c| c as f32), normal, from: Some(from), size: person }).unwrap();
-    let cavity = context.cavity.as_ref().expect("round doorway measured");
-    let local_r = context.local(cavity.mean_radius());
-    let local_drop = context.local(cavity.drop());
+    assert!(context.cavity.is_some(), "round doorway measured");
 
     // Verify element_guide_at embeds both the fitting section and the hobbit-door example.
     let guide_text = element_guide_at(&root).unwrap();
     assert!(guide_text.contains("### Fitting an opening") && guide_text.contains("struct HobbitDoor"));
 
-    // Adapt `elements/hobbit-door/element.rs` to the measured opening's exact local centre & radius.
+    // The carried door makes itself for the site it is given (`host.params`, the site's measures):
+    // as it is, it fits. Round 1: its frame made to stop short of the outline -> leaves a gap
+    // round the opening's rim -> breaks `cavity fit`.
     let base_door = std::fs::read_to_string(root.join("elements/hobbit-door/element.rs")).unwrap();
-    let fitted_door = base_door
-        .replace("const MIDDLE: Point = Point { x: 0.0, y: 1.05, z: 0.0 };", &format!("const MIDDLE: Point = Point {{ x: 0.0, y: {local_drop:.4}, z: 0.0 }};"))
-        .replace("const OUTER: f32 = 1.13;", &format!("const OUTER: f32 = {:.4};", local_r * 1.10))
-        .replace("const INNER: f32 = 0.95;", &format!("const INNER: f32 = {:.4};", local_r * 0.92))
-        .replace("const LEAF: f32 = 0.985;", &format!("const LEAF: f32 = {:.4};", local_r * 0.96))
-        .replace("const HINGE: Point = Point { x: -INNER, y: 1.05, z: 0.0 };", &format!("const HINGE: Point = Point {{ x: -INNER, y: {local_drop:.4}, z: 0.0 }};"));
-    // Round 1: frame too small -> leaves a gap around the opening rim -> breaks `cavity fit`.
-    let too_small_door = base_door
-        .replace("const MIDDLE: Point = Point { x: 0.0, y: 1.05, z: 0.0 };", &format!("const MIDDLE: Point = Point {{ x: 0.0, y: {local_drop:.4}, z: 0.0 }};"))
-        .replace("const OUTER: f32 = 1.13;", &format!("const OUTER: f32 = {:.4};", local_r * 0.80))
-        .replace("const INNER: f32 = 0.95;", &format!("const INNER: f32 = {:.4};", local_r * 0.65))
-        .replace("const LEAF: f32 = 0.985;", &format!("const LEAF: f32 = {:.4};", local_r * 0.68))
-        .replace("const HINGE: Point = Point { x: -INNER, y: 1.05, z: 0.0 };", &format!("const HINGE: Point = Point {{ x: -INNER, y: {local_drop:.4}, z: 0.0 }};"));
+    assert!(base_door.contains("const BEYOND: f32 = 0.08;"));
+    let fitted_door = base_door.clone();
+    let too_small_door = base_door.replace("const BEYOND: f32 = 0.08;", "const BEYOND: f32 = -0.25;");
 
     let site = Site { context, world: None, law: FitLaw::Auto };
     let dir = root.join("target/plateau-make-tests/element-cavity-fit");
@@ -425,4 +415,49 @@ fn with_a_neighbour_claude_gets_its_border_and_is_held_to_borders_match() {
     let reloaded = load_neighbors(&dir).unwrap();
     assert_eq!(reloaded.len(), 1);
     assert_eq!(reloaded[0].side, Side::West);
+}
+
+#[test]
+fn an_element_that_reads_its_params_is_held_to_openings_like_its_site_s_too() {
+    // The round doorway of the test above, measured.
+    let person = SIZES[1].1;
+    let mut edits = vec![Edit::add(Shape::Box { half: [3.0, 2.5, 3.0], round: 0.1 }, [32.0, 1.5, 46.0], 0.0, Material::Soil, person)];
+    let r = 0.75 * person;
+    for k in 0..8 {
+        edits.push(Edit::carve(Shape::Sphere { radius: r }, [32.0, 1.15, 49.0 - 0.45 * r * k as f32], 0.35 * r, None, person));
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let garden_bytes = std::fs::read(root.join("areas/modules/garden.wasm")).unwrap();
+    let garden = plateau_engine::Wasm::new(&garden_bytes, SEED, plateau_engine::Limits::default()).unwrap();
+    let mut world = Edited::new(garden, std::sync::Arc::new(EditLog::from_edits(edits).unwrap()));
+    let from = [32.0f32, 1.6, 53.0];
+    let hit = body::look(&mut world, from.map(|c| c as f64), [0.0, 0.0, -1.0], person, person * 45.0).unwrap().unwrap();
+    let normal = surface_normal(&mut world, hit, person).unwrap();
+    let context = SiteContext::measure(&mut world, &SiteProbe { target: hit.map(|c| c as f32), normal, from: Some(from), size: person }).unwrap();
+    let site = Site { context, world: None, law: FitLaw::Auto };
+
+    // The carried door makes itself from every radius it is given: it fits the doorway and the
+    // four beside it, and nothing is noted of its fitting (only of its wood in soil).
+    let door = std::fs::read_to_string(root.join("elements/hobbit-door/element.rs")).unwrap();
+    let work = root.join("target/plateau-make-tests/param-range");
+    let module = builder().build_element(&door, &work.join("door")).unwrap();
+    let judged = judge_element_at(&module, &site, QUICK);
+    assert!(judged.kept(), "{:?}", judged.broken);
+    assert!(!judged.notes.iter().any(|n| n.contains("params")), "{:?}", judged.notes);
+    assert!(judged.notes.iter().any(|n| n.contains("wood")), "{:?}", judged.notes);
+
+    // One that reads them but makes itself round, as wide as the doorway is to its right: it fits
+    // the round doorway, and none of the four beside it but the wider one.
+    let lazy = door.replace("*r = params[P_RADII + k];", "*r = params[P_RADII];");
+    assert_ne!(lazy, door);
+    let module = builder().build_element(&lazy, &work.join("lazy")).unwrap();
+    let judged = judge_element_at(&module, &site, QUICK);
+    let others: Vec<&String> = judged.broken.iter().filter(|(law, _)| law == "cavity fit, other openings").map(|(_, why)| why).collect();
+    assert!(judged.broken.iter().all(|(law, _)| law == "cavity fit, other openings"), "fits its own: {:?}", judged.broken);
+    assert!(others.iter().any(|w| w.contains("15% higher")) && others.iter().any(|w| w.contains("15% narrower")), "{others:?}");
+
+    // One that reads none: it fits its own, and is noted to fit no other.
+    let fixed = std::fs::read(root.join("made/elements/oak-hollow-door/element.wasm")).unwrap();
+    assert!(!plateau_engine::check::reads_params(&fixed));
+    assert!(plateau_engine::check::reads_params(&std::fs::read(root.join("elements/modules/hobbit-door.wasm")).unwrap()));
 }

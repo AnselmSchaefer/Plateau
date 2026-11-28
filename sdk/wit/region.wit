@@ -5,7 +5,7 @@
 ///
 /// An area is 64 m square: x and z from 0 to 64, y up, in metres, the ground about y = 0. North is
 /// the edge at z = 0, east at x = 64, south at z = 64, west at x = 0.
-package plateau:region@0.1.0;
+package plateau:region@0.2.0;
 
 interface types {
     /// A point in the area, in metres.
@@ -130,6 +130,12 @@ interface types {
 interface host {
     /// The area's seed: the same module with the same seed is the same world on every machine.
     seed: func() -> u64;
+
+    /// What this placement of an element was given to fit (WORLD_PLAN.md, phase I): at most 64
+    /// numbers, each finite, the same for as long as the placement is. An area, or an element
+    /// placed with none, gets an empty list. For a site, the numbers are `SiteContext::params`
+    /// (`make/ELEMENT_GUIDE.md`, "Params"). Since 0.2.0.
+    params: func() -> list<f32>;
 }
 
 world region {

@@ -19,7 +19,7 @@
 //! A site is `--site FILE.site` (as `plateau-play` writes them with `I`; the world beside it, as
 //! `FILE.plateau`, is used if it is there), or `--at X,Y,Z` in `--save WORLD.plateau` and/or `--area
 //! AREA`, seen `--from X,Y,Z` (or from nowhere), by someone `--size tiny|person|giant` (or metres
-//! tall). `--fit auto|cavity|ground|none` says which law of fitting it is held to; `--place` puts the
+//! tall). `--fit auto|cavity|ground|span|wall|none` says which law of fitting it is held to; `--place` puts the
 //! element made into `--save`'s world, where it was made to go.
 //!
 //! Claude is asked through the Claude Code command line with the owner's own login (`claude -p`).
@@ -198,11 +198,11 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "plateau make \"<words>\" [--sketch MAP.png] [--name NAME] [--beside SIDE:AREA ...]\n\
-         plateau make-element \"<words>\" [--name NAME] [SITE [--fit auto|cavity|ground|none] [--place [--accept-changed-modules]]]\n\
+         plateau make-element \"<words>\" [--name NAME] [SITE [--fit auto|cavity|ground|span|wall|none] [--place [--accept-changed-modules]]]\n\
          plateau test-set [NAME ...]\n\
          plateau check NAME [--sketch MAP.png] [--beside SIDE:AREA ...]\n\
          plateau check-pair AREA_A SIDE AREA_B\n\
-         plateau check-element NAME [SITE [--fit auto|cavity|ground|none]]\n\
+         plateau check-element NAME [SITE [--fit auto|cavity|ground|span|wall|none]]\n\
          plateau measure SITE [--out FILE.site]\n\
          SITE: --site FILE.site | --at X,Y,Z [--save WORLD.plateau] [--area AREA] [--seed N] [--from X,Y,Z] [--size tiny|person|giant|METRES]"
     );
@@ -297,7 +297,7 @@ fn point(s: &str) -> Result<[f32; 3], String> {
 fn site_of(repo: &Path, args: &[String]) -> Result<Option<Site>, String> {
     let e = |e: plateau_engine::Error| format!("{e:#}");
     let law = match flag(args, "--fit") {
-        Some(name) => FitLaw::from_name(&name).ok_or(format!("unknown fit `{name}` (expected auto, cavity, ground or none)"))?,
+        Some(name) => FitLaw::from_name(&name).ok_or(format!("unknown fit `{name}` (expected auto, cavity, ground, span, wall or none)"))?,
         None => FitLaw::Auto,
     };
     let area = flag(args, "--area").map(|a| resolve_area(repo, &a)).transpose()?;
@@ -367,6 +367,8 @@ fn place(repo: &Path, args: &[String], name: &str, site: &Site) -> Result<(), St
         fitted: true,
         opening: c.cavity.as_ref().map(|_| Opening { target: c.target, normal: c.normal, size: c.size }),
         seed: Some(SEED),
+        // What it was judged given: the site's params.
+        params: c.params(),
     };
     let id = match world.apply(Actor { id: LOCAL_PLAYER, body: &mut body }, place) {
         Outcome::Done(s) => s.added[0],
@@ -434,6 +436,9 @@ fn check_element(repo: &Path, name: &str, given: Option<Site>) -> Result<(), Str
     if !judged.kept() {
         let broken: String = judged.broken.iter().map(|(law, why)| format!("\n- {law}: {why}")).collect();
         return Err(format!("{name} breaks:{broken}"));
+    }
+    for note in &judged.notes {
+        eprintln!("note: {name}: {note}");
     }
     if let Some(parent) = out_wasm.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

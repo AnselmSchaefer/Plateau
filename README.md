@@ -11,8 +11,9 @@ physical objects across scales, and walk seamlessly from one area to the next.
 - `POC_FINDINGS.md`: Step 10 summary — answers to the two PoC questions, full numbers, and next-stage architecture.
 - `AGENTS.md`: core architectural invariants (Hybrid Layer Ownership, strict WASM sandboxing, bit-exact determinism).
 - `docs/architecture.html` / `docs/architecture.png`: system architecture overview.
-- `sdk/`: what areas and elements are written against — WIT world `plateau:region@0.1.0`
-  (`sdk/wit/region.wit`), pre-generated bindings, deterministic SDF math/noise, `MeshBuilder` /
+- `sdk/`: what areas and elements are written against — WIT world `plateau:region@0.2.0`
+  (`sdk/wit/region.wit`; `0.1.0` modules still load), pre-generated bindings, `params()` (what a
+  placement is given to fit its site), deterministic SDF math/noise, `MeshBuilder` /
   `SceneBuilder`, `Area` / `Element` traits, and `area!` / `element!` macros.
 - `engine/`: renderer-agnostic engine — Wasmtime loader & validator (`check`, `wasm`), multi-area
   `Atlas` & C¹ border stitching (`atlas`), Surface Nets chunks & view-directed LOD rings (`chunk`,
@@ -28,9 +29,11 @@ physical objects across scales, and walk seamlessly from one area to the next.
   (`G`, `H`, `R`/`T`, wheel), undo/redo (`Z`/`Y`), and save/reload (`Ctrl+S`/`Ctrl+L`).
 - `areas/`: carried hand-written areas (`areas/garden/area.rs`, built via `areas/build.sh`).
 - `elements/`: carried standalone composable `.wasm` elements (`tree`, `bridge`, `lantern`, `hill`,
-  built via `elements/build.sh`).
-- `made/`: Claude-generated areas (`table`, `headland`, `pond`, `forest`, `castle`,
-  `headland-sketched`, `pond-sketched`, `windmill`, and `forest-beside-pond`).
+  `boat`, `pillar`, `sign`, and `hobbit-door`, which makes itself for any opening from its site's
+  params), built via `elements/build.sh`.
+- `made/`: Claude-generated areas (`pond-sketched` and `forest-beside-pond`, which the engine tests
+  walk), the element `oak-hollow-door`, and the last test-set run (`results.md`; `plateau test-set`
+  makes the five again).
 - `sketches/`: paint palette (`plateau.gpl`) and example sketches (`headland.png`, `pond.png`).
 - `spike/`: Step 0 spike and benchmarks (`spike/RESULTS.md`).
 

@@ -79,7 +79,7 @@ fn done(outcome: Outcome) -> Summary {
 }
 
 fn place(world: &mut World, body: &mut Body, module: &str, pos: [f32; 3], yaw: f32) -> u32 {
-    done(act(world, body, Action::Place { module: module.into(), pos, yaw, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7) })).added[0]
+    done(act(world, body, Action::Place { module: module.into(), pos, yaw, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7), params: Vec::new() })).added[0]
 }
 
 fn laws_hold(world: &mut World) {

@@ -39,7 +39,7 @@ use plateau_engine::atlas::{CompiledAtlas, Side};
 use plateau_engine::body::{self, Body, Intent};
 use plateau_engine::cut::format_mass;
 use plateau_engine::edit::{Op, SavedTile, WorldSave, surface_normal};
-use plateau_engine::fit::fit_transform;
+use plateau_engine::fit::fit_to_site;
 use plateau_engine::graph::Opening;
 use plateau_engine::laws::length;
 use plateau_engine::live::{self, ActionLog, Actor, LayerChange, Outcome, SculptTarget, World};
@@ -682,20 +682,22 @@ fn place_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
                 let world = &mut ctx.world.0;
                 let site = SiteContext::measure(&mut world.combined(), &probe);
                 site.and_then(|s| {
-                    let fitted = fit_transform(&mut world.region, &world.scene, &s, &elem.preview_scene)?;
+                    let fitted = fit_to_site(&mut world.region, &world.scene, &s, &elem, 1)?;
                     Ok((s, fitted))
                 })
             });
             match cavity_attempt {
-                Some(Ok((site, Ok((tf, rim))))) => {
+                Some(Ok((site, Ok(fitted)))) => {
                     let summary = site.summary();
                     let opening = Opening { target: site.target, normal: site.normal, size: site.size };
+                    let rim = fitted.rim;
                     ctx.place.last_site = Some(site);
                     ctx.place.fitted = Some(FittedSnap {
                         module: elem.module.clone(),
-                        transform: tf,
+                        transform: fitted.tf,
                         summary: summary.clone(),
                         opening,
+                        params: fitted.params,
                     });
                     player.say(format!(
                         "fitted {} ({} to {} into rim) — LMB to place",
@@ -714,6 +716,7 @@ fn place_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
                             transform: saved_site.frame,
                             summary,
                             opening: Opening { target: saved_site.target, normal: saved_site.normal, size: saved_site.size },
+                            params: saved_site.params(),
                         });
                         player.say(format!("snapped {} to its authored site — LMB to place", elem.name));
                     } else {
@@ -734,15 +737,15 @@ fn place_input(ctx: &mut EditCtx<'_>, player: &mut Player, a: &Asking<'_>) {
         {
             let fitted_snap = ctx.place.fitted.clone().filter(|s| s.module == elem.module);
             let placement = if let Some(snap) = fitted_snap {
-                Some((snap.transform.pos, 0.0, Some(snap.transform.rot), snap.transform.scale, Some(snap.opening)))
+                Some((snap.transform.pos, 0.0, Some(snap.transform.rot), snap.transform.scale, Some(snap.opening), snap.params))
             } else {
                 ctx.place.aim.map(|(h, _)| {
-                    ([h[0] as f32, h[1] as f32, h[2] as f32], ctx.place.yaw, None, ctx.place.placement_scale(psize), None)
+                    ([h[0] as f32, h[1] as f32, h[2] as f32], ctx.place.yaw, None, ctx.place.placement_scale(psize), None, Vec::new())
                 })
             };
-            if let Some((at, yaw, rot, scale, opening)) = placement {
+            if let Some((at, yaw, rot, scale, opening, params)) = placement {
                 let was_fitted = opening.is_some();
-                let place = live::Action::Place { module: elem.module.clone(), pos: at, yaw, rot, scale, fitted: was_fitted, opening, seed: None };
+                let place = live::Action::Place { module: elem.module.clone(), pos: at, yaw, rot, scale, fitted: was_fitted, opening, seed: None, params };
                 if ctx.apply(player, place).is_done() && was_fitted {
                     ctx.place.fitted = None;
                 }

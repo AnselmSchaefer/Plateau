@@ -55,6 +55,7 @@ fn placed(id: u32, element: &CompiledElement, tf: PlacementTransform, size: f32)
         clips: Vec::new(),
         local_edits: Vec::new(),
         author: None,
+        params: Vec::new(),
     }
 }
 
@@ -65,7 +66,7 @@ fn oak(carves: &[Edit]) -> (PlacedElement, SdfElementEntry) {
     let mut pl = placed(1, &tree, PlacementTransform::new([32.0, 0.0, 48.0], 0.0, 1.0), PERSON);
     pl.promoted = Some(0);
     pl.local_edits = carves.iter().map(|e| world_edit_to_local(e, pl.transform())).collect();
-    let mesh = tree.build_mesh_sdf(pl.seed, &[]).unwrap().unwrap();
+    let mesh = tree.build_mesh_sdf(pl.seed, &[], &[]).unwrap().unwrap();
     (pl.clone(), SdfElementEntry::from_promoted_mesh(pl, mesh))
 }
 
@@ -258,18 +259,18 @@ fn the_round_door_goes_into_round_openings_of_every_scale_and_nothing_else() {
         let mean = c.mean_radius();
         assert!((tf.scale - mean * 1.07 / 1.13).abs() < 0.05 * mean, "{what}: scale {} for a radius of {mean}", tf.scale);
         assert!(rim.least > 0.04 * mean && rim.most < 0.15 * mean, "{what}: goes in {} to {} round a radius of {mean}", rim.least, rim.most);
-        let fit = cavity_fit(&mut area, &world, &site, &door, 7, tf).unwrap().unwrap_or_else(|why| panic!("{what}: {why}"));
+        let fit = cavity_fit(&mut area, &world, &site, &door, 7, &[], tf).unwrap().unwrap_or_else(|why| panic!("{what}: {why}"));
         assert!(fit.leaf && fit.walkable, "{what}: {fit:?}");
-        assert_eq!(cavity_fit(&mut area, &world, &site, &door, 7, tf).unwrap(), Ok(fit), "{what}: judged again, the same");
+        assert_eq!(cavity_fit(&mut area, &world, &site, &door, 7, &[], tf).unwrap(), Ok(fit), "{what}: judged again, the same");
 
         // From the site's file alone, its world not there: the same verdict.
         let mut alone = SiteRegion::new(SiteContext::from_text(&site.to_text()).unwrap());
         let (again, _) = fit_transform(&mut alone, &world, &site, &door.preview_scene).unwrap().unwrap();
         assert!((again.scale - tf.scale).abs() < 0.01 * tf.scale, "{what}");
-        assert_eq!(cavity_fit(&mut alone, &world, &site, &door, 7, tf).unwrap().map(|f| f.leaf), Ok(true), "{what}");
+        assert_eq!(cavity_fit(&mut alone, &world, &site, &door, 7, &[], tf).unwrap().map(|f| f.leaf), Ok(true), "{what}");
 
         // Wrong, and said how.
-        let refused = |area: &mut World, tf: PlacementTransform| cavity_fit(area, &world, &site, &door, 7, tf).unwrap().unwrap_err();
+        let refused = |area: &mut World, tf: PlacementTransform| cavity_fit(area, &world, &site, &door, 7, &[], tf).unwrap().unwrap_err();
         let small = refused(&mut area, PlacementTransform { scale: 0.9 * tf.scale, ..tf });
         assert!(small.contains("a gap of") && small.contains("o'clock"), "{what}: {small}");
         let large = refused(&mut area, PlacementTransform { scale: 1.6 * tf.scale, ..tf });
@@ -303,7 +304,7 @@ fn the_round_door_goes_into_round_openings_of_every_scale_and_nothing_else() {
         assert!(rim_fit(&mut trunk, &site, &element.preview_scene, site.frame).unwrap().is_err(), "{name}");
     }
     let hill = load_element("hill");
-    assert!(cavity_fit(&mut trunk, &world, &site, &hill, 7, site.frame).unwrap().unwrap_err().contains("landform"));
+    assert!(cavity_fit(&mut trunk, &world, &site, &hill, 7, &[], site.frame).unwrap().unwrap_err().contains("landform"));
 }
 
 #[test]
@@ -325,7 +326,7 @@ fn a_tiny_is_kept_out_by_the_shut_door_opens_it_walks_in_and_shuts_it_behind() {
     edits.append(&mut carves);
     let mut pl = oak(&[]).0;
     pl.promoted = Some(0);
-    let mesh = load_element("tree").build_mesh_sdf(pl.seed, &[]).unwrap().unwrap();
+    let mesh = load_element("tree").build_mesh_sdf(pl.seed, &[], &[]).unwrap().unwrap();
     let mut area = garden_with(&edits, vec![SdfElementEntry::from_promoted_mesh(pl.clone(), mesh)]);
 
     let eye = at(bark + 0.06, y);
@@ -337,7 +338,7 @@ fn a_tiny_is_kept_out_by_the_shut_door_opens_it_walks_in_and_shuts_it_behind() {
     let door = load_element("hobbit-door");
     let mut world = SceneWorld::default();
     let (tf, _) = fit_transform(&mut area, &world, &site, &door.preview_scene).unwrap().unwrap_or_else(|why| panic!("{why}"));
-    cavity_fit(&mut area, &world, &site, &door, 7, tf).unwrap().unwrap_or_else(|why| panic!("{why}"));
+    cavity_fit(&mut area, &world, &site, &door, 7, &[], tf).unwrap().unwrap_or_else(|why| panic!("{why}"));
     let pl_door = placed(2, &door, tf, TINY);
     let save = WorldSave::with_elements("The walled garden", 7, edits.clone(), vec![pl, pl_door.clone()]);
     let kept = WorldSave::from_text(&save.to_text()).unwrap();
@@ -425,7 +426,7 @@ fn elements_for_open_ground_stand_on_it() {
     let site = measured(&mut garden, [46.0, 1.6, 48.0], [0.0, -0.6, -0.8], PERSON);
     for name in ["pillar", "lantern", "bridge", "tree"] {
         let element = load_element(name);
-        let fits = fit_check(&mut garden, &world, &site, &element, 7).unwrap();
+        let fits = fit_check(&mut garden, &world, &site, &element, 7, &[]).unwrap();
         assert_eq!(fits, Ok(()), "{name} on the lawn");
         let mut lifted = site.frame;
         lifted.pos[1] += 0.6;

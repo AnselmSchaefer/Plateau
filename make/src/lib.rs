@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use plateau_engine::atlas::{BorderProfile, CompiledAtlas, Side, TileSpec};
 use plateau_engine::compose::CompiledElement;
-use plateau_engine::fit::{SiteRegion, cavity_fit, ground_fit, staged};
+use plateau_engine::fit::{SiteRegion, cavity_fit, ground_fit, span_fit, staged, style_fit, wall_fit};
 use plateau_engine::picture::{Camera, Plan, map, picture, plan, plans, seam_camera, seam_plan, tint, views};
 use plateau_engine::reach::World;
 use plateau_engine::scene::{Combined, SceneWorld};
@@ -213,6 +213,9 @@ impl Builder {
 pub struct Judged {
     pub description: Option<Description>,
     pub broken: Vec<(String, String)>,
+    /// What is not held against it, but told in the `look` round: how its materials go with its
+    /// site, that it fits only its own opening.
+    pub notes: Vec<String>,
     pub seconds: f64,
 }
 
@@ -552,6 +555,10 @@ pub enum FitLaw {
     Auto,
     Cavity,
     Ground,
+    /// A bridge's (`fit::span_fit`): both ends on the banks, a gap between, walked across.
+    Span,
+    /// A shelf's or a sign's (`fit::wall_fit`): its back on the wall.
+    Wall,
     /// None: the element is only told of the site (a lamp beside a door, a rug within).
     Free,
 }
@@ -562,6 +569,8 @@ impl FitLaw {
             "auto" => Some(FitLaw::Auto),
             "cavity" => Some(FitLaw::Cavity),
             "ground" => Some(FitLaw::Ground),
+            "span" => Some(FitLaw::Span),
+            "wall" => Some(FitLaw::Wall),
             "none" => Some(FitLaw::Free),
             _ => None,
         }
@@ -572,6 +581,8 @@ impl FitLaw {
             FitLaw::Auto => "auto",
             FitLaw::Cavity => "cavity",
             FitLaw::Ground => "ground",
+            FitLaw::Span => "span",
+            FitLaw::Wall => "wall",
             FitLaw::Free => "none",
         }
     }
@@ -610,40 +621,85 @@ impl Site {
     }
 }
 
-/// `judge_element`, and the element held to its site as well, where it is placed for it.
+/// The openings beside a site's an element made for it by its params is held to as well: as wide
+/// and as high times its own, about its sill.
+pub const OTHER_OPENINGS: [(f32, f32, &str); 4] =
+    [(1.15, 1.0, "15% wider"), (0.85, 1.0, "15% narrower"), (1.0, 1.15, "15% higher"), (1.0, 0.85, "15% lower")];
+
+/// `judge_element`, and the element held to its site as well, where it is placed for it, given the
+/// site's params; if it reads them (`check::reads_params`), held as well to openings like the site's
+/// (`OTHER_OPENINGS`), given theirs. How its materials go with the site is noted.
 pub fn judge_element_at(module: &[u8], site: &Site, settings: Settings) -> Judged {
     let mut judged = judge_element(module, settings);
     if !judged.kept() {
         return judged;
     }
     let started = Instant::now();
-    let (name, verdict) = match site.held_to() {
-        FitLaw::Cavity => ("cavity fit", held_to_site(module, site, true)),
-        FitLaw::Ground => ("ground fit", held_to_site(module, site, false)),
+    let law = site.held_to();
+    let name = match law {
+        FitLaw::Cavity => "cavity fit",
+        FitLaw::Ground => "ground fit",
+        FitLaw::Span => "span fit",
+        FitLaw::Wall => "wall fit",
         _ => return judged,
     };
-    match verdict {
+    match held_to_site(module, site, &site.context, law, true) {
         Ok(Ok(())) => {}
         Ok(Err(why)) => judged.broken.push((name.into(), why)),
         Err(e) => judged.broken.push((name.into(), format!("asking the element for this law failed: {e:#}"))),
+    }
+    if judged.kept() && law == FitLaw::Cavity {
+        if check::reads_params(module) {
+            for (wide, high, what) in OTHER_OPENINGS {
+                let other = site.context.varied(wide, high);
+                match held_to_site(module, site, &other, law, false) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(why)) => judged.broken.push((
+                        "cavity fit, other openings".into(),
+                        format!("given the params of an opening like this one but {what}, placed in it: {why}"),
+                    )),
+                    Err(e) => judged.broken.push(("cavity fit, other openings".into(), format!("asking the element failed: {e:#}"))),
+                }
+            }
+        } else {
+            judged.notes.push(
+                "it reads no `params()`, so it fits this opening alone: made from the params it is given, it would fit every opening like it".into(),
+            );
+        }
+    }
+    if let Ok(element) = CompiledElement::load("element", module, Limits::default())
+        && let Ok(scene) = element.compiled.instantiate_with(SEED, &site.context.params()).and_then(|mut w| w.scene())
+        && let Some(note) = style_fit(&site.context, &scene).note
+    {
+        judged.notes.push(note);
     }
     judged.seconds += started.elapsed().as_secs_f64();
     judged
 }
 
-fn held_to_site(module: &[u8], site: &Site, cavity: bool) -> plateau_engine::Result<laws::Verdict> {
+/// `module` held to `context` (the site's own, or one like it), where it is placed for it, by
+/// `law`, given `context`'s params; in the site's world if `own` and it is there, else in what the
+/// measure tells of it.
+fn held_to_site(module: &[u8], site: &Site, context: &SiteContext, law: FitLaw, own: bool) -> plateau_engine::Result<laws::Verdict> {
     let element = CompiledElement::load("element", module, Limits::default())?;
     let scene = site.scene();
-    let mut region = site.region(scene.clone())?;
-    if cavity {
-        return Ok(cavity_fit(&mut region.region, &scene, &site.context, &element, SEED, site.context.frame)?.map(|_| ()));
+    let mut region = if own { site.region(scene.clone())? } else { Solids { region: Box::new(SiteRegion::new(context.clone())) as Box<dyn Region>, world: scene.clone() } };
+    // Given what the site gives it (`host.params`), as where it is placed for it.
+    let params = context.params();
+    let frame = context.frame;
+    if law == FitLaw::Cavity {
+        return Ok(cavity_fit(&mut region.region, &scene, context, &element, SEED, &params, frame)?.map(|_| ()));
     }
     if element.is_sdf() {
         return Ok(Ok(())); // A landform goes into the ground as it likes.
     }
-    let made = element.compiled.instantiate(SEED)?.scene()?;
+    let made = element.compiled.instantiate_with(SEED, &params)?.scene()?;
     let mut combined = Combined { region: &mut region.region, world: &scene };
-    ground_fit(&mut combined, site.context.size, &made, site.context.frame)
+    match law {
+        FitLaw::Span => span_fit(&mut combined, &SceneWorld::default(), &made, frame, &[context.size]),
+        FitLaw::Wall => wall_fit(&mut combined, &SceneWorld::default(), &made, frame, context.size),
+        _ => ground_fit(&mut combined, context.size, &made, frame),
+    }
 }
 
 /// Pictures of a site as whoever measured it sees it, bare or (`module`) with an element placed there
@@ -679,7 +735,8 @@ pub fn site_pictures(site: &Site, module: Option<&[u8]>, into: &Path, settings: 
         Some(module) => {
             let element = CompiledElement::load("element", module, Limits::default()).map_err(e)?;
             let moves = element.preview_scene.instances.iter().any(|i| i.id > 0);
-            let stage = |pressed| staged(&site.scene(), c, &element, SEED, tf, pressed).map(Arc::new).map_err(e);
+            let params = c.params();
+            let stage = |pressed| staged(&site.scene(), c, &element, SEED, &params, tf, pressed).map(Arc::new).map_err(e);
             stages.push(("fitted", "your element in its place", stage(false)?));
             if moves {
                 stages.push(("pressed", "your element after F was pressed before it", stage(true)?));
@@ -1097,6 +1154,14 @@ fn site_prompt(words: &str, site: &Site, dir: &Path, shown: &[(String, String)])
              little into it; a leaf, if it has one, shuts it all, and `F` opens and shuts it; and whoever could walk in through the bare opening still can.\n\n"
         }
         FitLaw::Ground => "It is made **for this ground** and is held to it: it stands on the ground in every quarter of its footprint, where that is not water.\n\n",
+        FitLaw::Span => {
+            "It is made **to span this gap** and is held to it: its deck runs along its local x or z, both its ends rest on the ground on either side, \
+             there is a gap under its middle, and someone as tall as whoever measured the site walks across it from end to end.\n\n"
+        }
+        FitLaw::Wall => {
+            "It is made **for this wall** and is held to it: its back (its local -Z side, at z = 0) lies on the wall's face over at least three quarters \
+             of it, neither standing off it nor sunk into it.\n\n"
+        }
         _ => "It is made to go here, at the frame's origin; nothing holds it to the site but sense.\n\n",
     };
     format!(
@@ -1107,11 +1172,16 @@ fn site_prompt(words: &str, site: &Site, dir: &Path, shown: &[(String, String)])
 }
 
 /// What to say when a site's element keeps every law: look at it in its place.
-fn fitted_said(dir: &Path, shown: &[(String, String)]) -> String {
+fn fitted_said(dir: &Path, shown: &[(String, String)], notes: &[String]) -> String {
     let list: String = shown.iter().map(|(file, what)| format!("- `{}`: {what}\n", dir.join(file).display())).collect();
+    let noted: String = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("Noted, not held against it:\n\n{}\n", notes.iter().map(|n| format!("- {n}\n")).collect::<String>())
+    };
     format!(
         "It builds, keeps every law, and fits. These are pictures of it in its place, as the engine draws its solid parts (read them with your Read tool; \
-         tints and what is not solid are not drawn):\n\n{list}\nLook at them as the one who asked for it would. Does it look like what was asked, and as if it \
+         tints and what is not solid are not drawn):\n\n{list}\n{noted}Look at them as the one who asked for it would. Does it look like what was asked, and as if it \
          had always been there? Is anything missing, wrong, or too plain? Then answer with the whole of `element.rs` again, made better, in one ```rust block, \
          keeping every law. If it is already as good as you can make it, answer with it unchanged."
     )
@@ -1197,7 +1267,7 @@ fn make_element_with(
                                         ("keeps every law".into(), None)
                                     } else {
                                         pictures_for = Some(folder.clone());
-                                        ("keeps every law".into(), Some(("look", fitted_said(&folder, &shown))))
+                                        ("keeps every law".into(), Some(("look", fitted_said(&folder, &shown, &judged.notes))))
                                     }
                                 }
                                 None => ("keeps every law".into(), None),

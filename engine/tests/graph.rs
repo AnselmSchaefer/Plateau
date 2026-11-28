@@ -63,7 +63,7 @@ fn done(outcome: Outcome) -> Summary {
 }
 
 fn place(world: &mut World, who: &str, body: &mut Body, module: &str, pos: [f32; 3]) -> u32 {
-    done(act_as(world, who, body, Action::Place { module: module.into(), pos, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None })).added[0]
+    done(act_as(world, who, body, Action::Place { module: module.into(), pos, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: None, params: Vec::new() })).added[0]
 }
 
 /// Chops the element `id` a metre up with a saw, the top toppling east: (stump, trunk).
@@ -354,7 +354,7 @@ const SOUTH: f32 = 48.294_56;
 /// The oak placed with the seed `phase_c.rs` measures it by, and a tiny's round home bored into its
 /// trunk with a saw (12 stamps of the tiny's brush, in the tree's own frame).
 fn oak_with_home(world: &mut World, body: &mut Body) -> u32 {
-    let oak = done(act_as(world, "local", body, Action::Place { module: TREE.into(), pos: OAK, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7) })).added[0];
+    let oak = done(act_as(world, "local", body, Action::Place { module: TREE.into(), pos: OAK, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7), params: Vec::new() })).added[0];
     let r = 0.75 * TINY;
     for k in 0..12 {
         let at = [32.0, 0.5, SOUTH - 0.45 * r * k as f32];
@@ -406,6 +406,7 @@ fn a_door_fitted_to_a_home_in_a_tree_fills_it_and_hangs_from_the_tree() {
         fitted: true,
         opening: Some(opening),
         seed: Some(7),
+        params: Vec::new(),
     }))
     .added[0];
     assert_eq!(world.find(door).unwrap().seed, 7, "placed with the seed it was made with");

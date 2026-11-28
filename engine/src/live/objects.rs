@@ -104,10 +104,7 @@ impl World {
         if let Err(denial) = self.rules.check(actor.id, &Rule::CutOrCarry { at: pl.pos, owner: self.owner_of(id) }) {
             return Outcome::Denied(denial.reason);
         }
-        let Some(mut phys) = self.physics_of(id) else { return Outcome::Denied("rooted in terrain — sculpt with B".into()) };
-        if self.graph.contains(&Relation::uprooted(id)) {
-            phys.rooted = false;
-        }
+        let Some(phys) = self.carry_physics(id) else { return Outcome::Denied("rooted in terrain — sculpt with B".into()) };
         let extra_kg = self.carried_pack_kg(actor.id);
         match check_carry_with_load(&phys, self.is_sdf_element(&pl), actor.body.size, extra_kg) {
             CarryDecision::Blocked(reason) => Outcome::Denied(reason),

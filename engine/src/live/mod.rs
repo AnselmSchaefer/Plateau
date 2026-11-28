@@ -31,6 +31,7 @@ pub mod history;
 pub mod log;
 mod near;
 mod objects;
+mod refit;
 pub mod relations;
 
 use std::collections::BTreeMap;
@@ -47,7 +48,7 @@ use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, Plac
 use crate::carved::Carving;
 use crate::cut::{ObjectPhysics, check_carry_with_load, max_carry_mass_kg, world_edit_to_local};
 use crate::edit::{Edit, EditLog, Op, SavedTile, WorldSave};
-use crate::graph::{Graph, GraphDelta, Node};
+use crate::graph::{Graph, GraphDelta, Node, Relation};
 use crate::modules::{ModuleCheck, SavedModule, relative_to_root};
 use crate::physics::{BuoyancyState, Inventory, Tool, WorldMode, compute_buoyancy, player_mass_kg};
 use crate::rules::RuleBook;
@@ -59,6 +60,10 @@ pub use action::{Action, Actor, Outcome, SculptTarget, Summary};
 pub use history::{History, WorldAction};
 pub use log::{ActionLog, LOG_VERSION, Logged, replay, verify_save_edits};
 pub use falls::{FALL_LIMIT, MAX_ROUNDS};
+
+/// A scene element as a brush meets it alone (`World::element_brush`): where it stands, its exact
+/// solid, the edits its save records on it, and all that carves it now.
+pub(crate) type ElementBrush = (PlacementTransform, Arc<crate::mesh_sdf::MeshSdf>, Vec<Edit>, Vec<Edit>);
 pub use relations::Footing;
 
 /// Elements a carve promoted (id, edit index), their bounds, and their names.
@@ -471,8 +476,19 @@ impl World {
     /// (counting their carried material pack in `world` mode).
     pub fn can_still_hold(&self, player: &str, player_size: f32) -> bool {
         let Some(held) = self.held else { return true };
-        let Some(phys) = self.physics_of(held.id) else { return false };
-        check_carry_with_load(&phys, false, player_size, self.carried_pack_kg(player)).is_allowed()
+        let Some(phys) = self.carry_physics(held.id) else { return false };
+        let is_sdf = self.find(held.id).is_some_and(|pl| self.is_sdf_element(pl));
+        check_carry_with_load(&phys, is_sdf, player_size, self.carried_pack_kg(player)).is_allowed()
+    }
+
+    /// The physics `id` is carried by: its own, but not rooted if its roots were found to hold in
+    /// nothing (`uprooted`), as grabbing it judged.
+    pub(super) fn carry_physics(&self, id: u32) -> Option<ObjectPhysics> {
+        let mut phys = self.physics_of(id)?;
+        if self.graph.contains(&Relation::uprooted(id)) {
+            phys.rooted = false;
+        }
+        Some(phys)
     }
 
     /// Default tool for the world's current mode (`Hands` in `world`, `All` in `workshop`).
@@ -492,11 +508,16 @@ impl World {
             return;
         }
         let inv = self.inventories.entry(player.to_string()).or_default();
+        let before = inv.get(mat);
         inv.apply_delta(mat, delta_kg);
+        // What was actually applied (a debit is clamped at empty), so undo gives back no more.
+        let applied = inv.get(mat) - before;
         if inv.is_empty() {
             self.inventories.remove(player);
         }
-        self.inv_journal.push((player.to_string(), mat, delta_kg));
+        if applied != 0.0 {
+            self.inv_journal.push((player.to_string(), mat, applied));
+        }
     }
 
     pub(super) fn take_inv_journal(&mut self) -> Vec<(String, Material, f32)> {
@@ -533,11 +554,24 @@ impl World {
             if pl.is_promoted() || self.is_sdf_element(&pl) {
                 continue;
             }
-            if let Ok(Some(msdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) {
+            if let Ok(Some(msdf)) = self.catalog.mesh_sdf_of(&pl) {
                 out.push((pl.transform(), msdf));
             }
         }
         out
+    }
+
+    /// What a stroke on the scene element `id` alone is checked against: where it stands, its exact
+    /// solid, the edits recorded on it (`local_edits`: what a save can check again) and all that
+    /// carves it now (`carving_of`: those and the terrain's carves into it since it was promoted).
+    pub(super) fn element_brush(&mut self, id: u32) -> Option<ElementBrush> {
+        let pl = self.find(id)?.clone();
+        if self.is_sdf_element(&pl) {
+            return None;
+        }
+        let sdf = self.catalog.mesh_sdf_of(&pl).ok().flatten()?;
+        let carving = self.carving_of(&pl).map_or_else(|| pl.local_edits.clone(), |c| c.edits);
+        Some((pl.transform(), sdf, pl.local_edits.clone(), carving))
     }
 
     pub fn find(&self, id: u32) -> Option<&PlacedElement> {
@@ -572,12 +606,12 @@ impl World {
     /// by what was added to it).
     pub fn sdf_bounds_of(&self, pl: &PlacedElement) -> Option<ElementBounds> {
         if let Some(el) = self.catalog.get(&pl.module)
-            && let Some(bounds) = el.sdf_bounds
+            && let Some(bounds) = el.sdf_bounds_for(&pl.params)
         {
             return Some(bounds);
         }
         if pl.is_promoted()
-            && let Some(mesh_sdf) = self.catalog.cached_mesh_sdf(&pl.module, pl.seed, &pl.clips)
+            && let Some(mesh_sdf) = self.catalog.cached_mesh_sdf(&pl.module, pl.seed, &pl.params, &pl.clips)
         {
             let mut b = mesh_sdf.bounds();
             for e in &pl.local_edits {
@@ -609,12 +643,12 @@ impl World {
         best_id.map(|id| (id, best_t))
     }
 
-    /// A new SDF snapshot from the edits, water and every placed SDF element not carried or falling,
-    /// given to the region here and, with the chunks `inv` makes stale, to the window.
-    pub fn commit(&mut self, inv: Invalidation) {
-        let _span = info_span!("commit").entered();
+    /// The SDF as it is (the edits, water and every placed SDF element not carried or falling), but
+    /// for the elements `left_out`: a new snapshot, under a revision of its own.
+    pub(super) fn composed_without(&mut self, left_out: &[u32]) -> Arc<ComposedLog> {
         let mut exclude: Vec<u32> = self.falling.iter().map(|f| f.id).collect();
         exclude.extend(self.held.map(|h| h.id));
+        exclude.extend_from_slice(left_out);
         self.composed_revision += 1;
         let mut sdf_elements = Vec::new();
         for pl in &self.placed {
@@ -622,16 +656,23 @@ impl World {
                 continue;
             }
             if let Ok(compiled) = self.catalog.get_or_load(&pl.module) {
-                if let Some(bounds) = compiled.sdf_bounds {
+                if let Some(bounds) = compiled.sdf_bounds_for(&pl.params) {
                     sdf_elements.push(SdfElementEntry::new(pl.clone(), compiled.compiled.clone(), bounds));
                 } else if pl.is_promoted()
-                    && let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)
+                    && let Ok(Some(mesh_sdf)) = self.catalog.mesh_sdf_of(pl)
                 {
                     sdf_elements.push(SdfElementEntry::from_promoted_mesh(pl.clone(), mesh_sdf));
                 }
             }
         }
-        let composed = Arc::new(ComposedLog::new_with_water(self.edits.clone(), sdf_elements, self.water.clone(), self.composed_revision));
+        Arc::new(ComposedLog::new_with_water(self.edits.clone(), sdf_elements, self.water.clone(), self.composed_revision))
+    }
+
+    /// A new SDF snapshot from the edits, water and every placed SDF element not carried or falling,
+    /// given to the region here and, with the chunks `inv` makes stale, to the window.
+    pub fn commit(&mut self, inv: Invalidation) {
+        let _span = info_span!("commit").entered();
+        let composed = self.composed_without(&[]);
         self.region.log = composed.clone();
         self.region.prune_instances();
         self.changes.composed.push((composed, inv));
@@ -647,7 +688,7 @@ impl World {
         if !pl.is_promoted() || self.is_sdf_element(pl) {
             return None;
         }
-        let sdf = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips).ok().flatten()?;
+        let sdf = self.catalog.mesh_sdf_of(pl).ok().flatten()?;
         let mut edits = pl.local_edits.clone();
         if let Some(bounds) = self.sdf_bounds_of(pl) {
             let tf = pl.transform();
@@ -682,7 +723,7 @@ impl World {
     fn spawn_layer_for(&mut self, pl: PlacedElement) -> Result<Arc<crate::compose::CompiledElement>> {
         let compiled = self.catalog.get_or_load(&pl.module)?;
         if pl.is_promoted() {
-            self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips)?;
+            self.catalog.mesh_sdf_of(&pl)?;
         }
         let carving = self.carving_of(&pl);
         let scene = self.runtime.spawn_carved(pl.clone(), &compiled, &mut self.scene, self.viewer_size, carving)?;
@@ -699,7 +740,7 @@ impl World {
         let _span = info_span!("spawn_placed", id = pl.id).entered();
         let compiled = self.spawn_layer_for(pl.clone())?;
         self.dirty = true;
-        let sdf_bounds = compiled.sdf_bounds.or_else(|| if pl.is_promoted() { self.sdf_bounds_of(&pl) } else { None });
+        let sdf_bounds = compiled.sdf_bounds_for(&pl.params).or_else(|| if pl.is_promoted() { self.sdf_bounds_of(&pl) } else { None });
         let max_lift = if let Some(bounds) = sdf_bounds {
             self.commit(Invalidation::element(pl.transform(), bounds));
             let (_, hi) = pl.transform().world_influence_bounds(bounds);
@@ -802,7 +843,7 @@ impl World {
         for &(id, next_state) in ids {
             let Some(pos) = self.index_of(id) else { continue };
             let pl = self.placed[pos].clone();
-            if let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) {
+            if let Ok(Some(mesh_sdf)) = self.catalog.mesh_sdf_of(&pl) {
                 bounds_list.push((pl.transform(), mesh_sdf.bounds()));
             }
             self.set_promoted(id, next_state);
@@ -853,7 +894,7 @@ impl World {
             if compiled.is_sdf() {
                 continue;
             }
-            let Ok(Some(mesh_sdf)) = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.clips) else { continue };
+            let Ok(Some(mesh_sdf)) = self.catalog.mesh_sdf_of(&pl) else { continue };
             self.set_promoted(id, Some(edit_idx));
             promoted.push((id, edit_idx));
             bounds_list.push((pl.transform(), mesh_sdf.bounds()));

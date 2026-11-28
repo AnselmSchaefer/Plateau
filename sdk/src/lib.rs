@@ -113,8 +113,28 @@ pub trait Element: 'static {
     }
 }
 
+/// What this placement was given to fit (`plateau:region@0.2.0`, WORLD_PLAN.md phase I): at most
+/// 64 finite numbers, the same for as long as the placement is, empty for an area or an element
+/// placed with none. Ask once, in `new`. For a site they are its measures, in the order
+/// `make/ELEMENT_GUIDE.md` ("Params") gives; `param` reads one with a default.
+pub fn params() -> Vec<f32> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        bindings::plateau::region::host::params()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        native::PARAMS.with(|p| p.borrow().clone())
+    }
+}
+
+/// The `index`th of `params`, or `default` if there are not that many.
+pub fn param(params: &[f32], index: usize, default: f32) -> f32 {
+    params.get(index).copied().unwrap_or(default)
+}
+
 /// Exports a type implementing `Element` as a standalone composable Plateau `.wasm` module
-/// (`element!(OakTree);`). Uses the exact same sandboxed `plateau:region@0.1.0` contract as
+/// (`element!(OakTree);`). Uses the exact same sandboxed `plateau:region@0.2.0` contract as
 /// `area!`, plus `element-bounds` metadata and native `played(seed)` for tests.
 #[macro_export]
 macro_rules! element {
@@ -240,6 +260,17 @@ pub fn sample_all<A: Area>(area: &A, points: &[Point], size: f32) -> Vec<Answer>
 #[doc(hidden)]
 pub mod native {
     use crate::{Answer, Area, Command, Description, ElementBounds, PlayerState, Point, Scene};
+
+    thread_local!(pub(crate) static PARAMS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) });
+
+    /// Runs `f` (making an area or element natively, as `played`) with `params` as what `params()`
+    /// answers, as the engine gives them to a placement.
+    pub fn with_params<R>(params: &[f32], f: impl FnOnce() -> R) -> R {
+        let old = PARAMS.with(|p| std::mem::replace(&mut *p.borrow_mut(), params.to_vec()));
+        let out = f();
+        PARAMS.with(|p| *p.borrow_mut() = old);
+        out
+    }
 
     /// An area as the engine's tests play it, as the world's exports are called.
     pub trait Played {

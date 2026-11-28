@@ -11,14 +11,17 @@ pub const MOST_BYTES: usize = 4 << 20;
 pub const MOST_PAGES: u64 = 1024;
 pub const MOST_MEMORY: usize = (MOST_PAGES as usize) << 16;
 
-/// Where an area's imports come from: the world's `host`.
-pub const HOST: &str = "plateau:region/host@0.1.0";
+/// Where an area's imports come from: the world's `host`, as the interface is now.
+pub const HOST: &str = "plateau:region/host@0.2.0";
+/// The host of the first interface: modules built for it keep working (they are given no params).
+pub const HOST_0_1: &str = "plateau:region/host@0.1.0";
 
 type Signature = (&'static str, &'static [ValType], &'static [ValType]);
 
-/// What an area may import (from `HOST`) and must export, as the canonical ABI flattens the
-/// world's functions: their parameters and results.
-const IMPORTS: [Signature; 1] = [("seed", &[], &[I64])];
+/// What an area may import, from each version of the host, and must export, as the canonical ABI
+/// flattens the world's functions: their parameters and results. `params` returns a list, so it
+/// is given where to write it (a pointer and a length) and returns nothing.
+const IMPORTS: [(&str, &[Signature]); 2] = [(HOST_0_1, &[("seed", &[], &[I64])]), (HOST, &[("seed", &[], &[I64]), ("params", &[I32], &[])])];
 const EXPORTS: [Signature; 5] = [
     ("sample", &[I32, I32, F32], &[I32]),
     ("cabi_post_sample", &[I32], &[]),
@@ -56,6 +59,7 @@ pub fn check(module: &[u8]) -> Result<(), Vec<String>> {
     let mut why = Vec::new();
     // Each function's type, imported ones first.
     let (mut types, mut funcs, mut exported, mut memories) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    let mut hosts: Vec<&str> = Vec::new();
     let signature = |types: &Vec<Option<(Vec<ValType>, Vec<ValType>)>>, t: u32| types.get(t as usize).cloned().flatten();
     for payload in Parser::new(0).parse_all(module) {
         let Ok(payload) = payload else { return Err(vec!["it could not be read".into()]) };
@@ -72,7 +76,13 @@ pub fn check(module: &[u8]) -> Result<(), Vec<String>> {
             }
             Payload::ImportSection(r) => {
                 for import in r.into_imports().flatten() {
-                    let wanted = IMPORTS.iter().find(|i| import.module == HOST && i.0 == import.name);
+                    let host = IMPORTS.iter().find(|(h, _)| *h == import.module);
+                    if let Some(&(h, _)) = host
+                        && !hosts.contains(&h)
+                    {
+                        hosts.push(h);
+                    }
+                    let wanted = host.and_then(|(_, fs)| fs.iter().find(|i| i.0 == import.name));
                     match (import.ty, wanted) {
                         (TypeRef::Func(t), Some((name, params, results))) => {
                             if signature(&types, t) != Some((params.to_vec(), results.to_vec())) {
@@ -121,6 +131,9 @@ pub fn check(module: &[u8]) -> Result<(), Vec<String>> {
             _ => {}
         }
     }
+    if hosts.len() > 1 {
+        why.push(format!("it asks two versions of the engine at once ({})", hosts.join(" and ")));
+    }
     if memories != 1 {
         why.push("it does not have one memory of its own".into());
     }
@@ -130,4 +143,13 @@ pub fn check(module: &[u8]) -> Result<(), Vec<String>> {
         }
     }
     if why.is_empty() { Ok(()) } else { Err(why) }
+}
+
+/// Whether `module` asks the engine for its params (`host.params`, `plateau:region@0.2.0`): whether
+/// it can make itself for any site like the one it was made for, or only that one.
+pub fn reads_params(module: &[u8]) -> bool {
+    Parser::new(0).parse_all(module).flatten().any(|payload| match payload {
+        Payload::ImportSection(r) => r.into_imports().flatten().any(|i| i.module == HOST && i.name == "params"),
+        _ => false,
+    })
 }

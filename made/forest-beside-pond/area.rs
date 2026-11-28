@@ -222,7 +222,7 @@ impl Area for Forest {
         for t in self.trees.iter() {
             solid = solid.or(self.tree(t, p, view));
         }
-        solid = solid.or(self.rocks(p, view)).or(self.shrubs(p, view)).or(self.log(p, view));
+        solid = deepen(solid.or(self.rocks(p, view)).or(self.shrubs(p, view)).or(self.log(p, view)));
         let water = max(p.y - LEVEL, point(p.x - POOL.x, 0.0, p.z - POOL.z).flat_length() - POOL_REACH);
         let water = Answer::new(water, Material::Water).cut(solid.distance);
         solid.or(water)
@@ -1210,4 +1210,17 @@ fn hanging_lantern() -> MeshData {
     m.tint(255, 220, 130);
     m.lathe(point(0.0, 0.0, 0.0), &[(0.08, -0.72), (0.105, -0.64), (0.1, -0.54), (0.08, -0.49)], 12, Material::Sand);
     m.build()
+}
+
+/// Materials go down (`make/GUIDE.md`): a thin coat (grass, moss, leaf) only near a surface,
+/// giving way to what lies under it with depth.
+fn deepen(a: Answer) -> Answer {
+    let depth = -a.distance;
+    let material = match a.material {
+        Material::Grass => strata(depth, &[(Material::Grass, 0.08), (Material::Soil, 0.7), (Material::Stone, 0.0)]),
+        Material::Moss => strata(depth, &[(Material::Moss, 0.04), (Material::Stone, 0.0)]),
+        Material::Leaf => strata(depth, &[(Material::Leaf, 0.08), (Material::Wood, 0.0)]),
+        m => m,
+    };
+    Answer::new(a.distance, material)
 }

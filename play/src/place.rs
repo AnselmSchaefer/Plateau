@@ -36,6 +36,8 @@ pub struct FittedSnap {
     pub summary: String,
     /// Where the opening it fits was measured (it fills it once placed).
     pub opening: Opening,
+    /// What it is given to fit it (`host.params`): the site's, if it makes itself for them.
+    pub params: Vec<f32>,
 }
 
 #[derive(Resource)]
