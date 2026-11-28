@@ -59,7 +59,7 @@ use crate::{Compiled, ElementBounds, Limits, Material, PlayerState, Result, Scen
 pub use action::{Action, Actor, Outcome, SculptTarget, Summary};
 pub use history::{History, WorldAction};
 pub use log::{ActionLog, LOG_VERSION, Logged, replay, verify_save_edits};
-pub use falls::{FALL_LIMIT, MAX_ROUNDS};
+pub use falls::{FALL_LIMIT, MAX_ROUNDS, SETTLE_BUDGET};
 
 /// A scene element as a brush meets it alone (`World::element_brush`): where it stands, its exact
 /// solid, the edits its save records on it, and all that carves it now.
@@ -245,11 +245,16 @@ pub struct World {
     /// Inventory deltas `(player_id, material, delta_kg)` during the action being applied.
     inv_journal: Vec<(String, Material, f32)>,
     /// The most falls one action may set off (`FALL_LIMIT`); what is still loose falls with the next.
+    /// What settling left for later, out of budget (`falls::SETTLE_BUDGET`): settled with the
+    /// next action, or an `Action::Settle`.
+    unsettled: Option<falls::Pending>,
+    /// Points settling has asked in this action.
+    settle_spent: usize,
     pub fall_limit: usize,
     /// What the action being applied may have shaken (`falls`).
     pending: falls::Pending,
     /// Elements made into cells, by id, with the edits' revision and the element as they were.
-    cells: BTreeMap<u32, (u64, PlacedElement, falls::Cells)>,
+    cells: BTreeMap<u32, (PlacedElement, Vec<Edit>, falls::Cells)>,
     /// SDF elements asked alone (`entry_distances`), by id, with the edits' revision and the element.
     alone: BTreeMap<u32, (u64, PlacedElement, Arc<ComposedLog>)>,
 }
@@ -326,6 +331,8 @@ impl World {
             log: None,
             journal: GraphDelta::default(),
             inv_journal: Vec::new(),
+            unsettled: None,
+            settle_spent: 0,
             fall_limit: FALL_LIMIT,
             pending: falls::Pending::default(),
             cells: BTreeMap::new(),
@@ -398,6 +405,7 @@ impl World {
         self.changes.layers.push(LayerChange::DespawnAllPlaced);
         self.placed.clear();
         self.history = History::default();
+        self.unsettled = None;
         let edit_count = self.edits.len();
         for pl in saved.elements {
             let id = pl.id;
@@ -426,6 +434,12 @@ impl World {
             self.changes.layers.push(LayerChange::Spawn { owner, scene });
         }
         std::mem::take(&mut self.changes)
+    }
+
+    /// Whether settling left something for later (out of its budget): the window sends
+    /// `Action::Settle` while it does.
+    pub fn unsettled(&self) -> bool {
+        self.unsettled.is_some()
     }
 
     /// Draws carved elements on a thread of their own (`ElementRuntime::carve_in_background`): an
@@ -709,7 +723,9 @@ impl World {
         if !pl.is_promoted() || self.is_sdf_element(pl) {
             return None;
         }
-        let sdf = self.catalog.mesh_sdf_of(pl).ok().flatten()?;
+        // Drawn from its module's uncut solid and its cut planes, so a piece shares its original's
+        // bricks (`carved::Carving::clips`).
+        let sdf = self.catalog.get_or_build_mesh_sdf(&pl.module, pl.seed, &pl.params, &[]).ok().flatten()?;
         let mut edits = pl.local_edits.clone();
         if let Some(bounds) = self.sdf_bounds_of(pl) {
             let tf = pl.transform();
@@ -721,7 +737,7 @@ impl World {
                 }
             }
         }
-        Some(Carving { source: Carving::source_of(&pl.module, pl.seed, &pl.clips), sdf, edits })
+        Some(Carving { source: Carving::source_of(&pl.module, pl.seed, &pl.params), sdf, clips: pl.clips.clone(), edits })
     }
 
     /// Draws the element `id` as it is now carved (its layer made again if that changed).

@@ -75,7 +75,7 @@ fn a_carved_tree_keeps_its_own_triangles_and_remakes_only_the_carve() {
     let sdf = catalog.get_or_build_mesh_sdf(TREE, 7, &[], &[]).unwrap().unwrap();
     let source = Carving::source_of(TREE, 7, &[]);
 
-    let uncarved = Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), edits: Vec::new() });
+    let uncarved = Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), clips: Vec::new(), edits: Vec::new() });
     let original = tris(solid_mesh(&uncarved));
     let non_solid = scene.instances.iter().filter(|i| !i.solid).count();
     assert_eq!(uncarved.instances.len(), non_solid + 1, "the canopy is kept, the solid merged into one instance");
@@ -85,7 +85,7 @@ fn a_carved_tree_keeps_its_own_triangles_and_remakes_only_the_carve() {
     let r = 0.15;
     let edit = Edit::carve(Shape::Sphere { radius: r }, [east + 0.05, 1.0, 0.0], 0.02, None, PERSON);
     let edits = vec![edit];
-    let carving = Carving { source, sdf: sdf.clone(), edits: edits.clone() };
+    let carving = Carving { source, sdf: sdf.clone(), clips: Vec::new(), edits: edits.clone() };
     let carved = Carver::new().carve(&scene, &carving);
     let mesh = solid_mesh(&carved);
     let out = tris(mesh);
@@ -172,7 +172,7 @@ fn a_rim_cut_by_a_box_stays_sharp() {
     let east = bark_east(&sdf, 1.0);
     // A flat-floored notch: its floor at y = 0.94, cut in from the east.
     let edit = Edit::carve(Shape::Box { half: [0.3, 0.06, 0.6], round: 0.0 }, [east + 0.15, 1.0, 0.0], 0.0, None, PERSON);
-    let carving = Carving { source: Carving::source_of(TREE, 7, &[]), sdf, edits: vec![edit] };
+    let carving = Carving { source: Carving::source_of(TREE, 7, &[]), sdf, clips: Vec::new(), edits: vec![edit] };
     let carved = Carver::new().carve(&scene, &carving);
     let mesh = solid_mesh(&carved);
     // The notch's floor is flat and level: its vertices are on it, facing up, not rounded off.
@@ -268,8 +268,8 @@ fn a_bridge_carved_many_times_stays_light() {
         let at = [lo[0] + (hi[0] - lo[0]) * u, lo[1] + (hi[1] - lo[1]) * 0.4, lo[2] + (hi[2] - lo[2]) * (0.2 + 0.6 * ((k * 7 % 5) as f32 / 4.0))];
         edits.push(Edit::carve(Shape::Box { half: [half; 3], round: 0.07 * half }, at, 0.0, None, PERSON));
     }
-    let original = tris(solid_mesh(&Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), edits: Vec::new() }))).len();
-    let carved = Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), edits: edits.clone() });
+    let original = tris(solid_mesh(&Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), clips: Vec::new(), edits: Vec::new() }))).len();
+    let carved = Carver::new().carve(&scene, &Carving { source, sdf: sdf.clone(), clips: Vec::new(), edits: edits.clone() });
     let n = tris(solid_mesh(&carved)).len();
     println!("bridge: {original} triangles, carved fifteen times: {n}");
     assert!(n < 150_000, "a carved bridge is drawn with {n} triangles (from {original})");
@@ -323,5 +323,49 @@ fn carvings_made_in_the_background_end_as_those_made_at_once() {
         let expect = plateau_engine::compose::transform_scene(drawn, pl.transform());
         assert_eq!(shown.meshes.len(), expect.meshes.len());
         assert_eq!(solid_mesh(&shown).indices.len(), solid_mesh(&expect).indices.len(), "piece #{id} last shown as finally drawn");
+    }
+}
+
+/// A piece of a chop is drawn from its original's uncut solid with its cut plane (`Carving::clips`):
+/// the bricks no plane comes near are the original's, kept, so a chop makes again only those along
+/// the cut (played by hand 2026-11-28: every piece of a much-carved bridge was made whole again).
+/// Kept or made afresh, a piece is drawn the same.
+#[test]
+fn a_piece_is_drawn_from_its_originals_bricks_made_again_only_along_the_cut() {
+    use plateau_engine::cut::{ClipPlane, clip_scene};
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let scene = tree_scene(&mut catalog);
+    let sdf = catalog.get_or_build_mesh_sdf(TREE, 7, &[], &[]).unwrap().unwrap();
+    let source = Carving::source_of(TREE, 7, &[]);
+    // Carved all up the trunk, from the east, as a tiny's home and its stair might be.
+    let mut edits = Vec::new();
+    for k in 0..8 {
+        let y = 0.4 + 0.2 * k as f32;
+        let east = bark_east(&sdf, y);
+        edits.push(Edit::carve(Shape::Sphere { radius: 0.12 }, [east + 0.03, y, 0.0], 0.02, None, PERSON));
+    }
+    let whole = Carving { source, sdf: sdf.clone(), clips: Vec::new(), edits: edits.clone() };
+    let mut carver = Carver::new();
+    carver.carve(&scene, &whole);
+    let original_bricks = carver.bricks_made();
+    assert!(original_bricks > 10, "the carving is made of bricks ({original_bricks})");
+
+    // Chopped a metre up: the stump and the trunk.
+    let plane = ClipPlane::new([0.0, 1.0, 0.0], 1.0);
+    for (clip, name) in [(plane.flipped(), "stump"), (plane, "trunk")] {
+        let piece = clip_scene(&scene, &[clip]);
+        let carving = Carving { source, sdf: sdf.clone(), clips: vec![clip], edits: edits.clone() };
+        let before = carver.bricks_made();
+        let kept = carver.carve(&piece, &carving);
+        let made = carver.bricks_made() - before;
+        println!("{name}: {made} of {original_bricks} bricks made again");
+        assert!(made * 2 <= original_bricks, "the {name} made {made} bricks again of its original's {original_bricks}");
+        // The same, made afresh.
+        let fresh = Carver::new().carve(&piece, &carving);
+        assert_eq!(kept, fresh, "the {name} kept is the {name} made afresh");
+        // Nothing of it is drawn on the side its plane takes away.
+        for v in &solid_mesh(&kept).vertices {
+            assert!(v.pos[0] * clip.normal[0] + v.pos[1] * clip.normal[1] + v.pos[2] * clip.normal[2] >= clip.offset - 0.02, "the {name} drawn past its cut at {:?}", v.pos);
+        }
     }
 }

@@ -46,6 +46,8 @@ const DOMAIN: f32 = 3.0;
 const BRICK: i32 = 16;
 /// Cells along the side of the smallest block asked whether it holds surface.
 const LEAF: i32 = 4;
+/// A cut plane is asked of a brick it comes within this many cells of (`brick`).
+const CLIP_REACH: f32 = 3.0;
 /// Cells across an edit's smallest extent.
 const CELLS_PER_FEATURE: f32 = 6.0;
 /// Cells to the height of who made an edit, at most: what they see of it (the terrain gives them
@@ -77,26 +79,36 @@ const CUBE_EDGES: [(usize, usize); 12] = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2)
 pub struct Carving {
     /// What the SDF was made from (`Carving::source_of`): the same source, the same solid.
     pub source: u64,
+    /// The solid its module makes, uncut.
     pub sdf: Arc<MeshSdf>,
+    /// What it is cut to (a piece of a chop or a split), applied to `sdf` before `edits`, as its
+    /// physics has it. Kept apart from the solid so a piece is drawn from its original's bricks:
+    /// only those a plane comes near are made again (`WORLD_PLAN.md`, phase J).
+    pub clips: Vec<ClipPlane>,
     pub edits: Vec<Edit>,
 }
 
 impl Carving {
-    /// The key of the solid an element's `module`, `seed` and `clips` make.
-    pub fn source_of(module: &str, seed: u64, clips: &[ClipPlane]) -> u64 {
+    /// The key of the solid an element's `module`, `seed` and `params` make (uncut).
+    pub fn source_of(module: &str, seed: u64, params: &[f32]) -> u64 {
         let mut h = DefaultHasher::new();
         module.hash(&mut h);
         seed.hash(&mut h);
-        for c in clips {
-            c.key_bits().hash(&mut h);
+        for p in params {
+            p.to_bits().hash(&mut h);
         }
         h.finish()
     }
 
     /// Whether `other` carves the same solid the same way.
     pub fn same_as(&self, other: &Carving) -> bool {
-        self.source == other.source && self.edits == other.edits
+        self.source == other.source && self.clips == other.clips && self.edits == other.edits
     }
+}
+
+/// How far `p` is on the side `clip` takes away (negative on the side it keeps).
+fn beyond(clip: &ClipPlane, p: [f32; 3]) -> f32 {
+    clip.offset - dot3(clip.normal, p)
 }
 
 type Tri = [Vertex; 3];
@@ -108,6 +120,8 @@ type Crossing = ([f32; 3], [f32; 3]);
 pub struct Carver {
     solids: HashMap<u64, Arc<MeshData>>,
     bricks: HashMap<u64, Arc<Vec<Tri>>>,
+    /// Bricks made (not found kept), ever: what a carving cost.
+    made: usize,
 }
 
 impl Carver {
@@ -118,6 +132,11 @@ impl Carver {
     /// `scene` (an element's own, in its frame) with its solid instances drawn as `carving` carves
     /// them: one static solid instance of the carved mesh (added after its meshes, which keep their
     /// indices, as `SceneWorld`'s instances of it name them), every other instance and light as it was.
+    /// Bricks this carver has made (not found kept), ever.
+    pub fn bricks_made(&self) -> usize {
+        self.made
+    }
+
     pub fn carve(&mut self, scene: &Scene, carving: &Carving) -> Scene {
         let _span = tracing::info_span!("carve", edits = carving.edits.len()).entered();
         if !scene.instances.iter().any(|i| i.solid) {
@@ -147,6 +166,9 @@ impl Carver {
     fn solid_mesh(&mut self, scene: &Scene, carving: &Carving) -> Arc<MeshData> {
         let mut key = DefaultHasher::new();
         (VERSION, carving.source).hash(&mut key);
+        for c in &carving.clips {
+            c.key_bits().hash(&mut key);
+        }
         for e in &carving.edits {
             hash_edit(e, &mut key);
         }
@@ -167,7 +189,7 @@ impl Carver {
                     keep_outside(t, &reach, h, 0, &mut out);
                 }
             }
-            let field = Field { sdf: &carving.sdf, edits: &carving.edits };
+            let field = Field { sdf: &carving.sdf, clips: &carving.clips, edits: &carving.edits };
             let mut bricks = Vec::new();
             if let Some((lo, size)) = root(&reach, h) {
                 let _span = tracing::info_span!("carve_find_bricks").entered();
@@ -207,13 +229,25 @@ impl Carver {
         for r in &near {
             hash_edit(&r.edit, &mut key);
         }
+        // And the cut planes that come within `CLIP_REACH` cells of its own cells (and the one about
+        // them it asks): further, a plane changes no sign the brick contours, nor any crossing on
+        // its edges (only values deeper inside than the plane is near, and the colours come from the
+        // uncut solid). A brick no plane comes near is its original's, made once for every piece.
+        let (clo, chi) = (lo.map(|c| (c - 1) as f32 * h), lo.map(|c| (c + BRICK + 1) as f32 * h));
+        let corners: Vec<[f32; 3]> = (0..8).map(|k| [0, 1, 2].map(|a| if (k >> a) & 1 == 0 { clo[a] } else { chi[a] })).collect();
+        let clips: Vec<ClipPlane> = field.clips.iter().filter(|c| corners.iter().any(|&p| beyond(c, p) > -CLIP_REACH * h)).copied().collect();
+        "clips".hash(&mut key);
+        for c in &clips {
+            c.key_bits().hash(&mut key);
+        }
         let key = key.finish();
         if let Some(b) = self.bricks.get(&key) {
             return b.clone();
         }
         let _span = tracing::info_span!("carve_brick_made", edits = near.len()).entered();
+        self.made += 1;
         let edits: Vec<Edit> = near.iter().map(|r| r.edit).collect();
-        let field = Field { sdf: field.sdf, edits: &edits };
+        let field = Field { sdf: field.sdf, clips: &clips, edits: &edits };
         let mut contour = Contour::new(&field, &near, h);
         contour.visit(lo, BRICK);
         let made = Arc::new(contour.finish());
@@ -259,11 +293,16 @@ fn gmin(reach: &[Reach], p: [f32; 3]) -> f32 {
 /// The carved solid's SDF.
 struct Field<'a> {
     sdf: &'a MeshSdf,
+    clips: &'a [ClipPlane],
     edits: &'a [Edit],
 }
 
 impl Field<'_> {
+    /// The cut planes, then the edits, on `a` (the uncut solid at `p`).
     fn apply(&self, p: [f32; 3], mut a: Answer) -> Answer {
+        for c in self.clips {
+            a.distance = a.distance.max(beyond(c, p));
+        }
         for e in self.edits {
             a = e.apply(p, a);
         }

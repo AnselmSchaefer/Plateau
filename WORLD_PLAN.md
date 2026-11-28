@@ -700,12 +700,44 @@ Still to do, in order:
 2. **A cut reuses its parent's bricks.** A piece is carved from its parent's source with its clip
    planes as part of the field, so only bricks a plane crosses are made again: a cut costs its cut
    face, not its history. Pieces keep only the edits that reach them.
+   *Done 2026-11-28:* `Carving` holds the module's uncut solid and the piece's `clips` apart
+   (`World::carving_of`); the field applies the planes, then the edits, as physics does. A brick is
+   asked of, and kept by, only the planes that come within `CLIP_REACH` (3) cells of it: a brick no
+   plane comes near is its original's, kept for every piece. A tree carved up its trunk and chopped:
+   each piece makes 8 of its original's 18 bricks again, and is drawn exactly as made afresh. The
+   played session's heaviest cuts carve in half the time (cut 647: 279 → 137 ms). `source_of` now
+   keys by `params` (it ignored them: two fitted doors of one module and seed shared bricks).
+   Test: `a_piece_is_drawn_from_its_originals_bricks_made_again_only_along_the_cut`.
+   Not done: pieces of a mask split (`Data::Split`) still carry all their original's edits and
+   make their carving whole; and pieces do not yet drop the edits that no longer reach them.
 3. **Edits are compacted.** Past a number of edits, an element's (and a region's) edits are baked into
    sparse bricks of distance and material (the bricks above), so a sample costs the same after
    1,000 strokes as after 10. Saves keep the edits; bricks are a cache made again from them.
 4. **Settling has a budget.** Tipping advances by the clearance a broad phase finds (fewer, larger
    steps), and obstacle queries go through a BVH over elements, so cost follows contacts, not pile
    size; `FALL_LIMIT` stays as the hard stop.
+   *Done 2026-11-28* (played session, carving drawn in the background: all actions 10.9 → 2.8 s,
+   cuts 6.5 → 0.5 s, worst cut 1.13 s → 124 ms, no frame of settling after it over 41 ms):
+   - `tip` asks only the points that go down as it turns, and only as far as a whole step's turn
+     reaches; `touching` skips elements whose bounds are beyond reach of every point. Both exact
+     (the session's 655 outcomes unchanged).
+   - Cells are made in the element's own frame and kept by what they are made of (the element
+     wherever it stands, and the terrain's carves that reach it), across actions up to
+     `MAX_KEPT_CELLS`: a piece tipping is not made into cells again at each pose it passes, nor all
+     of them at every terrain stroke anywhere.
+   - A tip turns up to 15° a step (was 5°): the step is still at most 0.9 of the clearance, so
+     nothing is passed through.
+   - **`SETTLE_BUDGET`**: settling counts the points it asks (deterministic, not timed). Out of
+     budget, a fall stops where it has safely got to (part of a tip, part of a drop), and that and
+     what has not yet fallen are carried over (`World::unsettled`). `Action::Settle` settles them
+     further; `play` sends one each frame while any is left. Logged like any action, so replays hold;
+     its changes are undone and redone with the action they continue (`Done::continues`).
+     `World::apply_settled` settles all at once, for tests and tools. The fall suite's kept hashes
+     were made again (same on `-O`, dev and `-O0`). Test:
+     `settling_left_for_later_settles_and_is_undone_with_its_action`.
+   - Not done: a BVH over elements. Elements are found by a scan of bounds, which costs little next
+     to asking them; it matters at thousands of elements near one another, and the budget bounds a
+     frame either way.
 5. **Elements have levels of detail.** A carved element is drawn for the size class that sees it
    (tiny, person, giant), chosen by distance like chunks, within a triangle budget per element.
 6. **Budgets are laws.** A heavy-play corpus (sessions like this one, kept as logs and replayed) holds

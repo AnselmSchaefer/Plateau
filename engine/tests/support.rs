@@ -67,8 +67,9 @@ fn person(world: &mut World) -> Body {
     Body::standing(&mut world.combined(), [LAWN[0] as f64 - 3.0, 40.0, LAWN[2] as f64], PERSON).unwrap()
 }
 
+/// Applies `action` and settles all it leaves (as the window does over its frames).
 fn act(world: &mut World, body: &mut Body, action: Action) -> Outcome {
-    world.apply(Actor { id: "local", body }, action)
+    world.apply_settled(Actor { id: "local", body }, action)
 }
 
 fn done(outcome: Outcome) -> Summary {
@@ -766,19 +767,22 @@ fn falls_and_hashes_match_natively_as_modules_and_across_o_and_o0() {
 
     // 4. Cross-build golden digest: verified bit-identical whether `plateau-engine` itself is
     //    built with `-O` (`--release`), dev (`opt-level=1`), or `-O0` (`-C opt-level=0`).
-    const KEPT_SAVE_SHA: &str = "ba3ab7c7bfd27f7b9b517847f37b7fa2efdd4beaa75ce5f54f054206bd1b59b9";
-    const KEPT_LOG_SHA: &str = "24f8c8ea62febe425f1f2d49d531ecb5f96554c79e9bd9b42922a3295375b911";
+    //    Made again 2026-11-28: an element's cells are made in its own frame (`cells_of`), a tip
+    //    turns up to 15° a step, and settling has a budget (`SETTLE_BUDGET`, the rest settled by
+    //    `Action::Settle`), so where pieces come to rest moved a little.
+    const KEPT_SAVE_SHA: &str = "66f440df3e006fb3bd73c33d89805ec1c10831469be8e4bbeb4e06f0c162d7a7";
+    const KEPT_LOG_SHA: &str = "414a11a1d3b0f14669b13d7e6d0e1e6c5277c56576521306d9e022c82b34e3fe";
     const KEPT_SDF: [u64; 8] = [
         0xa4ec_3407_8b19_e715,
         0xf95f_54d6_4d05_8f32,
-        0x3fd8_a32e_0aba_484c,
-        0x59bb_1e64_c28b_f175,
-        0xe85c_710d_081c_0e6b,
-        0x5e53_5fc4_d142_a1a2,
-        0xf0c2_409f_d742_3532,
-        0x49bf_f506_4429_177a,
+        0x2fda_e637_b38f_9eae,
+        0x3b2e_9f05_76b0_33b0,
+        0xad22_e1d9_c1a5_30a9,
+        0x7730_4848_da99_720f,
+        0xfc51_0a71_f0c2_e9fd,
+        0x5835_b6f6_9e62_a7e9,
     ];
-    const KEPT_CHUNKS: [u64; 2] = [0x76ae_0037_39d4_e29a, 0xcea0_89ce_53c6_447e];
+    const KEPT_CHUNKS: [u64; 2] = [0x76ae_0037_39d4_e29a, 0xc6fe_fb32_24b4_afeb];
 
     let save_sha = sha256_hex(save_o.as_bytes());
     let log_sha = sha256_hex(log_o.as_bytes());
@@ -980,4 +984,56 @@ fn a_severed_stump_under_a_fallen_trunk_drops_into_the_pit_instead_of_floating()
         }
     }
     laws_hold(&mut world);
+}
+
+/// Settling has a budget (`SETTLE_BUDGET`): an action that would ask more leaves the rest for later
+/// (`World::unsettled`), and `Action::Settle` (sent by the window each frame) settles it further.
+/// Played by hand (2026-11-28), one cut into a pile of carved pieces took most of a second, all of
+/// it settling. One undo takes the action back with all its settling, one redo brings both, and the
+/// log, settles and all, replays to the same world.
+#[test]
+fn settling_left_for_later_settles_and_is_undone_with_its_action() {
+    let dir = scratch("settle_later");
+    let log_path = dir.join("session.jsonl");
+    let start = garden_save();
+    let mut world = open(start.clone());
+    world.set_log(Some(ActionLog::create(&log_path).unwrap()));
+    let mut body = person(&mut world);
+    let tree = place(&mut world, &mut body, TREE, LAWN, 0.0);
+    let standing = world.to_save().to_text();
+
+    // A notch four-fifths through: the top breaks off and goes over, more than one action's worth.
+    let notch_at = |world: &mut World| {
+        let (_, east) = trunk_at(world, 1.0, LAWN[2]);
+        [east, 1.0, LAWN[2]]
+    };
+    let at = notch_at(&mut world);
+    let (west, east) = trunk_at(&mut world, 1.0, LAWN[2]);
+    let deep = 0.8 * (east - west);
+    let cut = Edit::carve(Shape::Box { half: [deep * 0.5, 0.12, 0.6], round: 0.01 }, [east - deep * 0.5 + 0.02, 1.0, LAWN[2]], 0.0, None, PERSON);
+    let s = done(world.apply(Actor { id: "local", body: &mut body }, Action::Sculpt { edit: cut, hit: at, tool: Tool::Saw, target: SculptTarget::Terrain { aimed: Some(tree) } }));
+    assert!(world.unsettled(), "the fall is left for later: {s:?}");
+    let mut frames = 0;
+    while world.unsettled() {
+        world.apply(Actor { id: "local", body: &mut body }, Action::Settle);
+        frames += 1;
+        assert!(frames < 100, "settling ends");
+    }
+    assert!(matches!(world.apply(Actor { id: "local", body: &mut body }, Action::Settle), Outcome::Unchanged(_)), "nothing more to settle");
+    laws_hold(&mut world);
+    let settled = world.to_save().to_text();
+    assert!(world.find(tree).is_none(), "the tree broke");
+
+    // One undo: the tree stands whole; one redo: broken and at rest, as it was.
+    done(world.apply(Actor { id: "local", body: &mut body }, Action::Undo));
+    assert_eq!(world.to_save().to_text(), standing);
+    done(world.apply(Actor { id: "local", body: &mut body }, Action::Redo));
+    assert_eq!(world.to_save().to_text(), settled);
+    world.set_log(None);
+
+    let log = ActionLog::read(&log_path).unwrap();
+    assert_eq!(log.iter().filter(|l| l.action == Action::Settle).count(), frames + 1);
+    let mut again = open(start);
+    replay(&mut again, &log).unwrap();
+    assert_eq!(again.to_save().to_text(), settled);
 }

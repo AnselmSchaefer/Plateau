@@ -93,6 +93,9 @@ pub enum Action {
     SetMode { mode: WorldMode },
     Undo,
     Redo,
+    /// What an earlier action left unsettled (out of settling's budget) settles further: undone and
+    /// redone with that action.
+    Settle,
 }
 
 impl Action {
@@ -111,6 +114,7 @@ impl Action {
             Action::SetMode { .. } => "set_mode",
             Action::Undo => "undo",
             Action::Redo => "redo",
+            Action::Settle => "settle",
         }
     }
 }
@@ -207,7 +211,16 @@ impl World {
             Action::SetMode { mode } => self.set_mode(&actor, *mode),
             Action::Undo => self.undo(actor.body),
             Action::Redo => self.redo(&mut actor),
+            Action::Settle => match self.unsettled {
+                Some(_) => Outcome::Done(Summary { edits: self.edits.len(), elements: self.placed.len(), ..Summary::default() }),
+                None => Outcome::Unchanged("nothing to settle".into()),
+            },
         };
+        // Undone or redone, what was left unsettled is left as it is (it went with what was undone,
+        // or is settled as it was when redone).
+        if matches!(action, Action::Undo | Action::Redo) && outcome.is_done() {
+            self.unsettled = None;
+        }
         // What fills an opening it reached is fitted to it again (undone with it).
         if outcome.is_done()
             && matches!(action, Action::Sculpt { target: SculptTarget::Terrain { .. }, .. })
@@ -241,7 +254,7 @@ impl World {
                         names.push(name);
                     }
                 }
-                if !names.is_empty() {
+                if !names.is_empty() && !matches!(action, Action::Settle) {
                     let fell = format!("{} fell", names.join(", "));
                     summary.said = Some(match summary.said.take() {
                         Some(s) if !s.is_empty() => format!("{s}; {fell}"),
@@ -254,6 +267,13 @@ impl World {
         self.pending = Default::default();
         let joined = (self.history.pushed - pushed) as usize;
         self.history.join_last(joined);
+        // Settling further continues what was left: undone and redone with it.
+        if matches!(action, Action::Settle)
+            && joined > 0
+            && let Some(done) = self.history.undo.last_mut()
+        {
+            done.continues = true;
+        }
         // What it did to the graph and player inventories goes with its undo, and is said in its outcome.
         let delta = self.take_journal();
         let inv_delta = self.take_inv_journal();
@@ -272,6 +292,34 @@ impl World {
             if let Err(e) = log.write(&id, feet, size, yaw, &action, &outcome, before, after) {
                 self.changes.said.push(format!("action log failed: {e}"));
                 self.log = None;
+            }
+        }
+        outcome
+    }
+
+    /// Applies `action`, then settles all it left unsettled (`Action::Settle`, as the window does
+    /// a frame at a time): what it did in the end, the settling's additions, removals, falls and
+    /// graph changes with its own. For tests and tools that want a world at rest after each action.
+    pub fn apply_settled(&mut self, actor: Actor<'_>, action: Action) -> Outcome {
+        let mut outcome = self.apply(Actor { id: actor.id, body: &mut *actor.body }, action);
+        while self.unsettled() {
+            let more = self.apply(Actor { id: actor.id, body: &mut *actor.body }, Action::Settle);
+            if let (Outcome::Done(s), Outcome::Done(m)) = (&mut outcome, more) {
+                for id in m.added {
+                    if !s.added.contains(&id) {
+                        s.added.push(id);
+                    }
+                }
+                s.removed.extend(m.removed);
+                for id in m.fell {
+                    if !s.fell.contains(&id) {
+                        s.fell.push(id);
+                    }
+                }
+                s.graph.added.extend(m.graph.added);
+                s.graph.removed.extend(m.graph.removed);
+                s.edits = m.edits;
+                s.elements = m.elements;
             }
         }
         outcome
@@ -660,19 +708,28 @@ impl World {
 
     fn undo(&mut self, body: &mut Body) -> Outcome {
         self.finish_all_falls(Some(&mut *body));
-        let Some(done) = self.history.undo.pop() else { return Outcome::Unchanged("nothing to undo".into()) };
-        let said = match self.undo_one(done.action.clone(), body) {
-            Ok(said) => said,
-            Err(Refused::Unchanged(why)) => {
-                self.history.undo.push(done);
-                return Outcome::Unchanged(why);
+        let mut said = String::new();
+        // What settled further after an action is undone with it.
+        loop {
+            let Some(done) = self.history.undo.pop() else {
+                return if said.is_empty() { Outcome::Unchanged("nothing to undo".into()) } else { Outcome::Done(self.summary(said)) };
+            };
+            said = match self.undo_one(done.action.clone(), body) {
+                Ok(said) => said,
+                Err(Refused::Unchanged(why)) => {
+                    self.history.undo.push(done);
+                    return Outcome::Unchanged(why);
+                }
+                Err(Refused::Denied(why)) => return Outcome::Denied(why),
+            };
+            self.revert_graph(&done.graph, false);
+            self.revert_inventory(&done.inventory, false);
+            let more = done.continues;
+            self.history.redo.push(done);
+            if !more {
+                return Outcome::Done(self.summary(said));
             }
-            Err(Refused::Denied(why)) => return Outcome::Denied(why),
-        };
-        self.revert_graph(&done.graph, false);
-        self.revert_inventory(&done.inventory, false);
-        self.history.redo.push(done);
-        Outcome::Done(self.summary(said))
+        }
     }
 
     /// Undoes one change (its graph is reverted by `undo`): what to say, or why it could not be.
@@ -753,7 +810,7 @@ impl World {
         let body = &mut *actor.body;
         self.finish_all_falls(Some(&mut *body));
         let Some(done) = self.history.redo.pop() else { return Outcome::Unchanged("nothing to redo".into()) };
-        let said = match self.redo_one(done.action.clone(), &author, body) {
+        let mut said = match self.redo_one(done.action.clone(), &author, body) {
             Ok(said) => said,
             Err(Refused::Unchanged(why)) => return Outcome::Unchanged(why),
             Err(Refused::Denied(why)) => return Outcome::Denied(why),
@@ -761,6 +818,20 @@ impl World {
         self.revert_graph(&done.graph, true);
         self.revert_inventory(&done.inventory, true);
         self.history.undo.push(done);
+        // And what settled further after it.
+        while self.history.redo.last().is_some_and(|d| d.continues) {
+            let Some(next) = self.history.redo.pop() else { break };
+            said = match self.redo_one(next.action.clone(), &author, body) {
+                Ok(s) => s,
+                Err(_) => {
+                    self.history.redo.push(next);
+                    break;
+                }
+            };
+            self.revert_graph(&next.graph, true);
+            self.revert_inventory(&next.inventory, true);
+            self.history.undo.push(next);
+        }
         Outcome::Done(self.summary(said))
     }
 

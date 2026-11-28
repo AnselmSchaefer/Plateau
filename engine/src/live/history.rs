@@ -35,6 +35,9 @@ pub struct Done {
     pub graph: GraphDelta,
     /// Signed material mass deltas `(player_id, material, delta_kg)` applied by this action.
     pub inventory: Vec<(String, Material, f32)>,
+    /// It settled further what the change before it left unsettled (`Action::Settle`): undone and
+    /// redone with that one.
+    pub continues: bool,
 }
 
 /// Changes to undo, most recent last, and those undone, to redo.
@@ -51,7 +54,7 @@ impl History {
     /// A new change: undoable, and what was undone is no longer redone. Its graph and inventory
     /// deltas are given once the action is done (`World::apply`).
     pub fn push(&mut self, action: WorldAction) {
-        self.undo.push(Done { action, graph: GraphDelta::default(), inventory: Vec::new() });
+        self.undo.push(Done { action, graph: GraphDelta::default(), inventory: Vec::new(), continues: false });
         self.redo.clear();
         self.pushed += 1;
     }
@@ -67,6 +70,7 @@ impl History {
             action: WorldAction::Many(tail.into_iter().map(|d| d.action).collect()),
             graph: GraphDelta::default(),
             inventory: Vec::new(),
+            continues: false,
         });
     }
 }

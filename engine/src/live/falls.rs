@@ -40,7 +40,7 @@ use std::sync::Arc;
 use super::relations::{Nothing, solid_points};
 use super::{FallingElement, Footing, Invalidation, LayerChange, World, WorldAction};
 use crate::compose::{Composed, ComposedLog, MAX_CLIPS, PlacedElement, PlacementTransform, SdfElementEntry, quat_mul, quat_normalize, quat_rotate};
-use crate::cut::{ClipPlane, clip_scene, world_edit_to_local};
+use crate::cut::{ClipPlane, clip_scene, local_edit_to_world, world_edit_to_local};
 use crate::edit::{Edit, EditLog, Op};
 use crate::graph::{Data, Graph, Kind, Node, Relation};
 use crate::support::{self, CELLS, Grid, SECTION_GRIP};
@@ -60,12 +60,19 @@ const STOP: f32 = 0.01;
 /// The most a body tips at once before it is asked again how it stands.
 const MAX_TIP: f32 = std::f32::consts::FRAC_PI_2;
 const MIN_TIP_STEP: f32 = 0.004;
-const MAX_TIP_STEP: f32 = 0.087;
+const MAX_TIP_STEP: f32 = 0.26;
 /// The farthest a body drops at once.
 const MAX_DROP: f32 = 256.0;
 /// Heights a carve's reach is asked at, and the most asked of one element.
 const HEIGHTS_PER_CARVE: usize = 5;
 const MAX_HEIGHTS: usize = 12;
+/// What settling may ask in one action: points asked of what is near (`obstacle_distances`). Past
+/// it, no further fall is begun; what is left is carried over (`World::unsettled`) and settles with
+/// the next action, or an `Action::Settle` the window sends each frame while some is left. Counted,
+/// not timed, so it comes out the same on every machine and the log replays.
+pub const SETTLE_BUDGET: usize = 20_000;
+/// Elements whose cells are kept between actions, at most.
+const MAX_KEPT_CELLS: usize = 512;
 /// A cross-section is sampled on a square of this many points a side.
 const SECTION_SAMPLES: usize = 24;
 
@@ -317,20 +324,53 @@ impl World {
         Some(Solid { log: Arc::new(log), size: pl.scale.clamp(SMALLEST, LARGEST) })
     }
 
-    /// The element `id` made into cells (kept while it and the edits are as they were).
+    /// The element `pl` as its own solid in its own frame (placed at the origin, unturned, at its
+    /// scale), with the terrain's carves since it was promoted that reach where it stands, brought
+    /// into that frame; and what that solid is made of (`pl` so placed, and those carves).
+    fn own_solid(&mut self, pl: &PlacedElement) -> Option<(Solid, PlacedElement, Vec<Edit>)> {
+        if self.is_sdf_element(pl) {
+            return None;
+        }
+        let mesh = self.catalog.mesh_sdf_of(pl).ok().flatten()?;
+        let tf = pl.transform();
+        let own = PlacementTransform::with_rot([0.0; 3], [0.0, 0.0, 0.0, 1.0], tf.scale);
+        let mut carves = Vec::new();
+        if pl.is_promoted()
+            && let Some(bounds) = self.sdf_bounds_of(pl).or_else(|| Some(mesh.bounds()))
+        {
+            let (blo, bhi) = tf.world_bounds(bounds);
+            for e in &self.edits.edits()[pl.sdf_after_edits().min(self.edits.len())..] {
+                let (lo, hi) = e.influence_bounds();
+                if e.op == Op::Carve && (0..3).all(|a| hi[a] >= blo[a] && lo[a] <= bhi[a]) {
+                    carves.push(local_edit_to_world(&world_edit_to_local(e, tf), own));
+                }
+            }
+        }
+        let mut at_home = pl.clone();
+        at_home.set_transform(own);
+        let mut alone = at_home.clone();
+        alone.promoted = Some(0);
+        let entry = SdfElementEntry::from_promoted_mesh(alone, mesh);
+        let log = ComposedLog::new_with_water(Arc::new(EditLog::from_edits(carves.clone()).ok()?), vec![entry], Arc::new(WaterLog::new()), 0);
+        Some((Solid { log: Arc::new(log), size: pl.scale.clamp(SMALLEST, LARGEST) }, at_home, carves))
+    }
+
+    /// The element `id` made into cells, in its own frame: kept while it (wherever it stands) and the
+    /// carves that reach it are as they were, so a piece tipping or carried over is not made again
+    /// at every place it passes (played by hand 2026-11-28: a cut's settling made its pieces' cells
+    /// again some twenty times, and every terrain stroke anywhere made all of them again).
     fn cells_of(&mut self, id: u32) -> Option<Cells> {
         let _span = tracing::info_span!("cells_of").entered();
         let pl = self.find(id)?.clone();
-        let rev = self.edits.revision();
-        if let Some((r, was, c)) = self.cells.get(&id)
-            && *r == rev
-            && *was == pl
+        let (solid, at_home, carves) = self.own_solid(&pl)?;
+        if let Some((was, was_carves, c)) = self.cells.get(&id)
+            && *was == at_home
+            && *was_carves == carves
         {
             return Some(c.clone());
         }
         let phys = self.physics_of(id)?;
-        let solid = self.solid_of(&pl)?;
-        let tf = pl.transform();
+        let tf = at_home.transform();
         let mut grid = Grid::over(phys.local_lo, phys.local_hi, CELLS)?;
         let cell_w = grid.cell * tf.scale;
         let near = 0.25 * cell_w;
@@ -378,7 +418,10 @@ impl World {
         let centres = solid_cells.iter().map(|&i| grid.centre(i)).collect();
         let inside = solid_cells.iter().map(|&i| depth[i]).collect();
         let cells = Cells { grid, solid: solid_cells, centres, inside };
-        self.cells.insert(id, (rev, pl, cells.clone()));
+        if self.cells.len() >= MAX_KEPT_CELLS {
+            self.cells.clear();
+        }
+        self.cells.insert(id, (at_home, carves, cells.clone()));
         Some(cells)
     }
 
@@ -434,6 +477,7 @@ impl World {
     /// again further on (`meets`).
     fn obstacle_distances(&mut self, id: u32, pts: &[[f32; 3]], size: f32, far: f32) -> (Vec<f32>, Vec<f32>) {
         let _span = tracing::info_span!("obstacle_distances").entered();
+        self.settle_spent += pts.len();
         let mut field = self.node_distances(&Node::Terrain, pts, size, far);
         let mut meshes = vec![far; pts.len()];
         let (lo, hi) = bounds(pts);
@@ -989,6 +1033,11 @@ impl World {
             if active.is_empty() {
                 break;
             }
+            // Out of budget, it drops as far as every point is known to be free, and on later.
+            if self.settle_spent >= SETTLE_BUDGET {
+                let free = active.iter().map(|&i| t[i]).fold(best, f32::min);
+                return if hit { best.min(free) } else { free.min(MAX_DROP) };
+            }
             let q: Vec<[f32; 3]> = active.iter().map(|&i| [pts[i][0], pts[i][1] - t[i], pts[i][2]]).collect();
             let qr: Vec<f32> = active.iter().map(|&i| radii[i]).collect();
             let (field, meshes) = self.obstacle_distances(id, &q, size, far);
@@ -1020,7 +1069,6 @@ impl World {
         // Turning about (u.z, 0, -u.x) carries up towards u.
         let k = [u[1], 0.0, -u[0]];
         let stop = (STOP * span).max(1e-4);
-        let far = 4.0 * span + 8.0;
         let near = 0.05 * span;
         let at = |angle: f32| {
             let (s, c) = (math::sin(0.5 * angle), math::cos(0.5 * angle));
@@ -1030,12 +1078,15 @@ impl World {
         };
         let (mut angle, mut prev) = (0.0f32, 0.0f32);
         for _ in 0..256 {
+            // Out of budget, it stops where it has safely turned to, and turns on later.
+            if self.settle_spent >= SETTLE_BUDGET {
+                break;
+            }
             let now = at(angle);
             let pts: Vec<[f32; 3]> = local.iter().map(|&p| now.local_to_world_point(p)).collect();
-            let (field, meshes) = self.obstacle_distances(id, &pts, size, far);
             let (mut step, mut met, mut pressed) = (MAX_TIP_STEP, false, false);
             // Only what goes down as it turns can meet anything; what is on the line it turns
-            // about stays where it is.
+            // about stays where it is. Only those are asked what is near.
             let (mut ask, mut ways, mut arms) = (Vec::new(), Vec::new(), Vec::new());
             for (i, p) in pts.iter().enumerate() {
                 let r = sub(*p, pivot);
@@ -1050,8 +1101,12 @@ impl World {
                 ways.push(v.map(|c| c / vl.max(1e-9)));
                 arms.push(rl);
             }
-            let sel = |v: &[f32]| ask.iter().map(|&i| v[i]).collect::<Vec<f32>>();
-            let (apts, aradii, afield, ameshes) = (ask.iter().map(|&i| pts[i]).collect::<Vec<_>>(), sel(radii), sel(&field), sel(&meshes));
+            let apts: Vec<[f32; 3]> = ask.iter().map(|&i| pts[i]).collect();
+            let aradii: Vec<f32> = ask.iter().map(|&i| radii[i]).collect();
+            // Nothing further than a whole step's turn (and a ball and a stop) changes the step or
+            // what is met: asked no further, the step comes out the same, with fewer elements near.
+            let far = arms.iter().zip(&aradii).map(|(a, r)| MAX_TIP_STEP * a / 0.9 + r + 2.0 * stop).fold(4.0 * stop, f32::max);
+            let (afield, ameshes) = self.obstacle_distances(id, &apts, size, far);
             let hits = self.meets(id, &apts, &aradii, &ways, &afield, &ameshes, stop, size);
             for k in 0..ask.len() {
                 let d = afield[k].min(ameshes[k]) - aradii[k];
@@ -1112,6 +1167,9 @@ impl World {
         let com_local = cells.as_ref().and_then(|c| support::mean(&c.centres)).unwrap_or(phys.local_center);
         let (mut tf, mut pivot, mut push) = (start, None, push);
         for _ in 0..8 {
+            if self.settle_spent >= SETTLE_BUDGET {
+                break;
+            }
             // Broken at a known edge, it first tips over that edge.
             if let Some((u, Some(edge))) = push {
                 push = None;
@@ -1179,6 +1237,18 @@ impl World {
         let mut settled = Settled::default();
         let mut shown = Vec::new();
         let (mut falls, mut splits) = (0usize, 0usize);
+        // What an earlier action left unsettled settles first.
+        if let Some(left) = self.unsettled.take() {
+            let p = &mut self.pending;
+            p.reshaped.extend(left.reshaped);
+            p.mend.extend(left.mend);
+            p.unsteady.extend(left.unsteady);
+            p.roots.extend(left.roots);
+            for (id, push) in left.pushed {
+                p.pushed.entry(id).or_insert(push);
+            }
+        }
+        self.settle_spent = 0;
         for _ in 0..MAX_ROUNDS {
             let pending = std::mem::take(&mut self.pending);
             let mut changed = false;
@@ -1229,8 +1299,21 @@ impl World {
             let mut movers: Vec<u32> = self.placed.iter().map(|p| p.id).filter(|id| (!grounded.contains(id) && self.footing(*id) == Some(Footing::Loose)) || unsteady.contains(id) || pushed.contains_key(id)).collect();
             let low = |w: &World, id: u32| w.world_box(id).map_or(0.0, |(lo, _)| lo[1]);
             movers.sort_by(|&a, &b| low(self, a).total_cmp(&low(self, b)).then(a.cmp(&b)));
-            for id in movers {
+            for (k, &id) in movers.iter().enumerate() {
                 if falls >= self.fall_limit {
+                    break;
+                }
+                // Out of budget: what has not yet fallen, and what this round noted, is left for
+                // later, as it is.
+                if self.settle_spent >= SETTLE_BUDGET {
+                    let mut left = std::mem::take(&mut self.pending);
+                    for &rest in &movers[k..] {
+                        left.unsteady.insert(rest);
+                        if let Some(p) = pushed.get(&rest) {
+                            left.pushed.insert(rest, *p);
+                        }
+                    }
+                    self.unsettled = Some(left);
                     break;
                 }
                 // Held up by nothing that reaches the ground (resting only on each other, say), it
@@ -1245,9 +1328,30 @@ impl World {
                         settled.fell.push(id);
                     }
                 }
+                // Its fall ran out of budget part way: it, and what has not yet fallen, go on later.
+                if self.settle_spent >= SETTLE_BUDGET {
+                    let mut left = std::mem::take(&mut self.pending);
+                    for &rest in &movers[k..] {
+                        left.unsteady.insert(rest);
+                        if let Some(p) = pushed.get(&rest) {
+                            left.pushed.insert(rest, *p);
+                        }
+                    }
+                    self.unsettled = Some(left);
+                    break;
+                }
+            }
+            if self.unsettled.is_some() {
+                break;
             }
             let more = !self.pending.reshaped.is_empty() || !self.pending.mend.is_empty() || !self.pending.unsteady.is_empty() || !self.pending.roots.is_empty();
             if !changed && !more {
+                break;
+            }
+            if self.settle_spent >= SETTLE_BUDGET {
+                if more {
+                    self.unsettled = Some(std::mem::take(&mut self.pending));
+                }
                 break;
             }
             if falls >= self.fall_limit {
@@ -1255,8 +1359,8 @@ impl World {
             }
         }
         self.pending = Pending::default();
-        // The cells and fields asked are kept by what they were made of, but not past the action.
-        self.cells.clear();
+        // The fields asked are kept by what they were made of, but not past the action; the cells,
+        // in each element's own frame, are kept (up to `MAX_KEPT_CELLS`).
         self.alone.clear();
         self.show_falls(shown);
         settled

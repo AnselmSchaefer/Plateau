@@ -268,6 +268,15 @@ impl World {
             }
             let ext = (0..3).map(|a| entry.world_hi[a] - entry.world_lo[a]).fold(0.0f32, f32::max);
             let tol = (share * span.min(ext)).max(least);
+            // Its field is never nearer than its bounds: none of `pts` within `tol` of those (less
+            // its ball), it touches none of them, and is not asked.
+            let beyond = |i: usize, p: &[f32; 3]| {
+                let d = [0, 1, 2].map(|a| (entry.world_lo[a] - p[a]).max(p[a] - entry.world_hi[a]).max(0.0));
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() - entry.world_blend - radii.map_or(0.0, |r| r[i]) > tol
+            };
+            if pts.iter().enumerate().all(|(i, p)| beyond(i, p)) {
+                continue;
+            }
             if let Some(d) = self.entry_distances(&entry, pts, size) {
                 let d = less(d);
                 if d.iter().any(|&d| d <= tol)

@@ -1081,7 +1081,11 @@ fn look_and_ask(
     }
 
     let tool_active = ctx.sculpt.active || ctx.place.active || ctx.carry.is_carrying();
-    if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
+    // What settling left for later (out of one action's budget) settles a little more each frame.
+    if ctx.world.0.unsettled() {
+        ctx.apply(&mut player, live::Action::Settle);
+    }
+        if keys.just_pressed(KeyCode::KeyF) || (!tool_active && buttons.just_pressed(MouseButton::Right)) {
         if ctx.world.0.piloting.is_some() {
             ctx.apply(&mut player, live::Action::Pilot { id: None });
         } else if let Some(boat_id) = ctx.world.0.scene.standing_on_placed(player.body.feet, player.body.size)
