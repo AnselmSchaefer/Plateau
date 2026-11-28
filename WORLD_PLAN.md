@@ -689,6 +689,14 @@ Still to do, in order:
 1. **Drawing never holds up an action.** A carved element's mesh is made on a worker, as chunks are,
    and swapped in when ready (the old one shown meanwhile). It is not part of the world's state, so
    determinism is untouched; strokes and cuts then cost their physics alone.
+   *Done 2026-11-28:* `ElementRuntime::carve_in_background` (`CarveWorker`: its own thread and
+   `Carver` caches; a job superseded by a newer one for the same element is skipped unmade, and a
+   result is shown only for the generation still wanted). `World::take_changes` hands finished
+   carvings on as `LayerChange::Spawn`; `wait_for_carvings` for tests. A piece of a cut or a planar
+   split shows its original's drawing clipped by its plane until its own is made (`show_meanwhile`).
+   `play` turns it on; tests and tools stay synchronous. Played session: worst stroke 324 → 67 ms,
+   actions over 100 ms 80 → 15, all actions 27.8 → 11.8 s; cuts (≈1.2 s) are now settling's (4).
+   Test: `carvings_made_in_the_background_end_as_those_made_at_once`.
 2. **A cut reuses its parent's bricks.** A piece is carved from its parent's source with its clip
    planes as part of the field, so only bricks a plane crosses are made again: a cut costs its cut
    face, not its history. Pieces keep only the edits that reach them.

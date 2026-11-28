@@ -849,6 +849,9 @@ struct LiveElement {
     drawn_scene: Scene,
     /// What its promoted solid is carved by (`None` until the world says, or unpromoted).
     carving: Option<Carving>,
+    /// Bumped whenever what it should draw changes: a carving made in the background is shown
+    /// only if it was asked for this one (`CarveWorker`).
+    generation: u64,
     physics: ObjectPhysics,
     wasm: Wasm,
     held: bool,
@@ -870,11 +873,151 @@ impl LiveElement {
 pub struct ElementRuntime {
     live: Vec<LiveElement>,
     carver: Carver,
+    /// With it, carvings are made on its thread and shown when done (`carve_in_background`).
+    worker: Option<CarveWorker>,
+    generations: u64,
+    /// What an element about to be spawned shows while its carving is made (`show_meanwhile`).
+    meanwhile: HashMap<u32, Scene>,
+}
+
+/// A carving asked of the worker: the element `id`'s solid of `scene`, as `carving` carves it.
+struct CarveJob {
+    id: u32,
+    generation: u64,
+    scene: Scene,
+    carving: Carving,
+}
+
+/// Makes carvings on its own thread (`carved::Carver`, with its caches), so drawing a carved
+/// element never holds up an action (`WORLD_PLAN.md`, phase J: a stroke beside a much-carved
+/// element took up to three seconds, played by hand 2026-11-28). What an element draws is not part
+/// of the world's state: physics, saves and replays are as they were; only when it is seen changes.
+struct CarveWorker {
+    jobs: std::sync::mpsc::Sender<CarveJob>,
+    done: std::sync::mpsc::Receiver<(u32, u64, Option<Scene>)>,
+    /// The generation each element wants drawn: a job asked for an older one is skipped unmade.
+    wanted: Arc<std::sync::Mutex<HashMap<u32, u64>>>,
+    pending: usize,
+}
+
+impl CarveWorker {
+    fn start() -> CarveWorker {
+        let (jobs, inbox) = std::sync::mpsc::channel::<CarveJob>();
+        let (outbox, done) = std::sync::mpsc::channel();
+        let wanted: Arc<std::sync::Mutex<HashMap<u32, u64>>> = Arc::default();
+        let still = wanted.clone();
+        std::thread::Builder::new()
+            .name("carver".into())
+            .spawn(move || {
+                let mut carver = Carver::new();
+                for job in inbox {
+                    let current = still.lock().map(|w| w.get(&job.id) == Some(&job.generation)).unwrap_or(false);
+                    let made = current.then(|| carver.carve(&job.scene, &job.carving));
+                    if outbox.send((job.id, job.generation, made)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("a thread for carving");
+        CarveWorker { jobs, done, wanted, pending: 0 }
+    }
+
+    fn ask(&mut self, id: u32, generation: u64, scene: &Scene, carving: &Carving) {
+        if let Ok(mut w) = self.wanted.lock() {
+            w.insert(id, generation);
+        }
+        if self.jobs.send(CarveJob { id, generation, scene: scene.clone(), carving: carving.clone() }).is_ok() {
+            self.pending += 1;
+        }
+    }
+
+    fn forget(&mut self, id: u32) {
+        if let Ok(mut w) = self.wanted.lock() {
+            w.remove(&id);
+        }
+    }
 }
 
 impl ElementRuntime {
     pub fn new() -> ElementRuntime {
         ElementRuntime::default()
+    }
+
+    /// Makes carvings on a thread of their own (`true`) and shows each when done (`finished_carvings`),
+    /// or here, before an action returns (`false`, the default: tests and tools see them at once).
+    pub fn carve_in_background(&mut self, on: bool) {
+        match (on, self.worker.is_some()) {
+            (true, false) => self.worker = Some(CarveWorker::start()),
+            (false, true) => self.worker = None,
+            _ => {}
+        }
+    }
+
+    /// Carvings made in the background since last asked that are still wanted: each element's id
+    /// and its world scene, now drawn (one being carried is drawn by whoever carries it).
+    pub fn finished_carvings(&mut self) -> Vec<(u32, Scene)> {
+        let mut out = Vec::new();
+        let Some(worker) = &mut self.worker else { return out };
+        while let Ok((id, generation, made)) = worker.done.try_recv() {
+            worker.pending = worker.pending.saturating_sub(1);
+            let Some(scene) = made else { continue };
+            let Some(l) = self.live.iter_mut().find(|l| l.placed.id == id) else { continue };
+            if l.generation != generation {
+                continue;
+            }
+            l.drawn_scene = scene;
+            if !l.held {
+                out.push((id, transform_scene(&l.drawn_scene, l.placed.transform())));
+            }
+        }
+        out
+    }
+
+    /// Waits for every carving asked of the background (for tests), then as `finished_carvings`.
+    pub fn wait_for_carvings(&mut self) -> Vec<(u32, Scene)> {
+        let mut out = Vec::new();
+        while self.worker.as_ref().is_some_and(|w| w.pending > 0) {
+            out.extend(self.finished_carvings());
+            std::thread::yield_now();
+        }
+        out
+    }
+
+    /// Has the element `piece`, about to be spawned from `original` cut by `clip`, show `original`'s
+    /// drawing cut so while its own carving is made: its carves are seen at once.
+    pub fn show_meanwhile(&mut self, original: u32, piece: u32, clip: ClipPlane) {
+        if self.worker.is_none() {
+            return;
+        }
+        if let Some(l) = self.live.iter().find(|l| l.placed.id == original && l.carving.is_some()) {
+            self.meanwhile.insert(piece, clip_scene(&l.drawn_scene, &[clip]));
+        }
+    }
+
+    /// Whether carvings asked of the background are still being made.
+    pub fn carving_pending(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| w.pending > 0)
+    }
+
+    /// What `l` should draw for `carving`: made now, or asked of the worker while it draws
+    /// `meanwhile` (what it drew before; for a new element, its scene uncarved). Bumps its generation
+    /// either way, so a carving still being made for what it was is not shown.
+    fn draw(carver: &mut Carver, worker: &mut Option<CarveWorker>, generations: &mut u64, l: &mut LiveElement, meanwhile: Scene) {
+        *generations += 1;
+        l.generation = *generations;
+        match (&l.carving, worker) {
+            (None, w) => {
+                if let Some(w) = w {
+                    w.forget(l.placed.id);
+                }
+                l.drawn_scene = l.local_scene.clone();
+            }
+            (Some(c), None) => l.drawn_scene = carver.carve(&l.local_scene, c),
+            (Some(c), Some(w)) => {
+                w.ask(l.placed.id, l.generation, &l.local_scene, c);
+                l.drawn_scene = meanwhile;
+            }
+        }
     }
 
     pub fn placed(&self) -> impl Iterator<Item = &PlacedElement> {
@@ -948,16 +1091,19 @@ impl ElementRuntime {
             clipped
         };
         let carving = carving.filter(|_| placed.is_promoted());
-        let drawn_scene = match &carving {
-            Some(c) => self.carver.carve(&local_scene, c),
-            None => local_scene.clone(),
-        };
         let solid_proxy = placed.is_promoted() && viewer_size > placed.scale * PROMOTED_SDF_MAX_SIZE_RATIO;
         let skip_solid = placed.is_promoted() && !solid_proxy;
         let tf = placed.transform();
         world.add_layer_filtered(placed.id, &local_scene, Some(tf), skip_solid);
-        let world_scene = transform_scene(&drawn_scene, tf);
-        self.live.push(LiveElement { placed, local_scene, drawn_scene, carving, physics, wasm, held: false, solid_proxy });
+        // Spawned again as it was (an undo, a reload), it shows what it drew until made again.
+        let meanwhile = match self.meanwhile.remove(&placed.id) {
+            Some(s) => s,
+            None => self.live.iter().find(|l| l.placed.id == placed.id).map_or_else(|| local_scene.clone(), |l| l.drawn_scene.clone()),
+        };
+        let mut l = LiveElement { placed, drawn_scene: Scene::default(), local_scene, carving, generation: 0, physics, wasm, held: false, solid_proxy };
+        Self::draw(&mut self.carver, &mut self.worker, &mut self.generations, &mut l, meanwhile);
+        let world_scene = transform_scene(&l.drawn_scene, tf);
+        self.live.push(l);
         Ok(world_scene)
     }
 
@@ -974,11 +1120,14 @@ impl ElementRuntime {
         if same {
             return None;
         }
-        l.drawn_scene = match &carving {
-            Some(c) => self.carver.carve(&l.local_scene, c),
-            None => l.local_scene.clone(),
-        };
         l.carving = carving;
+        let meanwhile = l.drawn_scene.clone();
+        let asked = self.worker.is_some() && l.carving.is_some();
+        Self::draw(&mut self.carver, &mut self.worker, &mut self.generations, l, meanwhile);
+        // Made in the background, it is shown when done (`finished_carvings`).
+        if asked {
+            return None;
+        }
         Some(transform_scene(&l.drawn_scene, l.placed.transform()))
     }
 
@@ -1066,7 +1215,8 @@ impl ElementRuntime {
         if promoted.is_none() {
             l.solid_proxy = false;
             if l.carving.take().is_some() {
-                l.drawn_scene = l.local_scene.clone();
+                let meanwhile = l.local_scene.clone();
+                Self::draw(&mut self.carver, &mut self.worker, &mut self.generations, l, meanwhile);
             }
         }
         let tf = l.placed.transform();
@@ -1081,6 +1231,9 @@ impl ElementRuntime {
         let pos = self.live.iter().position(|l| l.placed.id == id)?;
         let removed = self.live.remove(pos);
         world.remove_layer(id);
+        if let Some(w) = &mut self.worker {
+            w.forget(id);
+        }
         Some(removed.placed)
     }
 
@@ -1088,6 +1241,9 @@ impl ElementRuntime {
     pub fn clear(&mut self, world: &mut SceneWorld) {
         for l in self.live.drain(..) {
             world.remove_layer(l.placed.id);
+            if let Some(w) = &mut self.worker {
+                w.forget(l.placed.id);
+            }
         }
     }
 

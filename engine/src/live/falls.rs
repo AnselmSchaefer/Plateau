@@ -753,6 +753,11 @@ impl World {
         rest.id = rest_id;
         part.id = part_id;
         self.unrelate_leaving(id);
+        // While the pieces' carvings are made, each shows the original's split along the plane.
+        if let (Data::Cut(r), Data::Cut(p)) = (rest_rel, part_rel) {
+            self.runtime.show_meanwhile(id, rest_id, r);
+            self.runtime.show_meanwhile(id, part_id, p);
+        }
         self.remove_placed(id);
         if self.spawn_placed(rest.clone(), None).and_then(|_| self.spawn_placed(part.clone(), None)).is_err() {
             self.remove_placed(rest_id);

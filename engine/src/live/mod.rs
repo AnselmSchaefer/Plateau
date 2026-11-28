@@ -422,7 +422,23 @@ impl World {
 
     /// What changed since this was last asked, for the window to show.
     pub fn take_changes(&mut self) -> Changes {
+        for (owner, scene) in self.runtime.finished_carvings() {
+            self.changes.layers.push(LayerChange::Spawn { owner, scene });
+        }
         std::mem::take(&mut self.changes)
+    }
+
+    /// Draws carved elements on a thread of their own (`ElementRuntime::carve_in_background`): an
+    /// action returns without them, and each is among the changes (`take_changes`) once made.
+    pub fn carve_in_background(&mut self, on: bool) {
+        self.runtime.carve_in_background(on);
+    }
+
+    /// Waits until every carving asked of the background is made (they are then among the changes).
+    pub fn wait_for_carvings(&mut self) {
+        for (owner, scene) in self.runtime.wait_for_carvings() {
+            self.changes.layers.push(LayerChange::Spawn { owner, scene });
+        }
     }
 
     /// The SDF the world now is, as last committed.

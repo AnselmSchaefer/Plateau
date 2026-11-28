@@ -274,3 +274,54 @@ fn a_bridge_carved_many_times_stays_light() {
     println!("bridge: {original} triangles, carved fifteen times: {n}");
     assert!(n < 150_000, "a carved bridge is drawn with {n} triangles (from {original})");
 }
+
+/// Carved elements drawn on a thread of their own (`World::carve_in_background`, as `play` does):
+/// an action returns without waiting for them, a stroke superseded before it is drawn is never
+/// shown, and once all are made every element draws exactly what it draws made at once.
+#[test]
+fn carvings_made_in_the_background_end_as_those_made_at_once() {
+    use plateau_engine::live::Changes;
+    let session = |background: bool| -> (World, Vec<Changes>, Vec<u32>) {
+        let mut world = garden();
+        world.carve_in_background(background);
+        let mut body = Body::standing(&mut world.combined(), [LAWN[0] as f64 - 3.0, 40.0, LAWN[2] as f64], PERSON).unwrap();
+        let mut act = |world: &mut World, action| done(world.apply(Actor { id: "local", body: &mut body }, action));
+        let tree = act(&mut world, Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7), params: Vec::new() }).added[0];
+        let east = body::look(&mut world.combined(), [LAWN[0] as f64 + 2.0, 1.0, LAWN[2] as f64], [-1.0, 0.0, 0.0], PERSON, 4.0).unwrap().unwrap()[0] as f32;
+        let mut changes = Vec::new();
+        for (k, y) in [1.0f32, 1.1, 1.2].into_iter().enumerate() {
+            let edit = Edit::carve(Shape::Sphere { radius: 0.1 + 0.02 * k as f32 }, [east + 0.04, y, LAWN[2]], 0.02, None, PERSON);
+            act(&mut world, Action::Sculpt { edit, hit: [east, y, LAWN[2]], tool: Tool::Saw, target: SculptTarget::Terrain { aimed: Some(tree) } });
+            changes.push(world.take_changes());
+        }
+        let cut = act(&mut world, Action::Cut { id: tree, hit: [LAWN[0], LAWN[1] + 1.1, LAWN[2]], dir: [1.0, 0.0, 0.0], tool: Tool::Saw, material: Some(Material::Wood) });
+        changes.push(world.take_changes());
+        world.wait_for_carvings();
+        changes.push(world.take_changes());
+        (world, changes, cut.added)
+    };
+    let (now, _, pieces) = session(false);
+    let (later, changes, later_pieces) = session(true);
+    assert_eq!(pieces, later_pieces);
+    assert!(!later.runtime.carving_pending());
+
+    // In the end, every element draws the same.
+    for pl in &now.placed {
+        assert_eq!(now.runtime.drawn_scene_of(pl.id), later.runtime.drawn_scene_of(pl.id), "element #{} drawn differently", pl.id);
+    }
+    // And what was last shown of each piece (its layer's last `Spawn`) is that drawing.
+    let last_shown = |id: u32| {
+        changes.iter().flat_map(|c| c.layers.iter()).rev().find_map(|c| match c {
+            LayerChange::Spawn { owner, scene } if *owner == id => Some(scene.clone()),
+            _ => None,
+        })
+    };
+    for &id in &pieces {
+        let pl = later.find(id).unwrap();
+        let drawn = later.runtime.drawn_scene_of(id).unwrap();
+        let shown = last_shown(id).expect("the piece is shown");
+        let expect = plateau_engine::compose::transform_scene(drawn, pl.transform());
+        assert_eq!(shown.meshes.len(), expect.meshes.len());
+        assert_eq!(solid_mesh(&shown).indices.len(), solid_mesh(&expect).indices.len(), "piece #{id} last shown as finally drawn");
+    }
+}

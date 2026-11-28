@@ -64,6 +64,9 @@ impl World {
         let uprooted = self.graph.contains(&Relation::uprooted(id));
         self.shaken(id);
         self.unrelate_leaving(id);
+        // While the pieces' carvings are made, each shows the original's cut as it lies.
+        self.runtime.show_meanwhile(id, lower_id, plane.flipped());
+        self.runtime.show_meanwhile(id, upper_id, plane);
         self.remove_placed(id);
         let spawned = self.spawn_placed(lower.clone(), Some(&mut *actor.body)).and_then(|_| self.spawn_placed(upper.clone(), Some(&mut *actor.body)));
         if let Err(e) = spawned {

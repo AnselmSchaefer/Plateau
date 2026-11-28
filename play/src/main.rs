@@ -150,6 +150,8 @@ fn main() {
     if !world.changed_modules.is_empty() {
         eprintln!("warning: changed since {what} was saved, loaded anyway: {}", world.changed_modules.join(", "));
     }
+    // Carved elements are drawn on a thread of their own: a stroke or a cut never waits for them.
+    world.carve_in_background(true);
     if let Some(path) = &log_arg {
         world.set_log(Some(ActionLog::create(path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()))));
         eprintln!("logging actions to {}", path.display());
