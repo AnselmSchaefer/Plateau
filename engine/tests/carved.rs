@@ -369,3 +369,65 @@ fn a_piece_is_drawn_from_its_originals_bricks_made_again_only_along_the_cut() {
         }
     }
 }
+
+/// A carved element is drawn within a budget (`MAX_CARVED_TRIANGLES`, coarser if it must) and at the
+/// level of detail its distance asks (`World::set_view`): finer near, coarser far, not flickering
+/// at the line between two (`WORLD_PLAN.md`, phase J).
+#[test]
+fn a_carved_element_is_drawn_in_its_budget_and_coarser_far_away() {
+    use plateau_engine::carved::{MAX_CARVED_TRIANGLES, MAX_LEVEL};
+    // A bridge carved all over with small strokes: at its finest, more than the budget.
+    let mut catalog = ElementCatalog::new(repo_root(), Limits::default());
+    let bridge = "elements/modules/bridge.wasm";
+    let scene = catalog.get_or_load(bridge).unwrap().compiled.instantiate(7).unwrap().scene().unwrap();
+    let sdf = catalog.get_or_build_mesh_sdf(bridge, 7, &[], &[]).unwrap().unwrap();
+    let (lo, hi) = (sdf.lo(), sdf.hi());
+    let mut edits = Vec::new();
+    for k in 0..120 {
+        let u = [(k * 37 % 120) as f32 / 120.0, (k * 11 % 7) as f32 / 7.0, (k * 53 % 120) as f32 / 120.0];
+        let at = [0, 1, 2].map(|a| lo[a] + (hi[a] - lo[a]) * u[a]);
+        edits.push(Edit::carve(Shape::Box { half: [0.05; 3], round: 0.005 }, at, 0.0, None, PERSON));
+    }
+    let carving = Carving { source: Carving::source_of(bridge, 7, &[]), sdf: sdf.clone(), clips: Vec::new(), edits };
+    let mut carver = Carver::new();
+    let drawn: Vec<usize> = (0..=MAX_LEVEL).map(|level| tris(solid_mesh(&carver.carve_at(&scene, &carving, level))).len()).collect();
+    println!("triangles by level asked: {drawn:?}");
+    assert!(drawn[0] <= MAX_CARVED_TRIANGLES, "within the budget, coarser if it must: {}", drawn[0]);
+    assert!(drawn.windows(2).all(|w| w[1] <= w[0]), "coarser, fewer: {drawn:?}");
+    assert!(drawn[MAX_LEVEL as usize] * 2 < drawn[0], "far away, much fewer: {drawn:?}");
+
+    // In a world: a tree with a home carved in it, seen from near and far.
+    let mut world = garden();
+    let mut body = Body::standing(&mut world.combined(), [LAWN[0] as f64 - 3.0, 40.0, LAWN[2] as f64], PERSON).unwrap();
+    let tree = done(world.apply(
+        Actor { id: "local", body: &mut body },
+        Action::Place { module: TREE.into(), pos: LAWN, yaw: 0.0, rot: None, scale: 1.0, fitted: false, opening: None, seed: Some(7), params: Vec::new() },
+    ))
+    .added[0];
+    let east = body::look(&mut world.combined(), [LAWN[0] as f64 + 2.0, 1.0, LAWN[2] as f64], [-1.0, 0.0, 0.0], PERSON, 4.0).unwrap().unwrap()[0] as f32;
+    let edit = Edit::carve(Shape::Sphere { radius: 0.12 }, [east + 0.04, 1.0, LAWN[2]], 0.02, None, PERSON);
+    done(world.apply(Actor { id: "local", body: &mut body }, Action::Sculpt { edit, hit: [east, 1.0, LAWN[2]], tool: Tool::Saw, target: SculptTarget::Terrain { aimed: Some(tree) } }));
+    let at = |metres: f64| [LAWN[0] as f64 + metres, 1.5, LAWN[2] as f64];
+    let near_tris = |w: &World| tris(solid_mesh(w.runtime.drawn_scene_of(tree).unwrap())).len();
+    world.set_view(at(3.0), PERSON);
+    assert_eq!(world.runtime.level_of(tree), Some(0));
+    let near = near_tris(&world);
+    world.set_view(at(400.0), PERSON);
+    assert_eq!(world.runtime.level_of(tree), Some(MAX_LEVEL));
+    let far = near_tris(&world);
+    assert!(far < near, "far, fewer triangles: {far} against {near}");
+    // At the line between levels 0 and 1 (eight heights), moving a little either way changes nothing.
+    world.set_view(at(3.0), PERSON);
+    let line = 8.0 * PERSON as f64 + 1.0;
+    world.set_view(at(line + 0.2), PERSON);
+    assert_eq!(world.runtime.level_of(tree), Some(0), "just past the line, still the finest");
+    world.set_view(at(line * 1.5), PERSON);
+    assert_eq!(world.runtime.level_of(tree), Some(1));
+    world.set_view(at(line - 0.2), PERSON);
+    assert_eq!(world.runtime.level_of(tree), Some(1), "just short of the line, still the coarser");
+    // A tiny standing close sees it at its finest; far, in tiny heights, coarser.
+    world.set_view(at(0.3), 0.017);
+    assert_eq!(world.runtime.level_of(tree), Some(0));
+    world.set_view(at(3.0), 0.017);
+    assert_eq!(world.runtime.level_of(tree), Some(MAX_LEVEL));
+}

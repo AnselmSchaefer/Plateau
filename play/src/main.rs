@@ -1237,6 +1237,8 @@ fn step(time: Res<Time>, mut player: ResMut<Player>, mut live: ResMut<LiveScene>
             apply_side_effects(&mut player, &eff);
         }
     }
+    // Carved elements are drawn finer near and coarser far, by how far they are in player heights.
+    world.set_view(player.body.eye(), player.body.size);
 
     player.owed = (player.owed + time.delta_secs()).min(0.25);
     let intent = player.intent;

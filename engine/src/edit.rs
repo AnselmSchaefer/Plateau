@@ -15,7 +15,7 @@
 //!   designed to accommodate future composable `.wasm` elements and portable `Scene` objects.
 
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -271,32 +271,258 @@ impl Edit {
     }
 }
 
-/// One node in the chronological interval BVH over `EditLog::edits`.
-/// Left child is always strictly earlier in time than right child so CSG order is preserved.
-#[derive(Clone, Debug)]
-struct Node {
-    start: usize,
-    end: usize,
-    lo: [f32; 3],
-    hi: [f32; 3],
+thread_local! {
+    static EDITS_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times, on this thread, an edit was asked of a point (`EditLog::apply_batch_range`):
+/// the work asking the edits costs, counted, for budgets (`engine/tests/budgets.rs`).
+pub fn edits_asked() -> u64 {
+    EDITS_ASKED.with(|c| c.get())
+}
+
+/// Points a batch is asked in at once, at most (`EditLog::apply_batch_range`).
+const CLUSTER: usize = 64;
+/// The grid edits are kept on (`Spatial`): a level's cell is this many metres times two to the level.
+const SPATIAL_BASE: f32 = 1.0;
+
+/// Edits by where they are: each kept in the cells it covers on the grid of its own size (a cell at
+/// least as wide as it, so at most two a side), so what reaches a place is found in the few cells
+/// about it, however many edits there are and in whatever order they were made.
+/// Level → cell → the edits in it, in order.
+type Grids = BTreeMap<i32, HashMap<[i32; 3], Vec<u32>>>;
+
+#[derive(Clone, Debug, Default)]
+struct Spatial {
+    /// For adds (0) and carves (1).
+    levels: [Grids; 2],
+    /// Each edit's bounds (its shape's, without its blend), and how far it can move a distance
+    /// (its half-diagonal, and its blend).
+    bounds: Vec<([f32; 3], [f32; 3])>,
+    reach: Vec<f32>,
     max_blend: f32,
-    has_add: bool,
-    has_carve: bool,
-    kind: NodeKind,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum NodeKind {
-    Leaf(usize),
-    Branch { left: usize, right: usize },
+impl Spatial {
+    fn level_of(lo: [f32; 3], hi: [f32; 3]) -> i32 {
+        let extent = (0..3).map(|a| hi[a] - lo[a]).fold(0.0f32, f32::max);
+        let mut level = -20;
+        while SPATIAL_BASE * 2f32.powi(level) < extent && level < 30 {
+            level += 1;
+        }
+        level
+    }
+
+    fn cells(level: i32, lo: [f32; 3], hi: [f32; 3]) -> impl Iterator<Item = [i32; 3]> {
+        let c = SPATIAL_BASE * 2f32.powi(level);
+        let a = lo.map(|v| (v / c).floor() as i32);
+        let b = hi.map(|v| (v / c).floor() as i32);
+        (a[0]..=b[0]).flat_map(move |x| (a[1]..=b[1]).flat_map(move |y| (a[2]..=b[2]).map(move |z| [x, y, z])))
+    }
+
+    fn push(&mut self, edit: &Edit) {
+        let i = self.bounds.len() as u32;
+        let (lo, hi) = edit.bounds();
+        let level = Self::level_of(lo, hi);
+        let grid = self.levels[Self::kind(edit)].entry(level).or_default();
+        for cell in Self::cells(level, lo, hi) {
+            grid.entry(cell).or_default().push(i);
+        }
+        let h = edit.shape.half_extents();
+        self.bounds.push((lo, hi));
+        self.reach.push((h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt() + edit.blend);
+        self.max_blend = max_f32(self.max_blend, edit.blend);
+    }
+
+    fn pop(&mut self, edit: &Edit) {
+        let Some((lo, hi)) = self.bounds.pop() else { return };
+        self.reach.pop();
+        let level = Self::level_of(lo, hi);
+        let levels = &mut self.levels[Self::kind(edit)];
+        if let Some(grid) = levels.get_mut(&level) {
+            for cell in Self::cells(level, lo, hi) {
+                if let Some(v) = grid.get_mut(&cell) {
+                    v.pop();
+                    if v.is_empty() {
+                        grid.remove(&cell);
+                    }
+                }
+            }
+            if grid.is_empty() {
+                levels.remove(&level);
+            }
+        }
+    }
+
+    fn kind(edit: &Edit) -> usize {
+        if edit.op == Op::Add { 0 } else { 1 }
+    }
+
+    /// The edits of `range` of the kind `kind` (adds 0, carves 1) whose bounds come within
+    /// `lo..hi`, in order, into `out`.
+    fn within(&self, kind: usize, lo: [f32; 3], hi: [f32; 3], range: std::ops::Range<usize>, out: &mut Vec<u32>) {
+        out.clear();
+        for (&level, grid) in &self.levels[kind] {
+            let c = SPATIAL_BASE * 2f32.powi(level);
+            let span: i64 = (0..3).map(|a| ((hi[a] / c).floor() as i64 - (lo[a] / c).floor() as i64 + 1).max(0)).product();
+            if span > grid.len() as i64 {
+                for (cell, v) in grid {
+                    let (clo, chi) = (cell.map(|x| x as f32 * c), cell.map(|x| (x + 1) as f32 * c));
+                    if (0..3).all(|a| chi[a] >= lo[a] && clo[a] <= hi[a]) {
+                        out.extend(v.iter().filter(|&&i| range.contains(&(i as usize))));
+                    }
+                }
+            } else {
+                for cell in Self::cells(level, lo, hi) {
+                    if let Some(v) = grid.get(&cell) {
+                        out.extend(v.iter().filter(|&&i| range.contains(&(i as usize))));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|&i| {
+            let (elo, ehi) = self.bounds[i as usize];
+            (0..3).all(|a| ehi[a] >= lo[a] && elo[a] <= hi[a])
+        });
+    }
 }
 
-/// Ordered log of SDF edits with a chronological BVH for fast exact batch evaluation and revision tracking.
+/// Edits kept exact at the end of a log however long, at least (`EditLog::bake_target`).
+pub const BAKE_KEEP: usize = 64;
+/// Edits baked at once (and a log's edits before any is): a bake moves on in steps of this many.
+pub const BAKE_STEP: usize = 128;
+/// Cells a side of a bake brick.
+const BAKE_CELLS: usize = 8;
+/// A bake brick's cell is a twentieth of the height of who made its edits (as the terrain's voxel
+/// is for them, `chunk::VOXELS_A_HEIGHT`), a power of two.
+const BAKE_CELLS_A_HEIGHT: f32 = 20.0;
+
+/// A brick of a bake: `BAKE_CELLS + 1` points a side, `cell` apart from `origin`, where the area
+/// asked at `size` was (`base`) and what the baked edits made of it (`made`, its materials).
+#[derive(Debug)]
+pub struct BakeBrick {
+    pub origin: [f32; 3],
+    pub cell: f32,
+    pub size: f32,
+    base: Vec<f32>,
+    made: Vec<f32>,
+    materials: Vec<Material>,
+    /// The greatest distance (either sign) the area has at any of its points.
+    pub base_reach: f32,
+}
+
+impl BakeBrick {
+    fn index(i: [usize; 3]) -> usize {
+        (i[0] * (BAKE_CELLS + 1) + i[1]) * (BAKE_CELLS + 1) + i[2]
+    }
+
+    fn points(origin: [f32; 3], cell: f32) -> Vec<[f32; 3]> {
+        let n = BAKE_CELLS + 1;
+        let mut out = Vec::with_capacity(n * n * n);
+        for x in 0..n {
+            for y in 0..n {
+                for z in 0..n {
+                    out.push([origin[0] + x as f32 * cell, origin[1] + y as f32 * cell, origin[2] + z as f32 * cell]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Its bounds.
+    pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
+        let side = BAKE_CELLS as f32 * self.cell;
+        (self.origin, self.origin.map(|o| o + side))
+    }
+
+    /// `a` (the area at `p`, as asked) as the baked edits make it: the change they made where the
+    /// area was asked at `size`, interpolated, added; and, where they changed it, their material.
+    fn give(&self, p: [f32; 3], a: Answer) -> Answer {
+        let u = [0, 1, 2].map(|k| ((p[k] - self.origin[k]) / self.cell).clamp(0.0, BAKE_CELLS as f32));
+        let i = u.map(|v| (v.floor() as usize).min(BAKE_CELLS - 1));
+        let t = [0, 1, 2].map(|k| u[k] - i[k] as f32);
+        let mut change = 0.0f32;
+        for c in 0..8usize {
+            let o = [c & 1, (c >> 1) & 1, (c >> 2) & 1];
+            let w = (0..3).map(|k| if o[k] == 1 { t[k] } else { 1.0 - t[k] }).product::<f32>();
+            let j = Self::index([i[0] + o[0], i[1] + o[1], i[2] + o[2]]);
+            change += w * (self.made[j] - self.base[j]);
+        }
+        let near = Self::index([0, 1, 2].map(|k| (u[k] + 0.5).floor() as usize).map(|v| v.min(BAKE_CELLS)));
+        let changed = self.made[near].to_bits() != self.base[near].to_bits();
+        Answer { distance: a.distance + change, material: if changed { self.materials[near] } else { a.material } }
+    }
+}
+
+/// The edits before `upto` baked (`EditLog::rebaked`): sparse bricks over where they reach, each of
+/// the size of who made the edits there. A sample in a brick (and not near an element placed among
+/// them, `Composed`) takes the area as asked plus the change the bake made there, then the edits
+/// after `upto`; elsewhere every edit, as ever.
+#[derive(Debug)]
+pub struct Bake {
+    pub upto: usize,
+    /// Level (its cell, two to the level) → brick → it.
+    levels: BTreeMap<i32, HashMap<[i32; 3], Arc<BakeBrick>>>,
+    /// The farthest any baked edit can move a distance.
+    pub reach: f32,
+}
+
+impl Bake {
+    fn level_of(stamp: f32) -> i32 {
+        let cell = stamp / BAKE_CELLS_A_HEIGHT;
+        let mut level = -30;
+        while 2f32.powi(level + 1) <= cell && level < 20 {
+            level += 1;
+        }
+        level
+    }
+
+    /// The finest brick `p` is in.
+    pub fn brick_at(&self, p: [f32; 3]) -> Option<&Arc<BakeBrick>> {
+        for (&level, grid) in &self.levels {
+            let side = BAKE_CELLS as f32 * 2f32.powi(level);
+            if let Some(b) = grid.get(&p.map(|v| (v / side).floor() as i32)) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    /// Every brick.
+    pub fn bricks(&self) -> impl Iterator<Item = &Arc<BakeBrick>> {
+        self.levels.values().flat_map(|g| g.values())
+    }
+
+    /// The bricks `edit` needs, at its level: those its reach (and a cell) overlaps.
+    fn keys_for(edit: &Edit) -> (i32, Vec<[i32; 3]>) {
+        let level = Self::level_of(edit.stamp_size);
+        let cell = 2f32.powi(level);
+        let side = BAKE_CELLS as f32 * cell;
+        let (lo, hi) = edit.influence_bounds();
+        let a = lo.map(|v| ((v - cell) / side).floor() as i32);
+        let b = hi.map(|v| ((v + cell) / side).floor() as i32);
+        let mut out = Vec::new();
+        for x in a[0]..=b[0] {
+            for y in a[1]..=b[1] {
+                for z in a[2]..=b[2] {
+                    out.push([x, y, z]);
+                }
+            }
+        }
+        (level, out)
+    }
+}
+
+/// Ordered log of SDF edits, kept by where they are (`Spatial`) for fast exact batch evaluation,
+/// and revision tracking; past `BAKE_STEP + BAKE_KEEP` edits, all but the last few baked (`Bake`).
 #[derive(Clone, Debug, Default)]
 pub struct EditLog {
     edits: Vec<Edit>,
-    nodes: Vec<Node>,
+    spatial: Spatial,
     revision: u64,
+    bake: Option<Arc<Bake>>,
 }
 
 impl EditLog {
@@ -312,8 +538,11 @@ impl EditLog {
         for e in &edits {
             e.validate()?;
         }
-        let mut log = EditLog { edits, nodes: Vec::new(), revision };
-        log.rebuild_index();
+        let mut log = EditLog { edits: Vec::new(), spatial: Spatial::default(), revision, bake: None };
+        for e in edits {
+            log.spatial.push(&e);
+            log.edits.push(e);
+        }
         Ok(log)
     }
 
@@ -336,17 +565,21 @@ impl EditLog {
     /// Validates and appends an edit, rebuilding the spatial index and bumping `revision`.
     pub fn push(&mut self, edit: Edit) -> Result<u64> {
         edit.validate()?;
+        self.spatial.push(&edit);
         self.edits.push(edit);
         self.revision += 1;
-        self.rebuild_index();
         Ok(self.revision)
     }
 
     /// Removes and returns the most recent edit (undo), bumping `revision` if non-empty.
     pub fn pop(&mut self) -> Option<Edit> {
         let removed = self.edits.pop()?;
+        self.spatial.pop(&removed);
         self.revision += 1;
-        self.rebuild_index();
+        // Baked past where it now ends, the bake is of edits it no longer has.
+        if self.bake.as_ref().is_some_and(|b| b.upto > self.edits.len()) {
+            self.bake = None;
+        }
         Some(removed)
     }
 
@@ -354,7 +587,8 @@ impl EditLog {
     pub fn clear(&mut self) {
         if !self.edits.is_empty() {
             self.edits.clear();
-            self.nodes.clear();
+            self.spatial = Spatial::default();
+            self.bake = None;
             self.revision += 1;
         }
     }
@@ -364,156 +598,313 @@ impl EditLog {
         self.edits.iter().any(|e| e.affects_chunk(key))
     }
 
-    /// Applies all edits in chronological order to `(points, out)` using exact BVH pruning.
+    /// Applies all edits in chronological order to `(points, out)` (`apply_batch_range`).
     pub fn apply_batch(&self, points: &[[f32; 3]], out: &mut [Answer]) {
         self.apply_batch_range(0, self.edits.len(), points, out);
     }
 
-    /// Applies edits in the chronological slice `[range_start..range_end)` to `(points, out)`
-    /// using exact BVH range & spatial pruning (bit-exact with sequential evaluation).
+    /// Applies edits in the chronological slice `[range_start..range_end)` to `(points, out)`:
+    /// each point is given, in order, every edit of the slice that can change it (bit-exact with
+    /// `apply_batch_reference`, which gives each point every edit).
+    ///
+    /// The points are asked in clusters of up to `CLUSTER` nearby ones. A cluster's edits are those
+    /// whose bounds come within its points' greatest distance (and its blend) of it, found in the
+    /// few cells about it (`Spatial`): an edit further away changes none of them. Asking a whole
+    /// batch at once against edits kept in the order they were made reached every edit in a
+    /// much-dug place for every point (played by hand 2026-11-28: 2,000 strokes in one place made
+    /// asking twenty times dearer, and walking there thirty).
     pub fn apply_batch_range(&self, range_start: usize, range_end: usize, points: &[[f32; 3]], out: &mut [Answer]) {
         let range_end = range_end.min(self.edits.len());
-        if range_start >= range_end || self.edits.is_empty() || points.is_empty() {
+        if range_start >= range_end || points.is_empty() {
             return;
         }
         debug_assert_eq!(points.len(), out.len());
-        let mut blo = [f32::INFINITY; 3];
-        let mut bhi = [f32::NEG_INFINITY; 3];
+        let mut found = Vec::new();
+        if points.len() <= CLUSTER {
+            self.apply_cluster(range_start..range_end, points, out, &mut found);
+            return;
+        }
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
         for p in points {
             for a in 0..3 {
-                blo[a] = min_f32(blo[a], p[a]);
-                bhi[a] = max_f32(bhi[a], p[a]);
+                lo[a] = min_f32(lo[a], p[a]);
+                hi[a] = max_f32(hi[a], p[a]);
             }
         }
-        let mut batch_min_d = f32::INFINITY;
-        let mut batch_max_d = f32::NEG_INFINITY;
-        for ans in out.iter() {
-            batch_min_d = min_f32(batch_min_d, ans.distance);
-            batch_max_d = max_f32(batch_max_d, ans.distance);
-        }
-        if !self.nodes.is_empty() {
-            self.visit(0, range_start, range_end, blo, bhi, &mut batch_min_d, &mut batch_max_d, points, out);
+        let scale = [0, 1, 2].map(|a| if hi[a] > lo[a] { 1023.0 / (hi[a] - lo[a]) } else { 0.0 });
+        let spread = |v: u32| -> u64 {
+            let mut x = v as u64 & 0x3ff;
+            x = (x | (x << 16)) & 0x0300_00ff;
+            x = (x | (x << 8)) & 0x0300_f00f;
+            x = (x | (x << 4)) & 0x030c_30c3;
+            (x | (x << 2)) & 0x0924_9249
+        };
+        let mut order: Vec<(u64, usize)> = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let q = [0, 1, 2].map(|a| ((p[a] - lo[a]) * scale[a]).clamp(0.0, 1023.0) as u32);
+                (spread(q[0]) | (spread(q[1]) << 1) | (spread(q[2]) << 2), i)
+            })
+            .collect();
+        order.sort_unstable();
+        let mut pts = Vec::with_capacity(CLUSTER);
+        let mut ans = Vec::with_capacity(CLUSTER);
+        for group in order.chunks(CLUSTER) {
+            pts.clear();
+            ans.clear();
+            for &(_, i) in group {
+                pts.push(points[i]);
+                ans.push(out[i]);
+            }
+            self.apply_cluster(range_start..range_end, &pts, &mut ans, &mut found);
+            for (k, &(_, i)) in group.iter().enumerate() {
+                out[i] = ans[k];
+            }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn visit(
-        &self,
-        idx: usize,
-        range_start: usize,
-        range_end: usize,
-        blo: [f32; 3],
-        bhi: [f32; 3],
-        batch_min_d: &mut f32,
-        batch_max_d: &mut f32,
-        points: &[[f32; 3]],
-        out: &mut [Answer],
-    ) {
-        let node = &self.nodes[idx];
-        if node.end <= range_start || node.start >= range_end {
+    /// One cluster of `apply_batch_range`.
+    fn apply_cluster(&self, range: std::ops::Range<usize>, points: &[[f32; 3]], out: &mut [Answer], found: &mut Vec<u32>) {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for p in points {
+            for a in 0..3 {
+                lo[a] = min_f32(lo[a], p[a]);
+                hi[a] = max_f32(hi[a], p[a]);
+            }
+        }
+        // An edit changes a point only if its bounds are within the point's distance as it then is
+        // (and the edit's blend) of it. Asked of the edits within `r` of the cluster, and no point's
+        // distance growing past `r` less the greatest blend while they are applied, no edit further
+        // changed any of them: the answers are exact. A distance grows only to the reach of an edit
+        // that changes it, so `r` starts there; if a point's grows further still (blends add a
+        // little), it is asked again, further.
+        let start = out.iter().fold(0.0f32, |m, a| max_f32(m, abs_f32(a.distance)));
+        let blend = self.spatial.max_blend;
+        if !start.is_finite() {
+            for i in range {
+                let (elo, ehi) = self.spatial.bounds[i];
+                Self::apply_one(&self.edits[i], elo, ehi, points, out, &mut 0.0);
+            }
             return;
         }
-        let box_d = aabb_to_aabb_distance(blo, bhi, node.lo, node.hi);
-        if box_d > 0.0 {
-            let need_add = node.has_add && *batch_max_d > box_d - node.max_blend;
-            let need_carve = node.has_carve && -*batch_min_d > box_d - node.max_blend;
-            if !need_add && !need_carve {
+        let given: Vec<Answer> = out.to_vec();
+        // How far into the air (`above`) and into the solid (`below`) the points are: adds are asked
+        // out to the one, carves to the other (each widened by the greatest blend). An add can take
+        // a point into the solid as deep as its reach, a carve into the air, so each is widened by
+        // the other's reach until neither grows; then, applied, a point's distance growing past
+        // what was asked (blends add a little) has them asked again, further.
+        let side = |out: &[Answer]| out.iter().fold((f32::NEG_INFINITY, f32::NEG_INFINITY), |(a, b), x| (max_f32(a, x.distance), max_f32(b, -x.distance)));
+        let (above0, below0) = side(out);
+        let (mut ra, mut rc) = (max_f32(above0, 0.0) + blend, max_f32(below0, 0.0) + blend);
+        let (mut adds, mut carves) = (Vec::new(), Vec::new());
+        loop {
+            loop {
+                self.spatial.within(0, lo.map(|v| v - ra), hi.map(|v| v + ra), range.clone(), &mut adds);
+                self.spatial.within(1, lo.map(|v| v - rc), hi.map(|v| v + rc), range.clone(), &mut carves);
+                let reach = |v: &[u32]| v.iter().fold(0.0f32, |m, &i| max_f32(m, self.spatial.reach[i as usize]));
+                let next_c = max_f32(rc, max_f32(below0, reach(&adds)) + blend);
+                let next_a = max_f32(ra, max_f32(above0, reach(&carves)) + blend);
+                if next_a <= ra && next_c <= rc {
+                    break;
+                }
+                (ra, rc) = (next_a, next_c);
+            }
+            found.clear();
+            let (mut x, mut y) = (0, 0);
+            while x < adds.len() || y < carves.len() {
+                if y >= carves.len() || (x < adds.len() && adds[x] < carves[y]) {
+                    found.push(adds[x]);
+                    x += 1;
+                } else {
+                    found.push(carves[y]);
+                    y += 1;
+                }
+            }
+            // How far into the air (`above`) and into the solid (`below`) any point now is: an add
+            // changes a point only if it is nearer than the point is into the air, a carve only if
+            // nearer than it is into the solid (each with its blend), so an edit further from the
+            // whole cluster than that is passed over at once; distances fall as edits are applied,
+            // so most are.
+            let (mut above, mut below) = (above0, below0);
+            let (mut most_above, mut most_below) = (above0, below0);
+            for &i in found.iter() {
+                let (elo, ehi) = self.spatial.bounds[i as usize];
+                let edit = &self.edits[i as usize];
+                let gap = (0..3).map(|a| max_f32(max_f32(elo[a] - hi[a], lo[a] - ehi[a]), 0.0)).map(|g| g * g).sum::<f32>().sqrt();
+                let into = if edit.op == Op::Add { above } else { below };
+                if gap > 0.0 && gap > into + edit.blend {
+                    continue;
+                }
+                Self::apply_one(edit, elo, ehi, points, out, &mut 0.0);
+                (above, below) = side(out);
+                most_above = max_f32(most_above, above);
+                most_below = max_f32(most_below, below);
+            }
+            if most_above + blend <= ra && most_below + blend <= rc {
                 return;
             }
+            ra = max_f32(ra, most_above + blend);
+            rc = max_f32(rc, most_below + blend);
+            out.copy_from_slice(&given);
         }
-        match node.kind {
-            NodeKind::Branch { left, right } => {
-                self.visit(left, range_start, range_end, blo, bhi, batch_min_d, batch_max_d, points, out);
-                self.visit(right, range_start, range_end, blo, bhi, batch_min_d, batch_max_d, points, out);
+    }
+
+    /// `edit` (its bounds `elo..ehi`) on each point it can change, as a sequential evaluation does;
+    /// `seen`, the greatest distance (either sign) a point it changed now has, if greater.
+    fn apply_one(edit: &Edit, elo: [f32; 3], ehi: [f32; 3], points: &[[f32; 3]], out: &mut [Answer], seen: &mut f32) {
+        EDITS_ASKED.with(|c| c.set(c.get() + points.len() as u64));
+        let blend = edit.blend;
+        for (&p, ans) in points.iter().zip(out.iter_mut()) {
+            let pd = point_to_aabb_distance(p, elo, ehi);
+            let unreached = match edit.op {
+                Op::Add => ans.distance <= pd - blend,
+                Op::Carve => -ans.distance <= pd - blend,
+            };
+            if pd > 0.0 && unreached {
+                continue;
             }
-            NodeKind::Leaf(edit_idx) => {
-                let edit = &self.edits[edit_idx];
-                let (elo, ehi) = (node.lo, node.hi);
-                let blend = edit.blend;
-                match edit.op {
-                    Op::Add => {
-                        for (&p, ans) in points.iter().zip(out.iter_mut()) {
-                            let pd = point_to_aabb_distance(p, elo, ehi);
-                            if pd > 0.0 && ans.distance <= pd - blend {
-                                continue;
-                            }
-                            let next = edit.apply(p, *ans);
-                            *ans = next;
-                            *batch_min_d = min_f32(*batch_min_d, next.distance);
-                            *batch_max_d = max_f32(*batch_max_d, next.distance);
-                        }
-                    }
-                    Op::Carve => {
-                        for (&p, ans) in points.iter().zip(out.iter_mut()) {
-                            let pd = point_to_aabb_distance(p, elo, ehi);
-                            if pd > 0.0 && -ans.distance <= pd - blend {
-                                continue;
-                            }
-                            let next = edit.apply(p, *ans);
-                            *ans = next;
-                            *batch_min_d = min_f32(*batch_min_d, next.distance);
-                            *batch_max_d = max_f32(*batch_max_d, next.distance);
-                        }
-                    }
+            *ans = edit.apply(p, *ans);
+            *seen = max_f32(*seen, abs_f32(ans.distance));
+        }
+    }
+
+    /// How many of `len` edits a log is baked up to: none until there are `BAKE_STEP + BAKE_KEEP`;
+    /// then all but the last `BAKE_KEEP` to `2 × BAKE_KEEP`, in steps of `BAKE_STEP`. Of the
+    /// count alone, so a log baked so is the same however it came to its edits (played, replayed,
+    /// opened, undone to).
+    pub fn bake_target(len: usize) -> usize {
+        if len < BAKE_STEP + BAKE_KEEP { 0 } else { (len - BAKE_KEEP) / BAKE_STEP * BAKE_STEP }
+    }
+
+    /// The bake, if any.
+    pub fn bake(&self) -> Option<&Arc<Bake>> {
+        self.bake.as_ref()
+    }
+
+    /// This log baked to `bake_target` of its length, if it is not, with where that changed what it
+    /// gives (the bricks made, and where the edits newly baked reach); the area is asked at the
+    /// bricks' points by `base` (points, size). Moving on, the bricks there are kept and given
+    /// the newly baked edits; going back (an undo), it is baked again from the start. Either way
+    /// every brick holds, to the bit, the area at its points with every baked edit applied in order.
+    #[allow(clippy::type_complexity)]
+    pub fn rebaked(&self, base: &mut dyn FnMut(&[[f32; 3]], f32, &mut Vec<Answer>) -> Result<()>) -> Result<Option<(EditLog, Vec<([f32; 3], [f32; 3])>)>> {
+        let target = Self::bake_target(self.edits.len());
+        let current = self.bake.as_ref().map_or(0, |b| b.upto);
+        if target == current {
+            return Ok(None);
+        }
+        let mut changed = Vec::new();
+        let mut out = self.clone();
+        // What it gives changed: whatever was kept by its revision is made again.
+        out.revision += 1;
+        let (mut levels, from) = match &self.bake {
+            Some(b) if target > b.upto => (b.levels.clone(), b.upto),
+            Some(b) => {
+                changed.extend(b.bricks().map(|k| k.bounds()));
+                (BTreeMap::new(), 0)
+            }
+            None => (BTreeMap::new(), 0),
+        };
+        if target == 0 {
+            out.bake = None;
+            return Ok(Some((out, changed)));
+        }
+        // The bricks there were: given the edits newly baked.
+        for grid in levels.values_mut() {
+            for brick in grid.values_mut() {
+                let pts = BakeBrick::points(brick.origin, brick.cell);
+                let mut ans: Vec<Answer> = brick.made.iter().zip(&brick.materials).map(|(&d, &m)| Answer { distance: d, material: m }).collect();
+                self.apply_batch_range(from, target, &pts, &mut ans);
+                if ans.iter().zip(&brick.made).any(|(a, &m)| a.distance.to_bits() != m.to_bits()) || ans.iter().zip(&brick.materials).any(|(a, &m)| a.material != m) {
+                    *brick = Arc::new(BakeBrick {
+                        origin: brick.origin,
+                        cell: brick.cell,
+                        size: brick.size,
+                        base: brick.base.clone(),
+                        made: ans.iter().map(|a| a.distance).collect(),
+                        materials: ans.iter().map(|a| a.material).collect(),
+                        base_reach: brick.base_reach,
+                    });
                 }
             }
         }
+        // And those the newly baked edits need, made: the area there, every baked edit on it.
+        let mut reach = self.bake.as_ref().filter(|_| from > 0).map_or(0.0, |b| b.reach);
+        for e in &self.edits[from..target] {
+            let (level, keys) = Bake::keys_for(e);
+            let cell = 2f32.powi(level);
+            let side = BAKE_CELLS as f32 * cell;
+            let h = e.shape.half_extents();
+            reach = max_f32(reach, (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt() + e.blend);
+            changed.push(e.influence_bounds());
+            let grid = levels.entry(level).or_default();
+            for key in keys {
+                if grid.contains_key(&key) {
+                    continue;
+                }
+                let origin = key.map(|k| k as f32 * side);
+                let pts = BakeBrick::points(origin, cell);
+                let size = cell * BAKE_CELLS_A_HEIGHT;
+                let mut ans = Vec::new();
+                base(&pts, size, &mut ans)?;
+                let base_d: Vec<f32> = ans.iter().map(|a| a.distance).collect();
+                let base_reach = base_d.iter().fold(0.0f32, |m, d| max_f32(m, abs_f32(*d)));
+                self.apply_batch_range(0, target, &pts, &mut ans);
+                let brick = BakeBrick { origin, cell, size, base: base_d, made: ans.iter().map(|a| a.distance).collect(), materials: ans.iter().map(|a| a.material).collect(), base_reach };
+                changed.push(brick.bounds());
+                grid.insert(key, Arc::new(brick));
+            }
+        }
+        out.bake = Some(Arc::new(Bake { upto: target, levels, reach }));
+        Ok(Some((out, changed)))
     }
 
-    fn rebuild_index(&mut self) {
-        self.nodes.clear();
-        if self.edits.is_empty() {
-            return;
+    /// `apply_batch_range`, with the bake: a point in a brick `usable` allows (no element placed
+    /// among the baked edits near it) is given the bake's change (if `range_start` is 0: once, at
+    /// the first range asked) and the edits of the range after the bake; any other point, every
+    /// edit of the range.
+    pub fn apply_batch_range_baked(&self, range_start: usize, range_end: usize, points: &[[f32; 3]], out: &mut [Answer], usable: &mut dyn FnMut(&BakeBrick) -> bool) {
+        let Some(bake) = self.bake.as_ref() else { return self.apply_batch_range(range_start, range_end, points, out) };
+        let (mut baked, mut exact) = (Vec::new(), Vec::new());
+        for (i, &p) in points.iter().enumerate() {
+            match bake.brick_at(p) {
+                Some(b) if usable(b) => {
+                    if range_start == 0 {
+                        out[i] = b.give(p, out[i]);
+                    }
+                    baked.push(i);
+                }
+                _ => exact.push(i),
+            }
         }
-        self.nodes.reserve(self.edits.len() * 2);
-        self.build_node(0, self.edits.len());
+        if baked.is_empty() {
+            return self.apply_batch_range(range_start, range_end, points, out);
+        }
+        for (idx, from) in [(&exact, range_start), (&baked, range_start.max(bake.upto))] {
+            if idx.is_empty() || from >= range_end {
+                continue;
+            }
+            let pts: Vec<[f32; 3]> = idx.iter().map(|&i| points[i]).collect();
+            let mut ans: Vec<Answer> = idx.iter().map(|&i| out[i]).collect();
+            self.apply_batch_range(from, range_end, &pts, &mut ans);
+            for (k, &i) in idx.iter().enumerate() {
+                out[i] = ans[k];
+            }
+        }
     }
 
-    fn build_node(&mut self, start: usize, end: usize) -> usize {
-        if end - start == 1 {
-            let e = &self.edits[start];
-            let (lo, hi) = e.bounds();
-            let id = self.nodes.len();
-            self.nodes.push(Node {
-                start,
-                end,
-                lo,
-                hi,
-                max_blend: e.blend,
-                has_add: e.op == Op::Add,
-                has_carve: e.op == Op::Carve,
-                kind: NodeKind::Leaf(start),
-            });
-            return id;
+    /// Every edit of `[range_start..range_end)` in order on every point it can change, unindexed:
+    /// what `apply_batch_range` must give, to the bit (for tests).
+    #[doc(hidden)]
+    pub fn apply_batch_reference(&self, range_start: usize, range_end: usize, points: &[[f32; 3]], out: &mut [Answer]) {
+        for i in range_start..range_end.min(self.edits.len()) {
+            let edit = &self.edits[i];
+            let (elo, ehi) = edit.bounds();
+            Self::apply_one(edit, elo, ehi, points, out, &mut 0.0);
         }
-        let id = self.nodes.len();
-        self.nodes.push(Node {
-            start,
-            end,
-            lo: [0.0; 3],
-            hi: [0.0; 3],
-            max_blend: 0.0,
-            has_add: false,
-            has_carve: false,
-            kind: NodeKind::Leaf(0),
-        });
-        let mid = start + (end - start) / 2;
-        let left = self.build_node(start, mid);
-        let right = self.build_node(mid, end);
-        let (nl, nr) = (&self.nodes[left], &self.nodes[right]);
-        let lo = [min_f32(nl.lo[0], nr.lo[0]), min_f32(nl.lo[1], nr.lo[1]), min_f32(nl.lo[2], nr.lo[2])];
-        let hi = [max_f32(nl.hi[0], nr.hi[0]), max_f32(nl.hi[1], nr.hi[1]), max_f32(nl.hi[2], nr.hi[2])];
-        self.nodes[id] = Node {
-            start,
-            end,
-            lo,
-            hi,
-            max_blend: max_f32(nl.max_blend, nr.max_blend),
-            has_add: nl.has_add || nr.has_add,
-            has_carve: nl.has_carve || nr.has_carve,
-            kind: NodeKind::Branch { left, right },
-        };
-        id
     }
 }
 
@@ -1163,10 +1554,3 @@ fn point_to_aabb_distance(p: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> f32 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-#[inline]
-fn aabb_to_aabb_distance(alo: [f32; 3], ahi: [f32; 3], blo: [f32; 3], bhi: [f32; 3]) -> f32 {
-    let dx = max_f32(max_f32(blo[0] - ahi[0], 0.0), alo[0] - bhi[0]);
-    let dy = max_f32(max_f32(blo[1] - ahi[1], 0.0), alo[1] - bhi[1]);
-    let dz = max_f32(max_f32(blo[2] - ahi[2], 0.0), alo[2] - bhi[2]);
-    (dx * dx + dy * dy + dz * dz).sqrt()
-}

@@ -47,7 +47,7 @@ use crate::body::Body;
 use crate::compose::{Composed, ComposedLog, ElementCatalog, ElementRuntime, PlacedElement, PlacementTransform, SdfElementEntry, quat_normalize};
 use crate::carved::Carving;
 use crate::cut::{ObjectPhysics, check_carry_with_load, max_carry_mass_kg, world_edit_to_local};
-use crate::edit::{Edit, EditLog, Op, SavedTile, WorldSave};
+use crate::edit::{Edit, EditLog, Op, SavedTile, Shape, WorldSave};
 use crate::graph::{Graph, GraphDelta, Node, Relation};
 use crate::modules::{ModuleCheck, SavedModule, relative_to_root};
 use crate::physics::{BuoyancyState, Inventory, Tool, WorldMode, compute_buoyancy, player_mass_kg};
@@ -436,6 +436,11 @@ impl World {
         std::mem::take(&mut self.changes)
     }
 
+    /// Points settling asked in the last action (`SETTLE_BUDGET`), for budgets.
+    pub fn settle_work(&self) -> usize {
+        self.settle_spent
+    }
+
     /// Whether settling left something for later (out of its budget): the window sends
     /// `Action::Settle` while it does.
     pub fn unsettled(&self) -> bool {
@@ -446,6 +451,15 @@ impl World {
     /// action returns without them, and each is among the changes (`take_changes`) once made.
     pub fn carve_in_background(&mut self, on: bool) {
         self.runtime.carve_in_background(on);
+    }
+
+    /// The viewer's eyes are at `eye` and they are `size` tall: carved elements are drawn at the level
+    /// of detail their distance asks (`ElementRuntime::set_view`); what that drew again at once is
+    /// among the changes.
+    pub fn set_view(&mut self, eye: [f64; 3], size: f32) {
+        for (owner, scene) in self.runtime.set_view(eye, size) {
+            self.changes.layers.push(LayerChange::Spawn { owner, scene });
+        }
     }
 
     /// Waits until every carving asked of the background is made (they are then among the changes).
@@ -707,6 +721,7 @@ impl World {
     /// given to the region here and, with the chunks `inv` makes stale, to the window.
     pub fn commit(&mut self, inv: Invalidation) {
         let _span = info_span!("commit").entered();
+        let inv = self.bake_edits(inv);
         let composed = self.composed_without(&[]);
         self.region.log = composed.clone();
         self.region.prune_instances();
@@ -714,6 +729,36 @@ impl World {
         let carved: Vec<u32> = self.placed.iter().filter(|pl| pl.is_promoted() || self.runtime.is_carved(pl.id)).map(|pl| pl.id).collect();
         for id in carved {
             self.sync_carving(id);
+        }
+    }
+
+    /// The edits baked as their count says (`EditLog::bake_target`; `WORLD_PLAN.md`, phase J): once
+    /// committed, a world's edits are baked so whether it was played, replayed, opened or undone
+    /// to. Where that changed what they give is made stale too.
+    fn bake_edits(&mut self, inv: Invalidation) -> Invalidation {
+        let _span = info_span!("bake").entered();
+        let area = &mut self.region.region;
+        match self.edits.rebaked(&mut |pts, size, out| crate::Region::sample(area, pts, size, out)) {
+            Ok(Some((log, changed))) => {
+                self.edits = Arc::new(log);
+                match inv {
+                    Invalidation::All => Invalidation::All,
+                    Invalidation::Some { mut edits, bounds, water } => {
+                        // Each changed box stands for an edit of its bounds: what it makes stale.
+                        for (lo, hi) in changed {
+                            let half = [0, 1, 2].map(|a| (0.5 * (hi[a] - lo[a])).max(1e-4));
+                            let centre = [0, 1, 2].map(|a| 0.5 * (lo[a] + hi[a]));
+                            edits.push(Edit::carve(Shape::Box { half, round: 0.0 }, centre, 0.0, None, 1.0));
+                        }
+                        Invalidation::Some { edits, bounds, water }
+                    }
+                }
+            }
+            Ok(None) => inv,
+            Err(e) => {
+                self.changes.said.push(format!("baking the edits failed: {e:#}"));
+                inv
+            }
         }
     }
 

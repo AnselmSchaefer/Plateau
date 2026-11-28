@@ -57,6 +57,12 @@ const CELLS_PER_STAMP: f32 = 40.0;
 /// `COARSEST_ALONG`.
 const FINEST_ALONG: f32 = 1024.0;
 const COARSEST_ALONG: f32 = 24.0;
+/// A coarser level of detail (`Carver::carve_at`) is no coarser than this many cells along.
+const COARSEST_ALONG_FAR: f32 = 6.0;
+/// The coarsest level of detail a carved element is drawn at.
+pub const MAX_LEVEL: u32 = 3;
+/// The most triangles a carved element's solid is drawn with: past it, a coarser level.
+pub const MAX_CARVED_TRIANGLES: usize = 60_000;
 /// How many times a triangle near an edit is divided (into four) before it is cut.
 const MAX_DEPTH: u32 = 10;
 /// A remade corner turns to its face's normal where its own differs from it more than this (cos).
@@ -138,11 +144,23 @@ impl Carver {
     }
 
     pub fn carve(&mut self, scene: &Scene, carving: &Carving) -> Scene {
-        let _span = tracing::info_span!("carve", edits = carving.edits.len()).entered();
+        self.carve_at(scene, carving, 0)
+    }
+
+    /// `carve` at the detail level `level` (its grid's cell two to the `level` times as wide; 0 is
+    /// the finest), or coarser if that would draw more than `MAX_CARVED_TRIANGLES`
+    /// (`WORLD_PLAN.md`, phase J: a carved element is drawn in a budget, and coarser far away).
+    pub fn carve_at(&mut self, scene: &Scene, carving: &Carving, level: u32) -> Scene {
+        let _span = tracing::info_span!("carve", edits = carving.edits.len(), level).entered();
         if !scene.instances.iter().any(|i| i.solid) {
             return scene.clone();
         }
-        let solid = self.solid_mesh(scene, carving);
+        let mut level = level.min(MAX_LEVEL);
+        let mut solid = self.solid_mesh(scene, carving, level);
+        while solid.indices.len() / 3 > MAX_CARVED_TRIANGLES && level < MAX_LEVEL {
+            level += 1;
+            solid = self.solid_mesh(scene, carving, level);
+        }
         let mut out = Scene {
             meshes: scene.meshes.clone(),
             instances: scene.instances.iter().filter(|i| !i.solid).copied().collect(),
@@ -163,9 +181,9 @@ impl Carver {
     }
 
     /// The solid triangles of `scene`, carved.
-    fn solid_mesh(&mut self, scene: &Scene, carving: &Carving) -> Arc<MeshData> {
+    fn solid_mesh(&mut self, scene: &Scene, carving: &Carving, level: u32) -> Arc<MeshData> {
         let mut key = DefaultHasher::new();
-        (VERSION, carving.source).hash(&mut key);
+        (VERSION, carving.source, level).hash(&mut key);
         for c in &carving.clips {
             c.key_bits().hash(&mut key);
         }
@@ -180,7 +198,7 @@ impl Carver {
         let mesh = if carving.edits.is_empty() {
             to_mesh(&tris)
         } else {
-            let h = cell_size(&carving.edits, &carving.sdf);
+            let h = cell_size(&carving.edits, &carving.sdf, level);
             let reach: Vec<Reach> = carving.edits.iter().map(|&e| Reach::new(e)).collect();
             let mut out = Vec::with_capacity(tris.len() * 3);
             {
@@ -707,7 +725,7 @@ fn clip_keep(t: Tri, s: [f32; 3], out: &mut Vec<Tri>) {
 /// Bound to the maker's size, the grid stays the same while one size carves: a small stroke among
 /// a person's strokes used to make the whole grid finer, and every brick was made again (a third
 /// of a second to three seconds a stroke, played by hand 2026-11-28).
-fn cell_size(edits: &[Edit], sdf: &MeshSdf) -> f32 {
+fn cell_size(edits: &[Edit], sdf: &MeshSdf, level: u32) -> f32 {
     let mut h = f32::INFINITY;
     for e in edits {
         let feature = match e.shape {
@@ -722,8 +740,17 @@ fn cell_size(edits: &[Edit], sdf: &MeshSdf) -> f32 {
     let (lo, hi) = (sdf.lo(), sdf.hi());
     let longest = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2]).max(1e-3);
     let h = h.clamp(longest / FINEST_ALONG, longest / COARSEST_ALONG).max(1e-4);
-    // The power of two at or below (a positive, normal float's exponent alone).
-    f32::from_bits(h.to_bits() & 0x7f80_0000)
+    // The power of two at or below (a positive, normal float's exponent alone); a coarser level
+    // doubles it each time, to no coarser than its longest side over `COARSEST_ALONG_FAR`.
+    let h = f32::from_bits(h.to_bits() & 0x7f80_0000);
+    let mut out = h;
+    for _ in 0..level {
+        if out * 2.0 > longest / COARSEST_ALONG_FAR {
+            break;
+        }
+        out *= 2.0;
+    }
+    out
 }
 
 /// Every solid triangle of `scene`, in its frame.

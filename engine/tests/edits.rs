@@ -315,3 +315,68 @@ fn raising_a_hill_on_the_player_lifts_smoothly_without_catapulting() {
     assert!(body.on.is_some(), "player should be grounded on the new hill");
     assert!(speed < 0.1, "player should not have launch velocity, speed = {speed:.3}");
 }
+
+/// The edit log asks only the edits near each cluster of points (`EditLog::apply_batch_range`,
+/// kept by place), yet every answer is the one every edit in order gives (`apply_batch_reference`),
+/// to the bit: tiny to giant edits, blended or not, adding and carving (with a material or not), on
+/// points at the surface, deep inside, far above, in batches large and small, over any range.
+#[test]
+fn edits_asked_by_place_answer_as_every_edit_in_order_does() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f32 / (1u64 << 53) as f32
+    };
+    let mats = [Material::Soil, Material::Stone, Material::Sand, Material::Wood];
+    for trial in 0..12 {
+        let n = [1, 5, 40, 300, 1500][trial % 5];
+        let mut edits = Vec::new();
+        for k in 0..n {
+            let size = [0.004, 0.03, 0.3, 0.6, 2.5, 8.0][(next() * 6.0) as usize % 6] * (0.5 + next());
+            let spread = if trial % 2 == 0 { 3.0 } else { 40.0 };
+            let at = [30.0 + (next() - 0.5) * spread, (next() - 0.6) * 2.0, 40.0 + (next() - 0.5) * spread];
+            let shape = match k % 3 {
+                0 => Shape::Sphere { radius: size },
+                1 => Shape::Box { half: [size, 0.7 * size, 1.3 * size], round: 0.1 * size },
+                _ => Shape::Cylinder { radius: size, half_height: 0.8 * size, round: 0.05 * size },
+            };
+            let blend = if next() < 0.3 { 0.0 } else { size * next() * 0.6 };
+            let mat = if next() < 0.5 { Some(mats[k % 4]) } else { None };
+            edits.push(if next() < 0.6 { Edit::carve(shape, at, blend, mat, 1.7) } else { Edit::add(shape, at, blend, mats[(k + 1) % 4], 1.7) });
+        }
+        let log = EditLog::from_edits(edits.clone()).unwrap();
+        // Built one at a time and some taken off again, it is the same.
+        let mut grown = EditLog::new();
+        for e in &edits {
+            grown.push(*e).unwrap();
+        }
+        for _ in 0..n.min(7) {
+            grown.pop();
+        }
+        for e in &edits[n - n.min(7)..] {
+            grown.push(*e).unwrap();
+        }
+        for (batch, near) in [(1usize, 0.5f32), (20, 2.0), (700, 6.0), (5000, 30.0)] {
+            let pts: Vec<[f32; 3]> = (0..batch).map(|_| [30.0 + (next() - 0.5) * 2.0 * near, (next() - 0.5) * 2.0 * near, 40.0 + (next() - 0.5) * 2.0 * near]).collect();
+            let given: Vec<Answer> = pts.iter().map(|p| Answer { distance: p[1] + 0.3 * (p[0] * 0.7).sin(), material: Material::Grass }).collect();
+            let (a, b) = ((next() * n as f32) as usize, n + 1 - (next() * n as f32 * 0.5) as usize);
+            for (from, to) in [(0, n), (a.min(n), b.min(n).max(a.min(n)))] {
+                let mut want = given.clone();
+                log.apply_batch_reference(from, to, &pts, &mut want);
+                for l in [&log, &grown] {
+                    let mut got = given.clone();
+                    l.apply_batch_range(from, to, &pts, &mut got);
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            g.distance.to_bits() == w.distance.to_bits() && g.material == w.material,
+                            "trial {trial} ({n} edits), batch {batch}, edits {from}..{to}, point {:?}: {g:?}, every edit gives {w:?}",
+                            pts[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

@@ -713,6 +713,33 @@ Still to do, in order:
 3. **Edits are compacted.** Past a number of edits, an element's (and a region's) edits are baked into
    sparse bricks of distance and material (the bricks above), so a sample costs the same after
    1,000 strokes as after 10. Saves keep the edits; bricks are a cache made again from them.
+   *Done 2026-11-28, for the terrain's edits* (a synthetic dig of 2,000 strokes in four metres
+   square, `engine/tests/budgets.rs`):
+   - **Kept by place** (`edit::Spatial`): each edit in the cells of a grid of its own size, adds and
+     carves apart; adding or undoing one no longer builds an index of them all. A batch is asked
+     in clusters of 64 nearby points, each given the edits within how far its points are into the
+     air (adds) or the solid (carves), applied in order and passed over at once when out of reach,
+     widened and asked again if a distance grew past that: bit-exact with every edit in order
+     (`apply_batch_reference`; test `edits_asked_by_place_answer_as_every_edit_in_order_does`, and
+     every kept hash unchanged).
+   - **Baked** (`edit::Bake`, `EditLog::rebaked`): past `BAKE_STEP + BAKE_KEEP` (192) edits, all but
+     the last 64–192 are baked, in steps of 128, into sparse bricks (8 cells a side, a cell a
+     twentieth of who made the edits there) holding the area and what the baked edits made of it at
+     each point. A sample in a brick takes the area as asked (at its own size: a tiny keeps the
+     area's detail) plus the interpolated change, then the edits since; a brick near an element
+     placed among the baked edits is not used (`Composed`), nor is one beyond its points. Of the
+     edit list alone, baked by `World::commit`: played, replayed, opened or undone to, the same to
+     the bit (moving on, the bricks there are given the new edits, which is the same as making them
+     from the start). Near the surface within 1.9 cm of exact (cell 6.25 cm). Tests:
+     `engine/tests/bake.rs`.
+   - Measured, 500 → 2,000 strokes: a stroke 0.16 → 0.18 ms (was 0.27 → 0.84), 2,000 points in
+     the dug place 1.65 → 1.75 ms, a second's walk there 4.0 → 9.3 ms (was 2.5 → 17.8), four chunks
+     over it 57 → 72 ms (much of it the dug ground's own new surface).
+   - Not done: points far from the surface (deep under a dug place, high over it) outside every
+     brick still ask the edits within their distance, as an exact distance must (2,000 such points
+     3.2 → 9.4 ms over the same range); a lower bound there (the area's distance, or the bricks',
+     whichever is nearer) would bound them too. An element's own edits (`local_edits`) are kept by
+     place but not baked.
 4. **Settling has a budget.** Tipping advances by the clearance a broad phase finds (fewer, larger
    steps), and obstacle queries go through a BVH over elements, so cost follows contacts, not pile
    size; `FALL_LIMIT` stays as the hard stop.
@@ -740,9 +767,30 @@ Still to do, in order:
      frame either way.
 5. **Elements have levels of detail.** A carved element is drawn for the size class that sees it
    (tiny, person, giant), chosen by distance like chunks, within a triangle budget per element.
+   *Done 2026-11-28:* `Carver::carve_at(scene, carving, level)`: each level doubles the grid's cell
+   (bricks are kept per cell, so levels share nothing and spoil nothing), to no coarser than a
+   sixth of the element along. Never more than `MAX_CARVED_TRIANGLES` (60,000): past it, the next
+   level. `World::set_view(eye, size)` (`play` calls it each frame) draws each carved element at
+   the level its distance in viewer heights asks (finest within 8 heights, a level coarser at each
+   doubling, `MAX_LEVEL` 3), with a quarter's hysteresis so it does not flicker at the line; a tiny
+   close to a person's carving sees it finest, a giant far coarser. Redrawn in the background like
+   any carving. Test: `a_carved_element_is_drawn_in_its_budget_and_coarser_far_away` (a bridge
+   carved 120 times: 37,862 triangles nearest, 6,101 farthest).
 6. **Budgets are laws.** A heavy-play corpus (sessions like this one, kept as logs and replayed) holds
    every action under a time budget and every element under a triangle budget, so growth is caught
    by tests, not by playing.
+   *Done 2026-11-28* (`engine/tests/budgets.rs`), counted rather than timed, so they hold on every
+   machine and in a debug build:
+   - `the_carved_bridge_session_keeps_every_budget`: the session that ran the graphics card out of
+     memory (`engine/tests/corpus/carved-bridge-cut.jsonl`, 655 actions) played again as the window
+     plays it: every element within `MAX_CARVED_TRIANGLES` and all within 600,000 at every stroke
+     and cut (now 53,010 and 97,468 at most; were 1.2 M and 4.5 M), no action's settling past its
+     budget (20,692 points at most).
+   - `a_long_dig_asks_no_more_of_its_edits_late_than_early`: 2,000 strokes in one place; near its
+     surface a point asks 48.9 edits after 500 and 48.0 after 2,000 (`edit::edits_asked`, a count
+     per thread). Unbaked it was 186 and 680, and the test fails so.
+   - Not held to a budget yet: far points outside the bake (step 3), and wall time (kept out of
+     tests, as it differs by machine; the tracing spans measure it).
 
 ### K. The inspector (one to one and a half weeks)
 

@@ -685,10 +685,22 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
         self.region.sample(points, size, out)?;
         let log = self.log.borrow();
         if log.sdf_elements.is_empty() {
-            log.edits.apply_batch(points, out);
+            log.edits.apply_batch_range_baked(0, log.edits.len(), points, out, &mut |_| true);
             log.water.apply_batch(points, out);
             return Ok(());
         }
+        // A bake brick is used where no element placed among the baked edits could change what
+        // they made: none nearer than a distance there can grow to (`EditLog::rebaked`).
+        let reach = log.edits.bake().map_or(0.0, |b| b.reach);
+        let mut usable_at: HashMap<[u32; 4], bool> = HashMap::new();
+        let mut usable = |b: &crate::edit::BakeBrick| -> bool {
+            let key = [b.origin[0].to_bits(), b.origin[1].to_bits(), b.origin[2].to_bits(), b.cell.to_bits()];
+            *usable_at.entry(key).or_insert_with(|| {
+                let (lo, hi) = b.bounds();
+                let r = max_f32(b.base_reach, reach);
+                log.sdf_elements.iter().all(|e| aabb_to_aabb_distance(lo, hi, e.world_lo, e.world_hi) > r + e.world_blend)
+            })
+        };
         if points.is_empty() {
             return Ok(());
         }
@@ -710,7 +722,7 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
         for entry in &log.sdf_elements {
             let end = entry.placed.sdf_after_edits().min(log.edits.len());
             if cursor < end {
-                log.edits.apply_batch_range(cursor, end, points, out);
+                log.edits.apply_batch_range_baked(cursor, end, points, out, &mut usable);
                 cursor = end;
             }
 
@@ -811,7 +823,7 @@ impl<R: Region, L: Borrow<ComposedLog>> Region for Composed<R, L> {
         }
 
         if cursor < log.edits.len() {
-            log.edits.apply_batch_range(cursor, log.edits.len(), points, out);
+            log.edits.apply_batch_range_baked(cursor, log.edits.len(), points, out, &mut usable);
         }
         log.water.apply_batch(points, out);
         Ok(())
@@ -852,6 +864,8 @@ struct LiveElement {
     /// Bumped whenever what it should draw changes: a carving made in the background is shown
     /// only if it was asked for this one (`CarveWorker`).
     generation: u64,
+    /// The detail level its carving is drawn at (`carved::Carver::carve_at`; `set_view`).
+    level: u32,
     physics: ObjectPhysics,
     wasm: Wasm,
     held: bool,
@@ -878,12 +892,45 @@ pub struct ElementRuntime {
     generations: u64,
     /// What an element about to be spawned shows while its carving is made (`show_meanwhile`).
     meanwhile: HashMap<u32, Scene>,
+    /// Where the viewer's eyes are and how tall they are (`set_view`).
+    view: Option<([f64; 3], f32)>,
+}
+
+/// Viewer heights away within which a carved element is drawn at its finest; each doubling of that
+/// is a level coarser (`carved::MAX_LEVEL` at most).
+const FINEST_WITHIN: f64 = 8.0;
+/// How far past (or short of) a level's distance an element must be to be drawn at the next level:
+/// it does not flicker between two as one walks about the line.
+const LEVEL_HYSTERESIS: f64 = 1.25;
+
+/// The level `placed` (its `physics`) is drawn at for a viewer `size` tall with eyes at `eye`, kept
+/// at `now` while it is near the line between two.
+fn level_for(placed: &PlacedElement, physics: &ObjectPhysics, eye: [f64; 3], size: f32, now: Option<u32>) -> u32 {
+    let tf = placed.transform();
+    let c = tf.local_to_world_point(physics.local_center);
+    let d = ((0..3).map(|a| (c[a] as f64 - eye[a]).powi(2)).sum::<f64>().sqrt() - 0.5 * physics.world_span as f64).max(0.0);
+    let heights = d / size.max(1e-4) as f64;
+    let at = |k: f64| -> u32 {
+        let mut level = 0;
+        while level < crate::carved::MAX_LEVEL && heights > FINEST_WITHIN * k * 2f64.powi(level as i32) {
+            level += 1;
+        }
+        level
+    };
+    let plain = at(1.0);
+    match now {
+        Some(n) if plain > n => at(LEVEL_HYSTERESIS).max(n),
+        Some(n) if plain < n => at(1.0 / LEVEL_HYSTERESIS).min(n),
+        Some(n) => n,
+        None => plain,
+    }
 }
 
 /// A carving asked of the worker: the element `id`'s solid of `scene`, as `carving` carves it.
 struct CarveJob {
     id: u32,
     generation: u64,
+    level: u32,
     scene: Scene,
     carving: Carving,
 }
@@ -912,7 +959,7 @@ impl CarveWorker {
                 let mut carver = Carver::new();
                 for job in inbox {
                     let current = still.lock().map(|w| w.get(&job.id) == Some(&job.generation)).unwrap_or(false);
-                    let made = current.then(|| carver.carve(&job.scene, &job.carving));
+                    let made = current.then(|| carver.carve_at(&job.scene, &job.carving, job.level));
                     if outbox.send((job.id, job.generation, made)).is_err() {
                         return;
                     }
@@ -922,11 +969,11 @@ impl CarveWorker {
         CarveWorker { jobs, done, wanted, pending: 0 }
     }
 
-    fn ask(&mut self, id: u32, generation: u64, scene: &Scene, carving: &Carving) {
+    fn ask(&mut self, id: u32, generation: u64, level: u32, scene: &Scene, carving: &Carving) {
         if let Ok(mut w) = self.wanted.lock() {
             w.insert(id, generation);
         }
-        if self.jobs.send(CarveJob { id, generation, scene: scene.clone(), carving: carving.clone() }).is_ok() {
+        if self.jobs.send(CarveJob { id, generation, level, scene: scene.clone(), carving: carving.clone() }).is_ok() {
             self.pending += 1;
         }
     }
@@ -994,6 +1041,37 @@ impl ElementRuntime {
         }
     }
 
+    /// The viewer's eyes are at `eye`, and they are `size` tall: each carved element is drawn at the
+    /// level of detail its distance in viewer heights asks (`level_for`). The world scenes of those
+    /// drawn again at once (made here, without a background thread); in the background they are
+    /// among `finished_carvings` once made.
+    pub fn set_view(&mut self, eye: [f64; 3], size: f32) -> Vec<(u32, Scene)> {
+        self.view = Some((eye, size));
+        let mut out = Vec::new();
+        for l in &mut self.live {
+            if l.carving.is_none() {
+                continue;
+            }
+            let level = level_for(&l.placed, &l.physics, eye, size, Some(l.level));
+            if level == l.level {
+                continue;
+            }
+            l.level = level;
+            let meanwhile = l.drawn_scene.clone();
+            let asked = self.worker.is_some();
+            Self::draw(&mut self.carver, &mut self.worker, &mut self.generations, l, meanwhile);
+            if !asked && !l.held {
+                out.push((l.placed.id, transform_scene(&l.drawn_scene, l.placed.transform())));
+            }
+        }
+        out
+    }
+
+    /// The level of detail the element `id` is drawn at.
+    pub fn level_of(&self, id: u32) -> Option<u32> {
+        self.live.iter().find(|l| l.placed.id == id).map(|l| l.level)
+    }
+
     /// Whether carvings asked of the background are still being made.
     pub fn carving_pending(&self) -> bool {
         self.worker.as_ref().is_some_and(|w| w.pending > 0)
@@ -1012,9 +1090,9 @@ impl ElementRuntime {
                 }
                 l.drawn_scene = l.local_scene.clone();
             }
-            (Some(c), None) => l.drawn_scene = carver.carve(&l.local_scene, c),
+            (Some(c), None) => l.drawn_scene = carver.carve_at(&l.local_scene, c, l.level),
             (Some(c), Some(w)) => {
-                w.ask(l.placed.id, l.generation, &l.local_scene, c);
+                w.ask(l.placed.id, l.generation, l.level, &l.local_scene, c);
                 l.drawn_scene = meanwhile;
             }
         }
@@ -1100,7 +1178,8 @@ impl ElementRuntime {
             Some(s) => s,
             None => self.live.iter().find(|l| l.placed.id == placed.id).map_or_else(|| local_scene.clone(), |l| l.drawn_scene.clone()),
         };
-        let mut l = LiveElement { placed, drawn_scene: Scene::default(), local_scene, carving, generation: 0, physics, wasm, held: false, solid_proxy };
+        let level = self.view.map_or(0, |(eye, size)| level_for(&placed, &physics, eye, size, None));
+        let mut l = LiveElement { placed, drawn_scene: Scene::default(), local_scene, carving, generation: 0, level, physics, wasm, held: false, solid_proxy };
         Self::draw(&mut self.carver, &mut self.worker, &mut self.generations, &mut l, meanwhile);
         let world_scene = transform_scene(&l.drawn_scene, tf);
         self.live.push(l);
